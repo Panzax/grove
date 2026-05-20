@@ -149,6 +149,18 @@ pub fn run(git_url: Option<&str>, no_agent: bool, no_devcontainer: bool, reconfi
         Ok(p) => println!("  {} installed engine at {}", "·".dimmed(), p.display()),
         Err(e) => eprintln!("  {} failed to install loop engine: {}", "Warning:".yellow(), e),
     }
+    match crate::agent::seed::install_assets(&context) {
+        Ok(paths) => println!(
+            "  {} installed framework files (.grove/{{PROTOCOL,RALPH-LOOP,SHARED,PROMPT.template}}.md): {} written",
+            "·".dimmed(),
+            paths.len()
+        ),
+        Err(e) => eprintln!(
+            "  {} failed to install framework files: {}",
+            "Warning:".yellow(),
+            e
+        ),
+    }
     match crate::agent::hook::default_user_settings_path() {
         Some(path) => match crate::agent::hook::install_stop_hook(
             &path,
