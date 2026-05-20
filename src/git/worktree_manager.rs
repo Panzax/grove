@@ -35,18 +35,31 @@ pub fn discover_repo() -> Result<RepoContext, String> {
             layout: ProjectLayout::Bare,
         });
     }
-    // Preserve upstream wording so the existing integration tests' assertion
-    // (`stderr contains "Not in a grove repository"`) still matches when both
-    // discovery paths fail.
-    discover_in_place(None).map_err(|in_place_err| {
-        format!(
-            "Not in a grove repository.\n\
-             Run `grove init <git-url>` to clone a fresh bare-layout project, OR\n\
-             `grove init [<path>]` to adopt an existing git checkout in-place.\n\
-             (in-place probe: {})",
-            in_place_err
-        )
-    })
+    // In-place fallback: only adopt the discovered git checkout if it has been
+    // through `grove init` already (signaled by `.grove/config.toml`). Without
+    // this gate, every `grove add` / `grove list` / etc. would silently start
+    // working in any git repo a user happens to `cd` into — breaking upstream's
+    // "Not in a grove repository" contract.
+    let in_place_result = discover_in_place(None);
+    let in_place_msg = match in_place_result {
+        Ok(ctx) => {
+            if ctx.project_root.join(".grove").join("config.toml").exists() {
+                return Ok(ctx);
+            }
+            format!(
+                "discovered git checkout at {} but no .grove/config.toml — not grove-initialized.",
+                ctx.project_root.display()
+            )
+        }
+        Err(e) => e,
+    };
+    Err(format!(
+        "Not in a grove repository.\n\
+         Run `grove init <git-url>` to clone a fresh bare-layout project, OR\n\
+         `grove init [<path>]` to adopt an existing git checkout in-place.\n\
+         ({})",
+        in_place_msg
+    ))
 }
 
 /// Adopt the supplied path (or cwd) as an in-place grove project. Verifies that the
