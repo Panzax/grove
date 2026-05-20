@@ -121,16 +121,21 @@ pub fn run(git_url: Option<&str>, no_agent: bool, no_devcontainer: bool, reconfi
                 "  {} .devcontainer/devcontainer.json already exists; left as-is",
                 "·".dimmed()
             ),
-            Err(e) => eprintln!("  {} devcontainer scaffold failed: {}", "Warning:".yellow(), e),
+            Err(e) => eprintln!(
+                "  {} devcontainer scaffold failed: {}",
+                "Warning:".yellow(),
+                e
+            ),
         }
     }
 
-    if let Err(e) = write_grove_config(
-        worktree_manager::project_root(&context),
-        &project,
-        &context,
-    ) {
-        eprintln!("  {} failed to write .grove/config.toml: {}", "Warning:".yellow(), e);
+    if let Err(e) = write_grove_config(worktree_manager::project_root(&context), &project, &context)
+    {
+        eprintln!(
+            "  {} failed to write .grove/config.toml: {}",
+            "Warning:".yellow(),
+            e
+        );
     } else {
         println!("  {} wrote .grove/config.toml", "·".dimmed());
     }
@@ -142,14 +147,25 @@ pub fn run(git_url: Option<&str>, no_agent: bool, no_devcontainer: bool, reconfi
     }
 
     if let Err(e) = patch_gitignore(worktree_manager::project_root(&context)) {
-        eprintln!("  {} failed to patch .gitignore: {}", "Warning:".yellow(), e);
+        eprintln!(
+            "  {} failed to patch .gitignore: {}",
+            "Warning:".yellow(),
+            e
+        );
     } else {
-        println!("  {} patched .gitignore (.grove/, worktrees/)", "·".dimmed());
+        println!(
+            "  {} patched .gitignore (.grove/, worktrees/)",
+            "·".dimmed()
+        );
     }
 
     if project.has_dockerfile {
         if let Err(e) = patch_dockerignore(worktree_manager::project_root(&context)) {
-            eprintln!("  {} failed to patch .dockerignore: {}", "Warning:".yellow(), e);
+            eprintln!(
+                "  {} failed to patch .dockerignore: {}",
+                "Warning:".yellow(),
+                e
+            );
         } else {
             println!(
                 "  {} patched .dockerignore (excludes .grove/ + worktrees/)",
@@ -168,7 +184,10 @@ pub fn run(git_url: Option<&str>, no_agent: bool, no_devcontainer: bool, reconfi
                 e
             );
         } else {
-            println!("  {} applied named cache volumes to devcontainer.json", "·".dimmed());
+            println!(
+                "  {} applied named cache volumes to devcontainer.json",
+                "·".dimmed()
+            );
         }
     }
 
@@ -176,7 +195,11 @@ pub fn run(git_url: Option<&str>, no_agent: bool, no_devcontainer: bool, reconfi
     // settings. These are idempotent so repeated `grove init` runs are safe.
     match crate::agent::hook::install_engine(&context) {
         Ok(p) => println!("  {} installed engine at {}", "·".dimmed(), p.display()),
-        Err(e) => eprintln!("  {} failed to install loop engine: {}", "Warning:".yellow(), e),
+        Err(e) => eprintln!(
+            "  {} failed to install loop engine: {}",
+            "Warning:".yellow(),
+            e
+        ),
     }
     match crate::agent::seed::install_assets(&context) {
         Ok(paths) => println!(
@@ -245,7 +268,10 @@ pub fn run(git_url: Option<&str>, no_agent: bool, no_devcontainer: bool, reconfi
     println!();
     println!("{}", "Next steps:".bold());
     println!("  {} {}", "cd".dimmed(), repo_name);
-    println!("  {} <name>                  # create a regular worktree", "grove add".dimmed());
+    println!(
+        "  {} <name>                  # create a regular worktree",
+        "grove add".dimmed()
+    );
     println!(
         "  {} <name> --task \"...\"   # spawn an agent in an isolated worktree",
         "grove spawn".dimmed()
@@ -290,12 +316,12 @@ fn run_reconfigure() {
 }
 
 fn print_detection_summary(project: &ProjectContext) {
-    let stack = project
-        .stack
-        .map(|s| s.as_str())
-        .unwrap_or("unknown");
+    let stack = project.stack.map(|s| s.as_str()).unwrap_or("unknown");
     let pm = project.package_manager.as_deref().unwrap_or("none");
-    let tc = project.toolchain_version.as_deref().unwrap_or("unspecified");
+    let tc = project
+        .toolchain_version
+        .as_deref()
+        .unwrap_or("unspecified");
     println!(
         "{} stack={} pm={} toolchain={} tests={} dockerfile={} CLAUDE.md={}",
         "Detected:".dimmed(),
@@ -322,7 +348,9 @@ fn build_grove_config(
     config.stack.package_mgr = project.package_manager.clone();
     config.stack.default_branch = project.default_branch.clone();
 
-    let stack_enum = project.stack.unwrap_or(crate::models::ProjectStack::Unknown);
+    let stack_enum = project
+        .stack
+        .unwrap_or(crate::models::ProjectStack::Unknown);
     config.verify = if scraped.is_empty() {
         let defaults = crate::devcontainer::stack::verify_defaults(
             stack_enum,
@@ -339,21 +367,20 @@ fn build_grove_config(
         crate::devcontainer::ci_scrape::into_verify_section(scraped)
     };
 
-    config.caches.volumes = crate::devcontainer::stack::cache_volumes(stack_enum, &project.repo_name)
-        .into_iter()
-        .map(|(source, target)| crate::models::CacheVolume { source, target })
-        .collect();
+    config.caches.volumes =
+        crate::devcontainer::stack::cache_volumes(stack_enum, &project.repo_name)
+            .into_iter()
+            .map(|(source, target)| crate::models::CacheVolume { source, target })
+            .collect();
 
     config.hooks.pre_commit = project.has_pre_commit;
     config.hooks.husky = project.has_husky;
     config.hooks.lefthook = project.has_lefthook;
-    config.meta.claude_md_strategy = Some(
-        if project.has_claude_md {
-            "reference".to_string()
-        } else {
-            "absent".to_string()
-        },
-    );
+    config.meta.claude_md_strategy = Some(if project.has_claude_md {
+        "reference".to_string()
+    } else {
+        "absent".to_string()
+    });
     config
 }
 
@@ -409,7 +436,11 @@ fn ensure_groverc_bootstrap(project_root: &Path) -> Result<(), String> {
         .or_insert_with(|| serde_json::json!({ "commands": [] }));
     let commands = bootstrap
         .as_object_mut()
-        .and_then(|b| b.entry("commands").or_insert_with(|| serde_json::json!([])).as_array_mut())
+        .and_then(|b| {
+            b.entry("commands")
+                .or_insert_with(|| serde_json::json!([]))
+                .as_array_mut()
+        })
         .ok_or_else(|| ".groverc bootstrap.commands is not an array".to_string())?;
 
     let devcontainer_cmd = serde_json::json!({
@@ -468,10 +499,13 @@ fn apply_cache_volumes_to_devcontainer(
     if !dev_path.exists() {
         return Ok(());
     }
-    let raw = fs::read_to_string(&dev_path).map_err(|e| format!("read {}: {}", dev_path.display(), e))?;
-    let mut value: serde_json::Value = serde_json::from_str(&raw)
-        .map_err(|e| format!("parse {}: {}", dev_path.display(), e))?;
-    let stack = project.stack.unwrap_or(crate::models::ProjectStack::Unknown);
+    let raw =
+        fs::read_to_string(&dev_path).map_err(|e| format!("read {}: {}", dev_path.display(), e))?;
+    let mut value: serde_json::Value =
+        serde_json::from_str(&raw).map_err(|e| format!("parse {}: {}", dev_path.display(), e))?;
+    let stack = project
+        .stack
+        .unwrap_or(crate::models::ProjectStack::Unknown);
     let vols = crate::devcontainer::stack::cache_volumes(stack, &project.repo_name);
 
     let obj = value
@@ -483,11 +517,11 @@ fn apply_cache_volumes_to_devcontainer(
         .as_array_mut()
         .ok_or_else(|| "devcontainer.json `mounts` is not an array".to_string())?;
     for (source, target) in vols {
-        let entry = format!(
-            "source={},target={},type=volume",
-            source, target
-        );
-        if !mounts.iter().any(|v| v == &serde_json::Value::String(entry.clone())) {
+        let entry = format!("source={},target={},type=volume", source, target);
+        if !mounts
+            .iter()
+            .any(|v| v == &serde_json::Value::String(entry.clone()))
+        {
             mounts.push(serde_json::Value::String(entry));
         }
     }

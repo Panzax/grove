@@ -11,9 +11,7 @@ use chrono::Utc;
 use colored::Colorize;
 
 use crate::agent::seed;
-use crate::git::worktree_manager::{
-    add_worktree, branch_exists, discover_repo, project_root,
-};
+use crate::git::worktree_manager::{add_worktree, branch_exists, discover_repo, project_root};
 use crate::models::AgentMetadata;
 use crate::session::tmux::{launch_detached, SessionSpec};
 
@@ -74,13 +72,7 @@ pub fn run(name: &str, branch: Option<&str>, task: Option<&str>) {
         }
     };
 
-    if let Err(e) = add_worktree(
-        &ctx,
-        &worktree_path_str,
-        &target_branch,
-        create_new,
-        None,
-    ) {
+    if let Err(e) = add_worktree(&ctx, &worktree_path_str, &target_branch, create_new, None) {
         eprintln!("{} create worktree: {}", "Error:".red(), e);
         std::process::exit(1);
     }
@@ -131,10 +123,7 @@ pub fn run(name: &str, branch: Option<&str>, task: Option<&str>) {
     }
 
     // Launch tmux session running `claude` (or the configured command).
-    let agent_dir_abs = project_root_path
-        .join(".grove")
-        .join("agents")
-        .join(name);
+    let agent_dir_abs = project_root_path.join(".grove").join("agents").join(name);
 
     let mut env: HashMap<String, String> = HashMap::new();
     env.insert(
@@ -184,7 +173,8 @@ pub fn run(name: &str, branch: Option<&str>, task: Option<&str>) {
     println!();
     println!(
         "{}",
-        "Next: edit PROMPT.md / STATE.md, then flip loop.md `active: true` to start the loop.".dimmed()
+        "Next: edit PROMPT.md / STATE.md, then flip loop.md `active: true` to start the loop."
+            .dimmed()
     );
     let _ = PathBuf::from(&agent_toml);
 }

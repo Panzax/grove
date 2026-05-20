@@ -25,7 +25,10 @@ pub fn detect_project_context(ctx: &RepoContext, repo_name: &str) -> ProjectCont
     let head_files: Vec<String> = ls_head_files(ctx).unwrap_or_default();
 
     let stacks_detected = stack::detect_all_stacks(&head_files);
-    let primary = stacks_detected.first().copied().unwrap_or(ProjectStack::Unknown);
+    let primary = stacks_detected
+        .first()
+        .copied()
+        .unwrap_or(ProjectStack::Unknown);
 
     let toolchain_version = stack::infer_toolchain_version(ctx, primary, &head_files);
     let package_manager = stack::infer_package_manager(primary, &head_files);
@@ -55,7 +58,8 @@ pub fn detect_project_context(ctx: &RepoContext, repo_name: &str) -> ProjectCont
     let has_pre_commit = head_file_exists(ctx, ".pre-commit-config.yaml")
         || head_file_exists(ctx, ".pre-commit-config.yml");
     let has_husky = head_files.iter().any(|p| p.starts_with(".husky/"));
-    let has_lefthook = head_file_exists(ctx, "lefthook.yml") || head_file_exists(ctx, "lefthook.yaml");
+    let has_lefthook =
+        head_file_exists(ctx, "lefthook.yml") || head_file_exists(ctx, "lefthook.yaml");
     let has_claude_md = head_file_exists(ctx, "CLAUDE.md")
         || head_file_exists(ctx, "docs/CLAUDE.md")
         || head_file_exists(ctx, ".claude/CLAUDE.md");
@@ -145,11 +149,12 @@ pub fn build_devcontainer_skeleton(project: &ProjectContext) -> Value {
 /// Read whatever devcontainer.json is currently on disk, returning its parsed JSON.
 /// Used by Phase 2 to mutate-in-place after the user confirms wizard choices.
 pub fn read_devcontainer_json(project_root_path: &Path) -> Result<Value, String> {
-    let path = project_root_path.join(".devcontainer").join("devcontainer.json");
+    let path = project_root_path
+        .join(".devcontainer")
+        .join("devcontainer.json");
     let raw = fs::read_to_string(&path)
         .map_err(|e| format!("Failed to read {}: {}", path.display(), e))?;
-    serde_json::from_str(&raw)
-        .map_err(|e| format!("Failed to parse {}: {}", path.display(), e))
+    serde_json::from_str(&raw).map_err(|e| format!("Failed to parse {}: {}", path.display(), e))
 }
 
 /// Write a devcontainer.json (overwrites). Used by Phase 2.

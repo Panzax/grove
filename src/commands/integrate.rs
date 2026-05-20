@@ -4,16 +4,13 @@
 //
 // Implementation port of `agent.sh cmd_integrate`.
 
-use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::Command;
 
 use chrono::Utc;
 use colored::Colorize;
 
-use crate::git::worktree_manager::{
-    add_worktree, discover_repo, get_default_branch, project_root,
-};
+use crate::git::worktree_manager::{add_worktree, discover_repo, get_default_branch, project_root};
 use crate::models::GroveConfig;
 
 pub fn run(into: Option<&str>, no_test: bool) {
@@ -26,7 +23,10 @@ pub fn run(into: Option<&str>, no_test: bool) {
     };
     let project = project_root(&ctx).to_path_buf();
 
-    let base = match into.map(|s| s.to_string()).or_else(|| get_default_branch(&ctx).ok()) {
+    let base = match into
+        .map(|s| s.to_string())
+        .or_else(|| get_default_branch(&ctx).ok())
+    {
         Some(b) => b,
         None => {
             eprintln!(
@@ -53,7 +53,18 @@ pub fn run(into: Option<&str>, no_test: bool) {
         std::process::exit(1);
     }
     let integration_str = integration_path.to_string_lossy().to_string();
-    if let Err(e) = add_worktree(&ctx, &integration_str, &integration_branch, true, None) {
+    // Branch the integration off `base` explicitly so the merges produce a clean
+    // history relative to the user's base branch.
+    if let Err(e) = git_in(&project, &["branch", &integration_branch, &base]) {
+        eprintln!(
+            "{} could not create integration branch off {}: {}",
+            "Error:".red(),
+            base,
+            e
+        );
+        std::process::exit(1);
+    }
+    if let Err(e) = add_worktree(&ctx, &integration_str, &integration_branch, false, None) {
         eprintln!(
             "{} create integration worktree on branch {}: {}",
             "Error:".red(),
@@ -101,7 +112,10 @@ pub fn run(into: Option<&str>, no_test: bool) {
     for branch in &agent_branches {
         println!();
         println!("{} merging {}", "▶".cyan(), branch.bold());
-        match git_in(&integration_path, &["merge", "--no-ff", "--no-edit", branch]) {
+        match git_in(
+            &integration_path,
+            &["merge", "--no-ff", "--no-edit", branch],
+        ) {
             Ok(_) => {
                 println!("  {} merge clean", "✓".green());
                 if let Some(cmd) = &verify_cmd {
@@ -212,7 +226,9 @@ fn make_readonly(path: &Path) -> Result<(), String> {
             if pth.is_dir() {
                 walk(&pth)?;
             } else {
-                let mut perms = std::fs::metadata(&pth).map_err(|e| e.to_string())?.permissions();
+                let mut perms = std::fs::metadata(&pth)
+                    .map_err(|e| e.to_string())?
+                    .permissions();
                 perms.set_mode(0o444);
                 std::fs::set_permissions(&pth, perms).map_err(|e| e.to_string())?;
             }
@@ -266,11 +282,7 @@ fn run_verify(integration: &Path, cmd: &[String]) -> bool {
     if cmd.is_empty() {
         return true;
     }
-    println!(
-        "  {} verify: {}",
-        "·".dimmed(),
-        cmd.join(" ").bold()
-    );
+    println!("  {} verify: {}", "·".dimmed(), cmd.join(" ").bold());
     let mut iter = cmd.iter();
     let program = iter.next().unwrap();
     let args: Vec<&String> = iter.collect();
@@ -303,8 +315,8 @@ fn run_verify(integration: &Path, cmd: &[String]) -> bool {
 /// `claude -p` with a context-aware prompt. Falls back to leaving the
 /// conflicts in place if no resolver is available.
 fn resolve_conflicts(integration: &Path) -> Result<(), String> {
-    let conflicted = git_in(integration, &["diff", "--name-only", "--diff-filter=U"])
-        .unwrap_or_default();
+    let conflicted =
+        git_in(integration, &["diff", "--name-only", "--diff-filter=U"]).unwrap_or_default();
     if conflicted.trim().is_empty() {
         return Ok(());
     }
@@ -347,7 +359,11 @@ fn resolver_command_tokens() -> Vec<String> {
             return tokens;
         }
     }
-    vec!["claude".into(), "-p".into(), "--dangerously-skip-permissions".into()]
+    vec![
+        "claude".into(),
+        "-p".into(),
+        "--dangerously-skip-permissions".into(),
+    ]
 }
 
 fn git_in(dir: &Path, args: &[&str]) -> Result<String, String> {
@@ -361,12 +377,3 @@ fn git_in(dir: &Path, args: &[&str]) -> Result<String, String> {
     }
     Ok(String::from_utf8_lossy(&out.stdout).to_string())
 }
-
-#[allow(dead_code)]
-fn debug_env() -> HashMap<String, String> {
-    std::env::vars().collect()
-}
-
-// `into: Option<&str>` referenced from main.rs (kept for clap signature parity).
-#[allow(dead_code)]
-fn _retain_signature(_p: PathBuf) {}

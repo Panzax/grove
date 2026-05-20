@@ -16,7 +16,7 @@
 
 use std::collections::HashMap;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use colored::Colorize;
 use dialoguer::theme::ColorfulTheme;
@@ -56,16 +56,15 @@ pub fn run_setup_wizard(
     );
 
     let mut config = read_or_default_config(&project_root_path);
-    let mut devcontainer = read_devcontainer_json(&project_root_path)
-        .unwrap_or_else(|_| {
-            json!({
-                "name": project.repo_name,
-                "image": project.default_image,
-                "mounts": [],
-                "containerEnv": {},
-                "customizations": { "vscode": { "extensions": [] } }
-            })
-        });
+    let mut devcontainer = read_devcontainer_json(&project_root_path).unwrap_or_else(|_| {
+        json!({
+            "name": project.repo_name,
+            "image": project.default_image,
+            "mounts": [],
+            "containerEnv": {},
+            "customizations": { "vscode": { "extensions": [] } }
+        })
+    });
 
     // ----- Prompt 1: project secrets mount -----
     prompt_secrets_mount(project, &mut config, &mut devcontainer)?;
@@ -332,7 +331,11 @@ fn prompt_extensions_and_packages(
         // pre-commit doesn't have a single canonical extension; rely on
         // language-specific ones already in defaults.
     }
-    if project.root_files.iter().any(|p| p == "Makefile" || p == "justfile") {
+    if project
+        .root_files
+        .iter()
+        .any(|p| p == "Makefile" || p == "justfile")
+    {
         inferred.push("nefrob.vscode-just-syntax");
     }
     if project
@@ -342,15 +345,15 @@ fn prompt_extensions_and_packages(
     {
         inferred.push("hashicorp.terraform");
     }
-    if project
-        .root_files
-        .iter()
-        .any(|p| p.ends_with(".proto"))
-    {
+    if project.root_files.iter().any(|p| p.ends_with(".proto")) {
         inferred.push("zxh404.vscode-proto3");
     }
 
-    let mut all: Vec<&str> = defaults.iter().copied().chain(inferred.iter().copied()).collect();
+    let mut all: Vec<&str> = defaults
+        .iter()
+        .copied()
+        .chain(inferred.iter().copied())
+        .collect();
     // Dedup while preserving order.
     let mut seen = std::collections::HashSet::new();
     all.retain(|s| seen.insert(*s));
@@ -375,17 +378,16 @@ fn prompt_extensions_and_packages(
 // ---------- devcontainer.json helpers ----------
 
 fn add_mount(devcontainer: &mut Value, source: &str, target: &str, mode: &str) {
-    let mounts = devcontainer
-        .as_object_mut()
-        .and_then(|o| o.entry("mounts").or_insert_with(|| json!([])).as_array_mut());
+    let mounts = devcontainer.as_object_mut().and_then(|o| {
+        o.entry("mounts")
+            .or_insert_with(|| json!([]))
+            .as_array_mut()
+    });
     let Some(arr) = mounts else {
         return;
     };
     let entry = if mode == "ro" {
-        format!(
-            "source={},target={},type=bind,readonly",
-            source, target
-        )
+        format!("source={},target={},type=bind,readonly", source, target)
     } else {
         format!("source={},target={},type=bind", source, target)
     };
@@ -395,9 +397,11 @@ fn add_mount(devcontainer: &mut Value, source: &str, target: &str, mode: &str) {
 }
 
 fn set_container_env(devcontainer: &mut Value, key: &str, value: &str) {
-    let env = devcontainer
-        .as_object_mut()
-        .and_then(|o| o.entry("containerEnv").or_insert_with(|| json!({})).as_object_mut());
+    let env = devcontainer.as_object_mut().and_then(|o| {
+        o.entry("containerEnv")
+            .or_insert_with(|| json!({}))
+            .as_object_mut()
+    });
     if let Some(map) = env {
         map.insert(key.to_string(), Value::String(value.to_string()));
     }
@@ -409,9 +413,11 @@ fn set_extensions(devcontainer: &mut Value, exts: &[String]) {
         return;
     };
     let custom = obj.entry("customizations").or_insert_with(|| json!({}));
-    let vscode = custom
-        .as_object_mut()
-        .and_then(|m| m.entry("vscode").or_insert_with(|| json!({})).as_object_mut());
+    let vscode = custom.as_object_mut().and_then(|m| {
+        m.entry("vscode")
+            .or_insert_with(|| json!({}))
+            .as_object_mut()
+    });
     if let Some(vs) = vscode {
         vs.insert(
             "extensions".to_string(),
@@ -448,21 +454,30 @@ fn apply_post_create(project: &ProjectContext, devcontainer: &mut Value) {
 
 // ---------- inferred-mount scan ----------
 
-fn infer_extra_mount_candidates(
-    ctx: &RepoContext,
-    project: &ProjectContext,
-) -> Vec<ExtraMount> {
+fn infer_extra_mount_candidates(ctx: &RepoContext, project: &ProjectContext) -> Vec<ExtraMount> {
     let mut out: Vec<ExtraMount> = Vec::new();
 
     let well_known_env_vars: &[(&str, &str, &str)] = &[
-        ("MARKET_DATA_DIR", "/mnt/market_data", "trading-data convention"),
+        (
+            "MARKET_DATA_DIR",
+            "/mnt/market_data",
+            "trading-data convention",
+        ),
         ("DATA_DIR", "/mnt/data", "generic data directory"),
         ("DATASET_PATH", "/mnt/datasets", "generic dataset directory"),
         ("MODEL_DIR", "/mnt/models", "ML model directory"),
         ("CACHE_DIR", "/mnt/cache", "shared cache directory"),
-        ("HF_HOME", "/home/vscode/.cache/huggingface", "HuggingFace cache"),
+        (
+            "HF_HOME",
+            "/home/vscode/.cache/huggingface",
+            "HuggingFace cache",
+        ),
         ("TORCH_HOME", "/home/vscode/.cache/torch", "PyTorch cache"),
-        ("XDG_DATA_HOME", "/home/vscode/.local/share", "XDG data home"),
+        (
+            "XDG_DATA_HOME",
+            "/home/vscode/.local/share",
+            "XDG data home",
+        ),
     ];
 
     // Sweep root files looking for env var references in code / README.
@@ -472,8 +487,12 @@ fn infer_extra_mount_candidates(
             // We don't have a working tree, but root_files came from ls-tree HEAD,
             // so re-read each via show_head_file.
             let raw = crate::devcontainer::read_head_or_empty(ctx, p);
-            raw.contains(envvar.0) || raw.contains(&format!("${}", envvar.0))
-                || full.exists() && std::fs::read_to_string(&full).map(|s| s.contains(envvar.0)).unwrap_or(false)
+            raw.contains(envvar.0)
+                || raw.contains(&format!("${}", envvar.0))
+                || full.exists()
+                    && std::fs::read_to_string(&full)
+                        .map(|s| s.contains(envvar.0))
+                        .unwrap_or(false)
         });
         if referenced {
             out.push(ExtraMount {
@@ -503,7 +522,10 @@ fn infer_extra_mount_candidates(
 
     // Dedup by (source, target).
     let mut seen: HashMap<String, ()> = HashMap::new();
-    out.retain(|m| seen.insert(format!("{}|{}", m.source, m.target), ()).is_none());
+    out.retain(|m| {
+        seen.insert(format!("{}|{}", m.source, m.target), ())
+            .is_none()
+    });
     out
 }
 
@@ -521,8 +543,7 @@ fn write_config(project_root_path: &Path, config: &GroveConfig) -> Result<(), St
     let dir = project_root_path.join(".grove");
     fs::create_dir_all(&dir).map_err(|e| format!("create .grove/: {}", e))?;
     let path = dir.join("config.toml");
-    let body = toml::to_string_pretty(config)
-        .map_err(|e| format!("serialize config: {}", e))?;
+    let body = toml::to_string_pretty(config).map_err(|e| format!("serialize config: {}", e))?;
     fs::write(&path, body).map_err(|e| format!("write {}: {}", path.display(), e))?;
     Ok(())
 }
@@ -562,7 +583,9 @@ mod tests {
     fn set_extensions_replaces_list() {
         let mut v = json!({});
         set_extensions(&mut v, &["a".to_string(), "b".to_string()]);
-        let arr = v["customizations"]["vscode"]["extensions"].as_array().unwrap();
+        let arr = v["customizations"]["vscode"]["extensions"]
+            .as_array()
+            .unwrap();
         assert_eq!(arr.len(), 2);
         assert_eq!(arr[0], "a");
     }

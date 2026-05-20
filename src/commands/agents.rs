@@ -111,10 +111,7 @@ pub fn status(name: &str) {
         "  task          : {}",
         row.metadata.task.as_deref().unwrap_or("—")
     );
-    println!(
-        "  spawned_at    : {}",
-        row.metadata.spawned_at.to_rfc3339()
-    );
+    println!("  spawned_at    : {}", row.metadata.spawned_at.to_rfc3339());
     println!("  loop status   : {}", row.loop_status());
     println!(
         "  iteration     : {} / {}",
@@ -168,10 +165,7 @@ pub fn kill(name: &str) {
         if state.active {
             state.active = false;
             let _ = loop_md::write_loop_md(&loop_path, &state);
-            println!(
-                "  {} flipped loop.md active -> false",
-                "·".dimmed()
-            );
+            println!("  {} flipped loop.md active -> false", "·".dimmed());
         }
     }
 }
@@ -201,7 +195,9 @@ fn collect_agents(agents_dir: &Path) -> Result<Vec<AgentRow>, String> {
         return Ok(Vec::new());
     }
     let mut rows = Vec::new();
-    for entry in fs::read_dir(agents_dir).map_err(|e| format!("read {}: {}", agents_dir.display(), e))? {
+    for entry in
+        fs::read_dir(agents_dir).map_err(|e| format!("read {}: {}", agents_dir.display(), e))?
+    {
         let entry = entry.map_err(|e| e.to_string())?;
         let path = entry.path();
         if !path.is_dir() {
@@ -225,8 +221,8 @@ fn load_agent(agent_dir: &Path) -> Result<AgentRow, String> {
     }
     let raw = fs::read_to_string(&metadata_path)
         .map_err(|e| format!("read {}: {}", metadata_path.display(), e))?;
-    let metadata: AgentMetadata = toml::from_str(&raw)
-        .map_err(|e| format!("parse {}: {}", metadata_path.display(), e))?;
+    let metadata: AgentMetadata =
+        toml::from_str(&raw).map_err(|e| format!("parse {}: {}", metadata_path.display(), e))?;
 
     let loop_path = agent_dir.join("loop.md");
     let loop_state = if loop_path.exists() {
@@ -235,7 +231,12 @@ fn load_agent(agent_dir: &Path) -> Result<AgentRow, String> {
         None
     };
     let (iteration, max_iterations, completion_promise, active) = match loop_state {
-        Some(s) => (s.iteration, s.max_iterations, s.completion_promise, s.active),
+        Some(s) => (
+            s.iteration,
+            s.max_iterations,
+            s.completion_promise,
+            s.active,
+        ),
         None => (0, 0, String::new(), false),
     };
     Ok(AgentRow {

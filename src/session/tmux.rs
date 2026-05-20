@@ -145,7 +145,11 @@ mod tests {
             return;
         }
         let tmpdir = std::env::temp_dir();
-        let unique = format!("test-{}-{}", std::process::id(), uuid::Uuid::new_v4().simple());
+        let unique = format!(
+            "test-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4().simple()
+        );
         let mut env = HashMap::new();
         env.insert("GROVE_AGENT_DIR".into(), "/tmp/nonexistent".into());
         let spec = SessionSpec {

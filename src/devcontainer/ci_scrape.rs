@@ -22,7 +22,10 @@ pub struct ScrapeResult {
 
 impl ScrapeResult {
     pub fn is_empty(&self) -> bool {
-        self.test.is_empty() && self.lint.is_empty() && self.format.is_empty() && self.typecheck.is_empty()
+        self.test.is_empty()
+            && self.lint.is_empty()
+            && self.format.is_empty()
+            && self.typecheck.is_empty()
     }
 }
 
@@ -31,7 +34,9 @@ pub fn scrape(ctx: &RepoContext) -> ScrapeResult {
     let head_files = ls_head_files(ctx).unwrap_or_default();
     let workflow_files: Vec<String> = head_files
         .into_iter()
-        .filter(|p| p.starts_with(".github/workflows/") && (p.ends_with(".yml") || p.ends_with(".yaml")))
+        .filter(|p| {
+            p.starts_with(".github/workflows/") && (p.ends_with(".yml") || p.ends_with(".yaml"))
+        })
         .collect();
     for wf in workflow_files {
         if !head_file_exists(ctx, &wf) {
@@ -57,31 +62,46 @@ pub fn classify_and_push(line: &str, out: &mut ScrapeResult) {
     let buckets: &[(&[&str], fn(&mut ScrapeResult) -> &mut Vec<Vec<String>>)] = &[
         (
             &[
-                "pytest", "cargo test", "go test", "npm test", "pnpm test",
-                "yarn test", "bun test", "dotnet test", "rspec", "jest", "vitest",
+                "pytest",
+                "cargo test",
+                "go test",
+                "npm test",
+                "pnpm test",
+                "yarn test",
+                "bun test",
+                "dotnet test",
+                "rspec",
+                "jest",
+                "vitest",
             ],
             |o| &mut o.test,
         ),
         (
             &[
-                "ruff check", "flake8", "eslint", "clippy", "golangci-lint",
-                "pylint", "rubocop",
+                "ruff check",
+                "flake8",
+                "eslint",
+                "clippy",
+                "golangci-lint",
+                "pylint",
+                "rubocop",
             ],
             |o| &mut o.lint,
         ),
         (
             &[
-                "ruff format", "black --check", "prettier --check",
-                "cargo fmt", "gofmt", "dotnet format",
+                "ruff format",
+                "black --check",
+                "prettier --check",
+                "cargo fmt",
+                "gofmt",
+                "dotnet format",
             ],
             |o| &mut o.format,
         ),
-        (
-            &[
-                "mypy", "tsc --noemit", "tsc -p", "cargo check",
-            ],
-            |o| &mut o.typecheck,
-        ),
+        (&["mypy", "tsc --noemit", "tsc -p", "cargo check"], |o| {
+            &mut o.typecheck
+        }),
     ];
 
     for (patterns, get) in buckets {
@@ -134,9 +154,8 @@ pub fn extract_run_commands(yaml: &str) -> Vec<String> {
 }
 
 pub fn into_verify_section(result: ScrapeResult) -> crate::models::VerifySection {
-    let pick_one = |v: Vec<Vec<String>>| -> Vec<String> {
-        v.into_iter().next().unwrap_or_default()
-    };
+    let pick_one =
+        |v: Vec<Vec<String>>| -> Vec<String> { v.into_iter().next().unwrap_or_default() };
     crate::models::VerifySection {
         test: pick_one(result.test),
         lint: pick_one(result.lint),

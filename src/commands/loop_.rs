@@ -10,7 +10,7 @@ use std::sync::mpsc::channel;
 use std::time::Duration;
 
 use colored::Colorize;
-use notify::{Event, EventKind, RecursiveMode, Watcher};
+use notify::{Event, RecursiveMode, Watcher};
 
 use crate::agent::loop_md;
 use crate::git::worktree_manager::{discover_repo, project_root};
@@ -93,11 +93,7 @@ fn print_snapshot(agents_dir: &Path, filter: Option<&str>) {
         };
         println!(
             "{:<24} {:<10} {:<8} {:<12} {}",
-            row.name,
-            active_word,
-            row.state.iteration,
-            progress,
-            row.state.completion_promise
+            row.name, active_word, row.state.iteration, progress, row.state.completion_promise
         );
     }
 }

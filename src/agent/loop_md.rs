@@ -26,7 +26,8 @@ use std::path::Path;
 use crate::models::LoopState;
 
 pub fn read_loop_md(path: &Path) -> Result<LoopState, String> {
-    let raw = std::fs::read_to_string(path).map_err(|e| format!("read {}: {}", path.display(), e))?;
+    let raw =
+        std::fs::read_to_string(path).map_err(|e| format!("read {}: {}", path.display(), e))?;
     parse(&raw)
 }
 

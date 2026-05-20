@@ -14,6 +14,10 @@
 // with a small YAML frontmatter block carrying metadata. The format is the same
 // one humans can write by hand if they want to inject test traffic.
 
+#![allow(dead_code)] // public bus API; some helpers are only invoked from commands
+                     // we haven't fully wired yet (e.g. `grove agents status` reading
+                     // the inbox for a given recipient).
+
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -28,19 +32,24 @@ pub const DEFAULT_BUS_DIR: &str = ".grove/bus";
 pub fn message_path(bus_root: &Path, msg: &BusMessage) -> PathBuf {
     let ts = msg.ts.format("%Y%m%dT%H%M%S%3fZ").to_string();
     match msg.kind {
-        MessageKind::Broadcast | MessageKind::Status => bus_root
-            .join("log.d")
-            .join(format!("{}-{}.md", ts, slug(&msg.from))),
-        MessageKind::Direct => bus_root
-            .join("inbox")
-            .join(slug(&msg.to))
-            .join(format!("{}-from-{}.md", ts, slug(&msg.from))),
+        MessageKind::Broadcast | MessageKind::Status => {
+            bus_root
+                .join("log.d")
+                .join(format!("{}-{}.md", ts, slug(&msg.from)))
+        }
+        MessageKind::Direct => bus_root.join("inbox").join(slug(&msg.to)).join(format!(
+            "{}-from-{}.md",
+            ts,
+            slug(&msg.from)
+        )),
         MessageKind::Contract => bus_root.join("contracts").join(format!(
             "{}.md",
-            msg.contract
-                .as_deref()
-                .map(slug)
-                .unwrap_or_else(|| format!("{}-{}-{}", ts, slug(&msg.from), slug(&msg.to)))
+            msg.contract.as_deref().map(slug).unwrap_or_else(|| format!(
+                "{}-{}-{}",
+                ts,
+                slug(&msg.from),
+                slug(&msg.to)
+            ))
         )),
     }
 }
@@ -248,12 +257,7 @@ fn slug(input: &str) -> String {
 }
 
 /// Build a fresh BusMessage with `Utc::now()` and a v4 UUID.
-pub fn new_message(
-    from: &str,
-    to: &str,
-    kind: MessageKind,
-    body: impl Into<String>,
-) -> BusMessage {
+pub fn new_message(from: &str, to: &str, kind: MessageKind, body: impl Into<String>) -> BusMessage {
     BusMessage {
         id: uuid::Uuid::new_v4().to_string(),
         from: from.to_string(),
@@ -349,7 +353,9 @@ mod tests {
         assert_eq!(moved, 2);
         let read_again = read_inbox(&dir, "feat-b").unwrap();
         assert!(read_again.is_empty());
-        let archived = fs::read_dir(dir.join("inbox/feat-b/archive")).unwrap().count();
+        let archived = fs::read_dir(dir.join("inbox/feat-b/archive"))
+            .unwrap()
+            .count();
         assert_eq!(archived, 2);
         let _ = fs::remove_dir_all(&dir);
     }

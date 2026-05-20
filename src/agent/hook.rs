@@ -70,7 +70,10 @@ pub fn default_user_settings_path() -> Option<PathBuf> {
 /// - Adds `hooks.Stop[]` with `{ "hooks": [ { "type": "command", "command": HOOK_COMMAND } ] }`
 ///   only when the exact `command` isn't already registered.
 /// - Pretty-prints the result, preserves every other top-level key untouched.
-pub fn install_stop_hook(settings_path: &Path, hook_command: &str) -> Result<HookInstallReport, String> {
+pub fn install_stop_hook(
+    settings_path: &Path,
+    hook_command: &str,
+) -> Result<HookInstallReport, String> {
     if let Some(parent) = settings_path.parent() {
         fs::create_dir_all(parent).map_err(|e| format!("create {}: {}", parent.display(), e))?;
     }
@@ -81,9 +84,8 @@ pub fn install_stop_hook(settings_path: &Path, hook_command: &str) -> Result<Hoo
         if raw.trim().is_empty() {
             json!({})
         } else {
-            serde_json::from_str(&raw).map_err(|e| {
-                format!("parse {}: {}", settings_path.display(), e)
-            })?
+            serde_json::from_str(&raw)
+                .map_err(|e| format!("parse {}: {}", settings_path.display(), e))?
         }
     } else {
         json!({})
@@ -94,15 +96,11 @@ pub fn install_stop_hook(settings_path: &Path, hook_command: &str) -> Result<Hoo
         .ok_or_else(|| format!("{} top-level is not a JSON object", settings_path.display()))?;
 
     // Ensure hooks.Stop is an array.
-    let hooks_val = obj
-        .entry("hooks")
-        .or_insert_with(|| json!({}));
+    let hooks_val = obj.entry("hooks").or_insert_with(|| json!({}));
     let hooks_obj = hooks_val
         .as_object_mut()
         .ok_or_else(|| "settings.json `hooks` is not an object".to_string())?;
-    let stop_val = hooks_obj
-        .entry("Stop")
-        .or_insert_with(|| json!([]));
+    let stop_val = hooks_obj.entry("Stop").or_insert_with(|| json!([]));
     let stop_arr = stop_val
         .as_array_mut()
         .ok_or_else(|| "settings.json `hooks.Stop` is not an array".to_string())?;
@@ -113,9 +111,8 @@ pub fn install_stop_hook(settings_path: &Path, hook_command: &str) -> Result<Hoo
             .get("hooks")
             .and_then(|h| h.as_array())
             .map(|cmds| {
-                cmds.iter().any(|c| {
-                    c.get("command").and_then(|v| v.as_str()) == Some(hook_command)
-                })
+                cmds.iter()
+                    .any(|c| c.get("command").and_then(|v| v.as_str()) == Some(hook_command))
             })
             .unwrap_or(false)
     });
@@ -207,7 +204,10 @@ mod tests {
         let v: Value = serde_json::from_str(&raw).unwrap();
         assert_eq!(v["theme"], "dark");
         assert_eq!(v["enabledPlugins"][0], "caveman:caveman");
-        assert_eq!(v["hooks"]["PreToolUse"][0]["hooks"][0]["command"], "echo pre");
+        assert_eq!(
+            v["hooks"]["PreToolUse"][0]["hooks"][0]["command"],
+            "echo pre"
+        );
         assert_eq!(v["hooks"]["Stop"][0]["hooks"][0]["command"], HOOK_COMMAND);
         let _ = fs::remove_dir_all(&dir);
     }

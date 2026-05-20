@@ -22,15 +22,15 @@ pub fn detect_all_stacks(head_files: &[String]) -> Vec<ProjectStack> {
             continue;
         }
         match path.as_str() {
-            "pyproject.toml" | "setup.py" | "setup.cfg" | "requirements.txt"
-            | "uv.lock" | "poetry.lock" | "pdm.lock" | "Pipfile" | "Pipfile.lock" => {
+            "pyproject.toml" | "setup.py" | "setup.cfg" | "requirements.txt" | "uv.lock"
+            | "poetry.lock" | "pdm.lock" | "Pipfile" | "Pipfile.lock" => {
                 out.insert(ProjectStack::Python);
             }
             "Cargo.toml" | "Cargo.lock" => {
                 out.insert(ProjectStack::Rust);
             }
-            "package.json" | "package-lock.json" | "pnpm-lock.yaml"
-            | "yarn.lock" | "bun.lock" | "tsconfig.json" => {
+            "package.json" | "package-lock.json" | "pnpm-lock.yaml" | "yarn.lock" | "bun.lock"
+            | "tsconfig.json" => {
                 out.insert(ProjectStack::Node);
             }
             "go.mod" | "go.sum" => {
@@ -200,10 +200,7 @@ pub fn default_extensions(stack: ProjectStack) -> Vec<&'static str> {
             "tamasfe.even-better-toml",
             "vadimcn.vscode-lldb",
         ],
-        ProjectStack::Node => &[
-            "dbaeumer.vscode-eslint",
-            "esbenp.prettier-vscode",
-        ],
+        ProjectStack::Node => &["dbaeumer.vscode-eslint", "esbenp.prettier-vscode"],
         ProjectStack::Go => &["golang.go"],
         ProjectStack::DotNet => &["ms-dotnettools.csdevkit", "ms-dotnettools.csharp"],
         ProjectStack::Unknown => &[],
@@ -234,10 +231,7 @@ pub fn package_manager_install(pm: Option<&str>) -> String {
 
 /// Default verify commands per stack. Used when CI-parity scrape returns nothing.
 /// Each inner Vec is `[program, arg, arg, ...]`.
-pub fn verify_defaults(
-    stack: ProjectStack,
-    pm: Option<&str>,
-) -> VerifyDefaults {
+pub fn verify_defaults(stack: ProjectStack, pm: Option<&str>) -> VerifyDefaults {
     match stack {
         ProjectStack::Python => VerifyDefaults {
             test: vec!["pytest".into(), "-q".into()],
@@ -255,7 +249,13 @@ pub fn verify_defaults(
                 "-D".into(),
                 "warnings".into(),
             ],
-            format: vec!["cargo".into(), "fmt".into(), "--all".into(), "--".into(), "--check".into()],
+            format: vec![
+                "cargo".into(),
+                "fmt".into(),
+                "--all".into(),
+                "--".into(),
+                "--check".into(),
+            ],
             typecheck: vec!["cargo".into(), "check".into(), "--all".into()],
         },
         ProjectStack::Node => {
@@ -290,7 +290,11 @@ pub fn verify_defaults(
         ProjectStack::DotNet => VerifyDefaults {
             test: vec!["dotnet".into(), "test".into()],
             lint: vec![],
-            format: vec!["dotnet".into(), "format".into(), "--verify-no-changes".into()],
+            format: vec![
+                "dotnet".into(),
+                "format".into(),
+                "--verify-no-changes".into(),
+            ],
             typecheck: vec![],
         },
         ProjectStack::Unknown => VerifyDefaults::default(),
@@ -317,19 +321,27 @@ pub fn cache_volumes(stack: ProjectStack, repo_name: &str) -> Vec<(String, Strin
             ("grove-pip-cache".into(), "/home/vscode/.cache/pip".into()),
         ],
         ProjectStack::Rust => vec![
-            ("grove-cargo-registry".into(), "/home/vscode/.cargo/registry".into()),
-            (format!("grove-rust-target-{}", safe), format!("/workspaces/{}/target", repo_name)),
+            (
+                "grove-cargo-registry".into(),
+                "/home/vscode/.cargo/registry".into(),
+            ),
+            (
+                format!("grove-rust-target-{}", safe),
+                format!("/workspaces/{}/target", repo_name),
+            ),
         ],
-        ProjectStack::Node => vec![
-            (format!("grove-node-cache-{}", safe), "/home/vscode/.local/share/pnpm/store".into()),
-        ],
+        ProjectStack::Node => vec![(
+            format!("grove-node-cache-{}", safe),
+            "/home/vscode/.local/share/pnpm/store".into(),
+        )],
         ProjectStack::Go => vec![
             ("grove-go-mod".into(), "/home/vscode/go/pkg/mod".into()),
-            ("grove-go-build".into(), "/home/vscode/.cache/go-build".into()),
+            (
+                "grove-go-build".into(),
+                "/home/vscode/.cache/go-build".into(),
+            ),
         ],
-        ProjectStack::DotNet => vec![
-            ("grove-nuget".into(), "/home/vscode/.nuget/packages".into()),
-        ],
+        ProjectStack::DotNet => vec![("grove-nuget".into(), "/home/vscode/.nuget/packages".into())],
         ProjectStack::Unknown => vec![],
     }
 }
@@ -449,9 +461,7 @@ mod tests {
     #[test]
     fn cache_volumes_for_rust_include_target_dir() {
         let vols = cache_volumes(ProjectStack::Rust, "demo");
-        assert!(vols
-            .iter()
-            .any(|(_, t)| t == "/workspaces/demo/target"));
+        assert!(vols.iter().any(|(_, t)| t == "/workspaces/demo/target"));
         assert!(vols.iter().any(|(s, _)| s == "grove-cargo-registry"));
     }
 }

@@ -84,16 +84,13 @@ pub fn seed_agent(
     fs::create_dir_all(&dir).map_err(|e| format!("create {}: {}", dir.display(), e))?;
 
     let prompt = PROMPT_TEMPLATE.replace("<AGENT_NAME>", name);
-    fs::write(dir.join("PROMPT.md"), prompt)
-        .map_err(|e| format!("write PROMPT.md: {}", e))?;
+    fs::write(dir.join("PROMPT.md"), prompt).map_err(|e| format!("write PROMPT.md: {}", e))?;
 
     let state = state_md_template(name, task);
-    fs::write(dir.join("STATE.md"), state)
-        .map_err(|e| format!("write STATE.md: {}", e))?;
+    fs::write(dir.join("STATE.md"), state).map_err(|e| format!("write STATE.md: {}", e))?;
 
     let loop_body = loop_md_template(completion_promise, max_iterations);
-    fs::write(dir.join("loop.md"), loop_body)
-        .map_err(|e| format!("write loop.md: {}", e))?;
+    fs::write(dir.join("loop.md"), loop_body).map_err(|e| format!("write loop.md: {}", e))?;
 
     Ok(dir)
 }
@@ -169,7 +166,8 @@ mod tests {
     #[test]
     fn seed_creates_three_files() {
         let dir = tmp("three");
-        let agent_dir = seed_agent(&dir, "feat-a", Some("build the thing"), "ALL DONE", 20).unwrap();
+        let agent_dir =
+            seed_agent(&dir, "feat-a", Some("build the thing"), "ALL DONE", 20).unwrap();
         assert!(agent_dir.join("PROMPT.md").exists());
         assert!(agent_dir.join("STATE.md").exists());
         assert!(agent_dir.join("loop.md").exists());

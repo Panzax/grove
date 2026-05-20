@@ -144,6 +144,7 @@ pub enum LoopStatus {
 }
 
 impl LoopStatus {
+    #[allow(dead_code)] // serialized via serde for status JSON output; reserved for future API
     pub fn as_str(self) -> &'static str {
         match self {
             LoopStatus::Running => "running",
