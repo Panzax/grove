@@ -6,6 +6,7 @@
 // agent in `crate::agent::setup`) refines the skeleton with mounts, extensions, and
 // per-stack tooling.
 
+pub mod ci_scrape;
 pub mod stack;
 
 use std::fs;

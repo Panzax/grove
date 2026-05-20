@@ -125,7 +125,11 @@ pub fn run(git_url: Option<&str>, no_agent: bool, no_devcontainer: bool, reconfi
         }
     }
 
-    if let Err(e) = write_grove_config(worktree_manager::project_root(&context), &project) {
+    if let Err(e) = write_grove_config(
+        worktree_manager::project_root(&context),
+        &project,
+        &context,
+    ) {
         eprintln!("  {} failed to write .grove/config.toml: {}", "Warning:".yellow(), e);
     } else {
         println!("  {} wrote .grove/config.toml", "·".dimmed());
@@ -141,6 +145,31 @@ pub fn run(git_url: Option<&str>, no_agent: bool, no_devcontainer: bool, reconfi
         eprintln!("  {} failed to patch .gitignore: {}", "Warning:".yellow(), e);
     } else {
         println!("  {} patched .gitignore (.grove/, worktrees/)", "·".dimmed());
+    }
+
+    if project.has_dockerfile {
+        if let Err(e) = patch_dockerignore(worktree_manager::project_root(&context)) {
+            eprintln!("  {} failed to patch .dockerignore: {}", "Warning:".yellow(), e);
+        } else {
+            println!(
+                "  {} patched .dockerignore (excludes .grove/ + worktrees/)",
+                "·".dimmed()
+            );
+        }
+    }
+
+    if !no_devcontainer {
+        if let Err(e) =
+            apply_cache_volumes_to_devcontainer(worktree_manager::project_root(&context), &project)
+        {
+            eprintln!(
+                "  {} failed to add cache volumes to devcontainer.json: {}",
+                "Warning:".yellow(),
+                e
+            );
+        } else {
+            println!("  {} applied named cache volumes to devcontainer.json", "·".dimmed());
+        }
     }
 
     // Install the Stop-hook engine into the project + register the hook in user
@@ -279,16 +308,12 @@ fn print_detection_summary(project: &ProjectContext) {
     );
 }
 
-/// Persist a baseline `.grove/config.toml` capturing the Phase 1 detection. Refuses
-/// to overwrite an existing file so user edits survive `grove init` re-runs.
-fn write_grove_config(project_root: &Path, project: &ProjectContext) -> Result<(), String> {
-    let dir = project_root.join(".grove");
-    fs::create_dir_all(&dir).map_err(|e| format!("create .grove/: {}", e))?;
-    let path = dir.join("config.toml");
-    if path.exists() {
-        return Ok(()); // respect existing user config
-    }
-
+/// Build the in-memory `.grove/config.toml` view from a detected ProjectContext
+/// and a (possibly empty) CI-parity scrape result. Pure function — easy to test.
+fn build_grove_config(
+    project: &ProjectContext,
+    scraped: crate::devcontainer::ci_scrape::ScrapeResult,
+) -> GroveConfig {
     let mut config = GroveConfig::default();
     if let Some(s) = project.stack {
         config.stack.detected = Some(s.as_str().to_string());
@@ -296,6 +321,58 @@ fn write_grove_config(project_root: &Path, project: &ProjectContext) -> Result<(
     config.stack.toolchain = project.toolchain_version.clone();
     config.stack.package_mgr = project.package_manager.clone();
     config.stack.default_branch = project.default_branch.clone();
+
+    let stack_enum = project.stack.unwrap_or(crate::models::ProjectStack::Unknown);
+    config.verify = if scraped.is_empty() {
+        let defaults = crate::devcontainer::stack::verify_defaults(
+            stack_enum,
+            project.package_manager.as_deref(),
+        );
+        crate::models::VerifySection {
+            test: defaults.test,
+            lint: defaults.lint,
+            format: defaults.format,
+            typecheck: defaults.typecheck,
+            source: Some("stack-default".to_string()),
+        }
+    } else {
+        crate::devcontainer::ci_scrape::into_verify_section(scraped)
+    };
+
+    config.caches.volumes = crate::devcontainer::stack::cache_volumes(stack_enum, &project.repo_name)
+        .into_iter()
+        .map(|(source, target)| crate::models::CacheVolume { source, target })
+        .collect();
+
+    config.hooks.pre_commit = project.has_pre_commit;
+    config.hooks.husky = project.has_husky;
+    config.hooks.lefthook = project.has_lefthook;
+    config.meta.claude_md_strategy = Some(
+        if project.has_claude_md {
+            "reference".to_string()
+        } else {
+            "absent".to_string()
+        },
+    );
+    config
+}
+
+/// Persist a baseline `.grove/config.toml` capturing the Phase 1 detection. Refuses
+/// to overwrite an existing file so user edits survive `grove init` re-runs.
+fn write_grove_config(
+    project_root: &Path,
+    project: &ProjectContext,
+    ctx: &worktree_manager::RepoContext,
+) -> Result<(), String> {
+    let dir = project_root.join(".grove");
+    fs::create_dir_all(&dir).map_err(|e| format!("create .grove/: {}", e))?;
+    let path = dir.join("config.toml");
+    if path.exists() {
+        return Ok(()); // respect existing user config
+    }
+
+    let scraped = crate::devcontainer::ci_scrape::scrape(ctx);
+    let mut config = build_grove_config(project, scraped);
     config.devcontainer.enabled = true;
     config.devcontainer.auto_up = true;
     config.meta.initialized_at = Some(chrono::Utc::now());
@@ -356,6 +433,70 @@ fn ensure_groverc_bootstrap(project_root: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// Idempotent: append grove-specific dockerignore entries if missing. Only invoked
+/// when a Dockerfile is present in HEAD.
+fn patch_dockerignore(project_root: &Path) -> Result<(), String> {
+    let path = project_root.join(".dockerignore");
+    let existing = fs::read_to_string(&path).unwrap_or_default();
+    let entries = ["worktrees/", ".grove/"];
+    let mut out = existing.clone();
+    if !out.ends_with('\n') && !out.is_empty() {
+        out.push('\n');
+    }
+    let mut needs_header = !existing.contains("# grove");
+    for entry in entries.iter() {
+        if !existing.lines().any(|l| l.trim() == *entry) {
+            if needs_header {
+                out.push_str("\n# grove\n");
+                needs_header = false;
+            }
+            out.push_str(entry);
+            out.push('\n');
+        }
+    }
+    fs::write(&path, out).map_err(|e| format!("write .dockerignore: {}", e))?;
+    Ok(())
+}
+
+/// Add named cache volumes (from `stack::cache_volumes`) to devcontainer.json's
+/// `mounts` array. No-op if devcontainer.json doesn't exist (e.g. --no-devcontainer).
+fn apply_cache_volumes_to_devcontainer(
+    project_root: &Path,
+    project: &ProjectContext,
+) -> Result<(), String> {
+    let dev_path = project_root.join(".devcontainer").join("devcontainer.json");
+    if !dev_path.exists() {
+        return Ok(());
+    }
+    let raw = fs::read_to_string(&dev_path).map_err(|e| format!("read {}: {}", dev_path.display(), e))?;
+    let mut value: serde_json::Value = serde_json::from_str(&raw)
+        .map_err(|e| format!("parse {}: {}", dev_path.display(), e))?;
+    let stack = project.stack.unwrap_or(crate::models::ProjectStack::Unknown);
+    let vols = crate::devcontainer::stack::cache_volumes(stack, &project.repo_name);
+
+    let obj = value
+        .as_object_mut()
+        .ok_or_else(|| "devcontainer.json top-level is not a JSON object".to_string())?;
+    let mounts = obj
+        .entry("mounts")
+        .or_insert_with(|| serde_json::json!([]))
+        .as_array_mut()
+        .ok_or_else(|| "devcontainer.json `mounts` is not an array".to_string())?;
+    for (source, target) in vols {
+        let entry = format!(
+            "source={},target={},type=volume",
+            source, target
+        );
+        if !mounts.iter().any(|v| v == &serde_json::Value::String(entry.clone())) {
+            mounts.push(serde_json::Value::String(entry));
+        }
+    }
+    let body = serde_json::to_string_pretty(&value)
+        .map_err(|e| format!("serialize {}: {}", dev_path.display(), e))?;
+    fs::write(&dev_path, body).map_err(|e| format!("write {}: {}", dev_path.display(), e))?;
+    Ok(())
+}
+
 /// Idempotent: append grove-specific gitignore entries if missing. Never rewrites or
 /// reorders existing lines.
 fn patch_gitignore(project_root: &Path) -> Result<(), String> {
@@ -401,31 +542,89 @@ mod tests {
     }
 
     #[test]
-    fn write_grove_config_creates_toml() {
-        let dir = tmp("config");
+    fn build_grove_config_carries_stack_metadata() {
         let project = ProjectContext {
             stack: Some(crate::models::ProjectStack::Rust),
             package_manager: Some("cargo".into()),
             toolchain_version: Some("rust-stable".into()),
             default_branch: Some("main".into()),
             repo_name: "demo".into(),
+            has_pre_commit: true,
             ..Default::default()
         };
-        write_grove_config(&dir, &project).unwrap();
-        let body = fs::read_to_string(dir.join(".grove/config.toml")).unwrap();
-        assert!(body.contains("detected = \"rust\""));
-        assert!(body.contains("package_mgr = \"cargo\""));
+        let config = build_grove_config(
+            &project,
+            crate::devcontainer::ci_scrape::ScrapeResult::default(),
+        );
+        assert_eq!(config.stack.detected.as_deref(), Some("rust"));
+        assert_eq!(config.stack.package_mgr.as_deref(), Some("cargo"));
+        // Fell back to stack defaults for verify.
+        assert_eq!(config.verify.source.as_deref(), Some("stack-default"));
+        assert_eq!(config.verify.test[0], "cargo");
+        // Cache volumes for Rust include cargo registry + per-repo target.
+        assert!(config
+            .caches
+            .volumes
+            .iter()
+            .any(|v| v.source == "grove-cargo-registry"));
+        assert!(config.hooks.pre_commit);
+        assert_eq!(config.meta.claude_md_strategy.as_deref(), Some("absent"));
+    }
+
+    #[test]
+    fn build_grove_config_uses_scrape_when_available() {
+        let project = ProjectContext {
+            stack: Some(crate::models::ProjectStack::Rust),
+            repo_name: "demo".into(),
+            ..Default::default()
+        };
+        let mut scraped = crate::devcontainer::ci_scrape::ScrapeResult::default();
+        crate::devcontainer::ci_scrape::classify_and_push("pytest -q tests/", &mut scraped);
+        let config = build_grove_config(&project, scraped);
+        assert_eq!(config.verify.source.as_deref(), Some("ci-scrape"));
+        assert_eq!(config.verify.test[0], "pytest");
+    }
+
+    #[test]
+    fn patch_dockerignore_appends_grove_block() {
+        let dir = tmp("dockerignore-new");
+        patch_dockerignore(&dir).unwrap();
+        let body = fs::read_to_string(dir.join(".dockerignore")).unwrap();
+        assert!(body.contains("# grove"));
+        assert!(body.contains("worktrees/"));
+        assert!(body.contains(".grove/"));
         let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn write_grove_config_does_not_overwrite_existing() {
-        let dir = tmp("config-existing");
-        fs::create_dir_all(dir.join(".grove")).unwrap();
-        fs::write(dir.join(".grove/config.toml"), "# user-edited\n").unwrap();
-        write_grove_config(&dir, &ProjectContext::default()).unwrap();
-        let body = fs::read_to_string(dir.join(".grove/config.toml")).unwrap();
-        assert!(body.contains("# user-edited"));
+    fn patch_dockerignore_is_idempotent() {
+        let dir = tmp("dockerignore-idem");
+        patch_dockerignore(&dir).unwrap();
+        let body1 = fs::read_to_string(dir.join(".dockerignore")).unwrap();
+        patch_dockerignore(&dir).unwrap();
+        let body2 = fs::read_to_string(dir.join(".dockerignore")).unwrap();
+        assert_eq!(body1, body2);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn apply_cache_volumes_adds_named_volumes_to_devcontainer() {
+        let dir = tmp("apply-vols");
+        fs::create_dir_all(dir.join(".devcontainer")).unwrap();
+        fs::write(
+            dir.join(".devcontainer/devcontainer.json"),
+            r#"{"name":"demo","mounts":[]}"#,
+        )
+        .unwrap();
+        let project = ProjectContext {
+            stack: Some(crate::models::ProjectStack::Rust),
+            repo_name: "demo".into(),
+            ..Default::default()
+        };
+        apply_cache_volumes_to_devcontainer(&dir, &project).unwrap();
+        let body = fs::read_to_string(dir.join(".devcontainer/devcontainer.json")).unwrap();
+        assert!(body.contains("grove-cargo-registry"));
+        assert!(body.contains("type=volume"));
         let _ = fs::remove_dir_all(&dir);
     }
 
