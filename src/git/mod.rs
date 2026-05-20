@@ -1,4 +1,5 @@
 pub mod worktree_manager;
+pub mod worktree_paths;
 
 pub use worktree_manager::{
     add_worktree, branch_exists, clone_bare_repository, discover_repo, find_worktree_by_name,

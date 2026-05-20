@@ -14,6 +14,7 @@ use crate::agent::seed;
 use crate::git::worktree_manager::{
     add_worktree, branch_exists, discover_repo, layout, project_root,
 };
+use crate::git::worktree_paths::make_worktree_pointers_relative;
 use crate::models::{AgentMetadata, ProjectLayout};
 use crate::session::container::{self, ContainerInfo};
 use crate::session::tmux::{launch_detached, SessionSpec};
@@ -244,6 +245,22 @@ fn fresh_agent(
         target_branch.bold()
     );
 
+    // Rewrite the two .git pointer files (forward + back) to use RELATIVE
+    // paths so the worktree resolves identically on host and inside the
+    // devcontainer (host /home/u/proj vs container /workspaces/proj).
+    if let Err(e) = make_worktree_pointers_relative(worktree_path) {
+        eprintln!(
+            "  {} rewrite worktree pointers to relative: {} (git ops inside the container may fail)",
+            "Warning:".yellow(),
+            e
+        );
+    } else {
+        println!(
+            "  {} relativized .git pointers (works under host + container)",
+            "·".dimmed()
+        );
+    }
+
     if let Err(e) = seed::link_grove_into_worktree(worktree_path, project_root_path) {
         eprintln!("  {} link .grove into worktree: {}", "Warning:".yellow(), e);
     } else {
@@ -364,6 +381,17 @@ fn resume_agent(
             "·".dimmed(),
             worktree_path.display(),
             recorded_branch.bold()
+        );
+    }
+
+    // Always relativize pointers on resume — covers two cases: (1) a fresh
+    // re-create above; (2) a worktree from an older grove that wrote absolute
+    // paths. Idempotent when already relative.
+    if let Err(e) = make_worktree_pointers_relative(worktree_path) {
+        eprintln!(
+            "  {} rewrite worktree pointers to relative: {}",
+            "Warning:".yellow(),
+            e
         );
     }
 
