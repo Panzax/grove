@@ -143,6 +143,46 @@ pub fn run(git_url: Option<&str>, no_agent: bool, no_devcontainer: bool, reconfi
         println!("  {} patched .gitignore (.grove/, worktrees/)", "·".dimmed());
     }
 
+    // Install the Stop-hook engine into the project + register the hook in user
+    // settings. These are idempotent so repeated `grove init` runs are safe.
+    match crate::agent::hook::install_engine(&context) {
+        Ok(p) => println!("  {} installed engine at {}", "·".dimmed(), p.display()),
+        Err(e) => eprintln!("  {} failed to install loop engine: {}", "Warning:".yellow(), e),
+    }
+    match crate::agent::hook::default_user_settings_path() {
+        Some(path) => match crate::agent::hook::install_stop_hook(
+            &path,
+            crate::agent::hook::HOOK_COMMAND,
+        ) {
+            Ok(report) => {
+                if report.added {
+                    println!(
+                        "  {} registered Stop hook in {} (total Stop entries: {})",
+                        "·".dimmed(),
+                        report.path.display(),
+                        report.total_stop_hooks
+                    );
+                } else {
+                    println!(
+                        "  {} Stop hook already present in {} ({} total)",
+                        "·".dimmed(),
+                        report.path.display(),
+                        report.total_stop_hooks
+                    );
+                }
+            }
+            Err(e) => eprintln!(
+                "  {} could not install Stop hook (set CLAUDE_HOME or edit ~/.claude/settings.json manually): {}",
+                "Warning:".yellow(),
+                e
+            ),
+        },
+        None => eprintln!(
+            "  {} could not locate ~/.claude/settings.json; skipping Stop hook registration",
+            "Warning:".yellow()
+        ),
+    }
+
     // ---- Phase 2 hook: setup wizard ----
     if no_agent {
         println!(
