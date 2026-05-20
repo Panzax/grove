@@ -37,7 +37,9 @@ pub fn list() {
     }
     // Cross-reference with live tmux sessions so we can mark each agent
     // attached or detached.
-    let live_sessions: std::collections::HashSet<String> = tmux::list_grove_sessions()
+    // C3: pass None (host target). C6 will resolve a container target
+    // when [devcontainer] enabled = true.
+    let live_sessions: std::collections::HashSet<String> = tmux::list_grove_sessions(None)
         .unwrap_or_default()
         .into_iter()
         .collect();
@@ -99,7 +101,8 @@ pub fn status(name: &str) {
         }
     };
     let session_name = tmux::session_name(name);
-    let attached = tmux::has_session(&session_name).unwrap_or(false);
+    // C3: pass None (host target). C6 wires container resolution.
+    let attached = tmux::has_session(&session_name, None).unwrap_or(false);
     println!(
         "{} ({})",
         row.metadata.name.bold(),
@@ -134,12 +137,12 @@ pub fn status(name: &str) {
             "detached".dimmed().to_string()
         }
     );
-    println!("  attach        : {}", tmux::attach_instructions(name));
+    println!("  attach        : {}", tmux::attach_instructions(name, None));
 }
 
 pub fn kill(name: &str) {
     let session_name = tmux::session_name(name);
-    match tmux::kill_session(&session_name) {
+    match tmux::kill_session(&session_name, None) {
         Ok(()) => println!("{} killed {}", "✓".green(), session_name),
         Err(e) => {
             eprintln!("{} {}", "Error:".red(), e);

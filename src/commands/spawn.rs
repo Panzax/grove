@@ -190,7 +190,9 @@ pub fn run(
         env,
         command: cmd_tokens.clone(),
     };
-    match launch_detached(&spec) {
+    // C3: host target for now. C5 plugs in container::ensure_up so the
+    // session lives inside the devcontainer.
+    match launch_detached(&spec, None) {
         Ok(session_name) => {
             println!(
                 "{} launched tmux session {} ({})",
@@ -200,7 +202,7 @@ pub fn run(
             );
             println!(
                 "  attach: {}",
-                crate::session::tmux::attach_instructions(name)
+                crate::session::tmux::attach_instructions(name, None)
             );
         }
         Err(e) => {
