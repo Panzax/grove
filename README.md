@@ -321,6 +321,94 @@ cargo check             # type-check
 cargo test --all        # unit + integration tests
 ```
 
+### Development workflow (editable install + warm rebuilds)
+
+Grove has no `pip install -e .` equivalent in cargo. The closest setup that
+keeps `grove` "live" against your checkout is:
+
+**1. Shell function** in `~/.bashrc` / `~/.zshrc`:
+
+```bash
+grove() {
+  cargo run --quiet --manifest-path "$HOME/Documents/GitHub/grove/Cargo.toml" -- "$@"
+}
+```
+
+Calling `grove` from any cwd compiles+runs the current checkout. Cargo
+skips the rebuild if nothing changed, so subsequent invocations are
+near-instant. The function uses `--manifest-path` so cwd doesn't matter —
+important since grove is meant to operate on *other* repos.
+
+If you need to call an installed `grove` binary instead of the function,
+use `command grove ...` or `~/.cargo/bin/grove ...`.
+
+For release-mode smoke tests:
+
+```bash
+groverel() {
+  cargo run --release --quiet --manifest-path "$HOME/Documents/GitHub/grove/Cargo.toml" -- "$@"
+}
+```
+
+**2. Bacon** ([dystroy.org/bacon](https://dystroy.org/bacon/)) in a background
+terminal pane keeps the incremental compile cache warm:
+
+```bash
+cd ~/Documents/GitHub/grove
+bacon            # default: `cargo check --all-targets` — surfaces type
+                 # errors as you save
+bacon build      # keeps target/debug/grove warm so the shell function's
+                 # next invocation is ~50ms
+bacon test       # `cargo test` on every save
+bacon clippy     # linter
+```
+
+The `bacon.toml` at the repo root defines all four jobs.
+
+**3. Make `grove` available on `$PATH`** (for hooks, scripts, and any
+non-interactive shell — the shell function above only fires in interactive
+shells):
+
+```bash
+# One-time: build a release binary, then symlink it into ~/.cargo/bin/
+# (which is on $PATH for any user with a Rust toolchain).
+cargo build --release
+mkdir -p ~/.cargo/bin
+ln -sf "$HOME/Documents/GitHub/grove/target/release/grove" ~/.cargo/bin/grove
+```
+
+Then run `bacon release` in a background pane (defined in `bacon.toml`)
+so the symlink target stays current as you edit. The first invocation
+after a save costs a release-mode rebuild (a few seconds — bacon does it,
+not you). Subsequent invocations resolve through the symlink at native
+binary speed: no cargo overhead per call.
+
+If you'd rather keep dev-iteration faster and `grove` on PATH only
+periodically (e.g. ship-when-stable), use `cargo install --path .`
+instead — it copies the binary into `~/.cargo/bin/grove` but doesn't
+auto-update on edits. Run again after each change you want to publish.
+
+**4. Recommended setup overall**:
+- `bacon release` in a background pane (keeps the PATH-symlink target warm).
+- The `grove()` shell function in your rc file (interactive dev convenience).
+- `~/.cargo/bin/grove` symlink → `target/release/grove` (covers hooks +
+  non-interactive callers + the multi-agent worktree scenarios where grove
+  invokes itself recursively).
+
+When the function and the symlink both exist: interactive shells call the
+function (cargo overhead, debug build, faster recompile); scripts /
+sub-processes call the binary via PATH (release, near-zero overhead).
+Both run against the same source tree.
+
+**Tradeoffs by approach**
+
+| Approach | Editable? | Speed per invocation | Available to non-interactive callers? |
+|---|---|---|---|
+| Symlink `target/release/grove` → `~/.cargo/bin/grove` + `bacon release` | Yes | Native binary | Yes |
+| Shell function + `bacon build` | Yes | ~50ms cargo overhead | No (functions are shell-local) |
+| `cargo install --path .` | No (reinstall per change) | Native | Yes |
+| `cargo watch -x run` | Only in the watching terminal | N/A | No |
+
 ## License
 
 MIT. Copyright (c) 2025 Safia Abdalla (upstream). Fork additions copyright (c) 2026
