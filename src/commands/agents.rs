@@ -12,7 +12,8 @@ use colored::Colorize;
 
 use crate::agent::loop_md;
 use crate::git::worktree_manager::{discover_repo, project_root};
-use crate::models::AgentMetadata;
+use crate::models::{AgentMetadata, GroveConfig};
+use crate::session::container::{self, ContainerInfo};
 use crate::session::tmux;
 
 pub fn list() {
@@ -36,13 +37,15 @@ pub fn list() {
         return;
     }
     // Cross-reference with live tmux sessions so we can mark each agent
-    // attached or detached.
-    // C3: pass None (host target). C6 will resolve a container target
-    // when [devcontainer] enabled = true.
-    let live_sessions: std::collections::HashSet<String> = tmux::list_grove_sessions(None)
-        .unwrap_or_default()
-        .into_iter()
-        .collect();
+    // attached or detached. When [devcontainer] enabled, query in-container
+    // tmux; when disabled or unreachable, fall back to host tmux.
+    let project_root_path = project_root(&ctx).to_path_buf();
+    let container = resolve_container_for_query(&project_root_path);
+    let live_sessions: std::collections::HashSet<String> =
+        tmux::list_grove_sessions(container.as_ref())
+            .unwrap_or_default()
+            .into_iter()
+            .collect();
 
     println!(
         "{:<24} {:<10} {:<5} {:<8} {:<12} TASK",
@@ -101,8 +104,9 @@ pub fn status(name: &str) {
         }
     };
     let session_name = tmux::session_name(name);
-    // C3: pass None (host target). C6 wires container resolution.
-    let attached = tmux::has_session(&session_name, None).unwrap_or(false);
+    let project_root_path = project_root(&ctx).to_path_buf();
+    let container = resolve_container_for_query(&project_root_path);
+    let attached = tmux::has_session(&session_name, container.as_ref()).unwrap_or(false);
     println!(
         "{} ({})",
         row.metadata.name.bold(),
@@ -137,12 +141,19 @@ pub fn status(name: &str) {
             "detached".dimmed().to_string()
         }
     );
-    println!("  attach        : {}", tmux::attach_instructions(name, None));
+    println!(
+        "  attach        : {}",
+        tmux::attach_instructions(name, container.as_ref())
+    );
 }
 
 pub fn kill(name: &str) {
     let session_name = tmux::session_name(name);
-    match tmux::kill_session(&session_name, None) {
+    let project_root_path = discover_repo().ok().map(|c| project_root(&c).to_path_buf());
+    let container = project_root_path
+        .as_deref()
+        .and_then(resolve_container_for_query);
+    match tmux::kill_session(&session_name, container.as_ref()) {
         Ok(()) => println!("{} killed {}", "✓".green(), session_name),
         Err(e) => {
             eprintln!("{} {}", "Error:".red(), e);
@@ -249,6 +260,42 @@ fn load_agent(agent_dir: &Path) -> Result<AgentRow, String> {
         completion_promise,
         active,
     })
+}
+
+/// Resolve a ContainerInfo for queries (list/status/kill) WITHOUT bringing
+/// the container up. If `[devcontainer] enabled` and the container is
+/// already running, return Some; otherwise None (we'll query host tmux).
+///
+/// `grove spawn` is the one place that auto-starts the container — read
+/// operations should never trigger a 30-60s container boot.
+fn resolve_container_for_query(project_root: &Path) -> Option<ContainerInfo> {
+    let cfg_path = project_root.join(".grove").join("config.toml");
+    let raw = std::fs::read_to_string(&cfg_path).ok()?;
+    let cfg: GroveConfig = toml::from_str(&raw).ok()?;
+    if !cfg.devcontainer.enabled {
+        return None;
+    }
+    if !container::is_up(project_root) {
+        return None;
+    }
+    // Container is running — build a ContainerInfo from config. This avoids
+    // re-shelling out for metadata we already wrote at init time.
+    let workspace_target = cfg
+        .devcontainer
+        .workspace_target
+        .unwrap_or_else(|| format!("/workspaces/{}", project_root_basename(project_root)));
+    Some(ContainerInfo::new(
+        project_root.to_path_buf(),
+        std::path::PathBuf::from(workspace_target),
+        cfg.devcontainer.remote_user,
+    ))
+}
+
+fn project_root_basename(p: &Path) -> String {
+    p.file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("workspace")
+        .to_string()
 }
 
 fn short_branch(branch: &str) -> String {
