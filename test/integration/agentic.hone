@@ -1,0 +1,102 @@
+#! shell: /bin/bash
+#! timeout: 60s
+
+# Grove agentic-flow Integration Tests
+# Verifies the new fork-specific surface from outside the test binary.
+# These tests do NOT require Claude Code, tmux, or a devcontainer — they
+# exercise the deterministic Phase 1 scaffold + the commands that should
+# fail-clean in absence of project context.
+
+TEST "grove --help lists the new agentic commands"
+
+RUN grove --help
+ASSERT exit_code == 0
+ASSERT stdout contains "spawn"
+ASSERT stdout contains "agents"
+ASSERT stdout contains "loop"
+ASSERT stdout contains "msg"
+ASSERT stdout contains "integrate"
+
+TEST "grove spawn --help shows --task and --branch"
+
+RUN grove spawn --help
+ASSERT exit_code == 0
+ASSERT stdout contains "--task"
+ASSERT stdout contains "--branch"
+
+TEST "grove init --help advertises --no-agent and --reconfigure"
+
+RUN grove init --help
+ASSERT exit_code == 0
+ASSERT stdout contains "no-agent"
+ASSERT stdout contains "no-devcontainer"
+ASSERT stdout contains "reconfigure"
+
+TEST "grove agents list outside a grove repo errors cleanly"
+
+ENV TEST_DIR=/tmp/grove-agentic-agents-no-repo
+RUN setup: rm -rf $TEST_DIR && mkdir -p $TEST_DIR
+RUN agents-test: cd $TEST_DIR && grove agents list
+ASSERT agents-test.exit_code != 0
+ASSERT agents-test.stderr contains "Error"
+RUN cleanup: rm -rf $TEST_DIR
+
+TEST "grove loop outside a grove repo errors cleanly"
+
+ENV TEST_DIR=/tmp/grove-agentic-loop-no-repo
+RUN setup: rm -rf $TEST_DIR && mkdir -p $TEST_DIR
+RUN loop-test: cd $TEST_DIR && grove loop
+ASSERT loop-test.exit_code != 0
+ASSERT loop-test.stderr contains "Error"
+RUN cleanup: rm -rf $TEST_DIR
+
+TEST "grove msg outside a grove repo errors cleanly"
+
+ENV TEST_DIR=/tmp/grove-agentic-msg-no-repo
+RUN setup: rm -rf $TEST_DIR && mkdir -p $TEST_DIR
+RUN msg-test: cd $TEST_DIR && grove msg broadcast "hello"
+ASSERT msg-test.exit_code != 0
+ASSERT msg-test.stderr contains "Error"
+RUN cleanup: rm -rf $TEST_DIR
+
+TEST "grove integrate outside a grove repo errors cleanly"
+
+ENV TEST_DIR=/tmp/grove-agentic-integrate-no-repo
+RUN setup: rm -rf $TEST_DIR && mkdir -p $TEST_DIR
+RUN integrate-test: cd $TEST_DIR && grove integrate
+ASSERT integrate-test.exit_code != 0
+ASSERT integrate-test.stderr contains "Error"
+RUN cleanup: rm -rf $TEST_DIR
+
+TEST "grove init with no args adopts a fresh git repo in cwd"
+
+ENV TEST_DIR=/tmp/grove-agentic-init-in-place
+RUN setup: rm -rf $TEST_DIR && mkdir -p $TEST_DIR && cd $TEST_DIR && git init -q && git -c user.email=t@t -c user.name=t commit --allow-empty -q -m init
+RUN init-test: cd $TEST_DIR && grove init --no-agent
+ASSERT init-test.exit_code == 0
+ASSERT init-test.stdout contains "Adopting"
+ASSERT init-test.stdout contains "in-place"
+RUN check-config: ls $TEST_DIR/.grove
+ASSERT check-config.stdout contains "config.toml"
+ASSERT check-config.stdout contains "PROMPT.template.md"
+RUN cleanup: rm -rf $TEST_DIR
+
+TEST "grove init <path> adopts the supplied directory"
+
+ENV TEST_DIR=/tmp/grove-agentic-init-explicit-path
+RUN setup: rm -rf $TEST_DIR && mkdir -p $TEST_DIR && cd $TEST_DIR && git init -q && git -c user.email=t@t -c user.name=t commit --allow-empty -q -m init
+RUN init-test: grove init $TEST_DIR --no-agent
+ASSERT init-test.exit_code == 0
+ASSERT init-test.stdout contains "Adopting"
+RUN config-check: test -f $TEST_DIR/.grove/config.toml
+ASSERT config-check.exit_code == 0
+RUN cleanup: rm -rf $TEST_DIR
+
+TEST "grove init refuses path that isn't a git repo"
+
+ENV TEST_DIR=/tmp/grove-agentic-init-non-git
+RUN setup: rm -rf $TEST_DIR && mkdir -p $TEST_DIR
+RUN init-test: cd $TEST_DIR && grove init --no-agent
+ASSERT init-test.exit_code != 0
+ASSERT init-test.stderr contains "not a git repository"
+RUN cleanup: rm -rf $TEST_DIR

@@ -1,10 +1,16 @@
 use colored::Colorize;
-use std::process::Command;
 
+#[allow(unused_imports)]
+// upstream's unit tests live in utils.rs; keep the import path stable.
 use crate::utils::get_self_update_command;
 
 pub fn run(version: Option<&str>, pr: Option<u64>) {
-    let base_url = "https://i.safia.sh/captainsafia/grove";
+    // Fork note: upstream's self-update hits https://i.safia.sh (captainsafia's hosted
+    // install endpoint) which does not serve this fork's binaries. Until Panzax/grove
+    // ships a hosted install script of its own, this command prints a notice rather
+    // than attempting a download. `get_self_update_command` is preserved for upstream
+    // unit-test compatibility.
+    let base_url = "https://github.com/Panzax/grove/releases";
     let install_url = if let Some(pr_num) = pr {
         format!("{}/pr/{}", base_url, pr_num)
     } else if let Some(ver) = version {
@@ -18,23 +24,13 @@ pub fn run(version: Option<&str>, pr: Option<u64>) {
         base_url.to_string()
     };
 
-    let (command, args) = get_self_update_command(&install_url);
-
-    let status = Command::new(command).args(args).status();
-
-    match status {
-        Ok(s) if s.success() => {
-            println!();
-            println!("{}", "✓ Update completed successfully".green());
-        }
-        Ok(s) => {
-            let code = s.code().unwrap_or(1);
-            eprintln!("{} Update failed with exit code {}", "Error:".red(), code);
-            std::process::exit(1);
-        }
-        Err(e) => {
-            eprintln!("{} {}", "Error:".red(), e);
-            std::process::exit(1);
-        }
-    }
+    eprintln!(
+        "{} grove self-update is not available on this fork yet.",
+        "Note:".yellow()
+    );
+    eprintln!(
+        "       Build from source: cargo install --git {}",
+        "https://github.com/Panzax/grove"
+    );
+    eprintln!("       Target URL was: {}", install_url);
 }

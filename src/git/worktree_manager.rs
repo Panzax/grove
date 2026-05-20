@@ -4,7 +4,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use crate::models::Worktree;
+use crate::models::{ProjectLayout, Worktree};
 use crate::utils::{discover_bare_clone, get_project_root, trim_trailing_branch_slashes};
 
 pub const MAIN_BRANCHES: &[&str] = &["main", "master"];
@@ -13,20 +13,94 @@ pub const DETACHED_HEAD: &str = "detached HEAD";
 pub struct RepoContext {
     repo_path: PathBuf,
     project_root: PathBuf,
+    layout: ProjectLayout,
 }
 
 /// Discover the grove repository and return the repo context.
+///
+/// Search order:
+///   1. `GROVE_REPO` env var (set by a previous `discover_repo` / `grove go`).
+///   2. Walk up from cwd looking for a bare clone (`<name>.git/`) — upstream layout.
+///   3. Walk up from cwd looking for an in-place `.git/` checkout — fork addition.
+///
+/// In-place mode is matched only as a fallback so existing bare-clone projects keep
+/// working unchanged.
 pub fn discover_repo() -> Result<RepoContext, String> {
-    let bare_clone_path = discover_bare_clone(None).map_err(|e| e.message)?;
-    let project_root = get_project_root(&bare_clone_path);
+    if let Ok(bare_clone_path) = discover_bare_clone(None).map_err(|e| e.message) {
+        let project_root = get_project_root(&bare_clone_path);
+        env::set_var("GROVE_REPO", &bare_clone_path);
+        return Ok(RepoContext {
+            repo_path: bare_clone_path,
+            project_root,
+            layout: ProjectLayout::Bare,
+        });
+    }
+    // In-place fallback: only adopt the discovered git checkout if it has been
+    // through `grove init` already (signaled by `.grove/config.toml`). Without
+    // this gate, every `grove add` / `grove list` / etc. would silently start
+    // working in any git repo a user happens to `cd` into — breaking upstream's
+    // "Not in a grove repository" contract.
+    let in_place_result = discover_in_place(None);
+    let in_place_msg = match in_place_result {
+        Ok(ctx) => {
+            if ctx.project_root.join(".grove").join("config.toml").exists() {
+                return Ok(ctx);
+            }
+            format!(
+                "discovered git checkout at {} but no .grove/config.toml — not grove-initialized.",
+                ctx.project_root.display()
+            )
+        }
+        Err(e) => e,
+    };
+    Err(format!(
+        "Not in a grove repository.\n\
+         Run `grove init <git-url>` to clone a fresh bare-layout project, OR\n\
+         `grove init [<path>]` to adopt an existing git checkout in-place.\n\
+         ({})",
+        in_place_msg
+    ))
+}
 
-    // Cache the discovered path
-    env::set_var("GROVE_REPO", &bare_clone_path);
-
-    Ok(RepoContext {
-        repo_path: bare_clone_path,
-        project_root,
-    })
+/// Adopt the supplied path (or cwd) as an in-place grove project. Verifies that the
+/// path is a git working copy (a `.git/` dir or a `.git` file pointing into one),
+/// then returns a `RepoContext` whose `repo_path == project_root` (both refer to the
+/// repo's working-tree root). All git operations issue `git -C <root>` via
+/// `git_raw`, which handles both bare and non-bare paths transparently.
+pub fn discover_in_place(start: Option<&Path>) -> Result<RepoContext, String> {
+    let start_path = match start {
+        Some(p) => p.to_path_buf(),
+        None => std::env::current_dir().map_err(|e| format!("cwd: {}", e))?,
+    };
+    let mut cursor: PathBuf = start_path
+        .canonicalize()
+        .unwrap_or_else(|_| start_path.clone());
+    loop {
+        let dot_git = cursor.join(".git");
+        if dot_git.exists() {
+            // Either a real `.git/` directory or a `.git` file pointing into one — git
+            // handles both via rev-parse; we just need to verify we're inside something.
+            let probe = Command::new("git")
+                .args(["rev-parse", "--is-inside-work-tree"])
+                .current_dir(&cursor)
+                .output()
+                .map_err(|e| format!("git rev-parse: {}", e))?;
+            if probe.status.success() {
+                env::set_var("GROVE_REPO", &cursor);
+                return Ok(RepoContext {
+                    repo_path: cursor.clone(),
+                    project_root: cursor,
+                    layout: ProjectLayout::InPlace,
+                });
+            }
+        }
+        if !cursor.pop() {
+            return Err(format!(
+                "Not inside a grove or git project: searched up from {}",
+                start_path.display()
+            ));
+        }
+    }
 }
 
 pub fn repo_path(context: &RepoContext) -> &Path {
@@ -35,6 +109,25 @@ pub fn repo_path(context: &RepoContext) -> &Path {
 
 pub fn project_root(context: &RepoContext) -> &Path {
     &context.project_root
+}
+
+pub fn layout(context: &RepoContext) -> ProjectLayout {
+    context.layout
+}
+
+/// Convenience constructor for tests and the init-time in-place flow, which needs to
+/// produce a RepoContext for a path before git knows about it.
+#[allow(dead_code)]
+pub fn make_context(
+    repo_path: PathBuf,
+    project_root: PathBuf,
+    layout: ProjectLayout,
+) -> RepoContext {
+    RepoContext {
+        repo_path,
+        project_root,
+        layout,
+    }
 }
 
 fn git_raw(context: &RepoContext, args: &[&str]) -> Result<String, String> {
@@ -383,6 +476,35 @@ pub fn get_default_branch(context: &RepoContext) -> Result<String, String> {
     }
 
     Err("Could not determine default branch. Please specify with --branch.".to_string())
+}
+
+/// Read a file from HEAD against the bare clone without a working tree.
+///
+/// Used by the agentic init Phase 1 / Phase 2 to inspect manifests
+/// (`pyproject.toml`, `Cargo.toml`, `package.json`, ...) immediately after
+/// `clone_bare_repository`. Returns the file contents on success.
+pub fn show_head_file(context: &RepoContext, file: &str) -> Result<String, String> {
+    git_raw(context, &["show", &format!("HEAD:{}", file)])
+        .map_err(|e| format!("Failed to read HEAD:{}: {}", file, e))
+}
+
+/// List every tracked path at HEAD against the bare clone.
+///
+/// Used by the agentic init Phase 1 to detect monorepo structures and find every
+/// candidate manifest without a working tree.
+pub fn ls_head_files(context: &RepoContext) -> Result<Vec<String>, String> {
+    let output = git_raw(context, &["ls-tree", "-r", "--name-only", "HEAD"])
+        .map_err(|e| format!("Failed to ls-tree HEAD: {}", e))?;
+    Ok(output
+        .lines()
+        .filter(|line| !line.is_empty())
+        .map(|s| s.to_string())
+        .collect())
+}
+
+/// Check whether `HEAD:<file>` exists as a regular blob.
+pub fn head_file_exists(context: &RepoContext, file: &str) -> bool {
+    git_raw(context, &["cat-file", "-e", &format!("HEAD:{}", file)]).is_ok()
 }
 
 pub fn sync_branch(context: &RepoContext, branch: &str) -> Result<(), String> {

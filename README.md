@@ -1,13 +1,17 @@
 # grove
 
-<div align="center">
-  <img src="site/logo.png" alt="Grove Logo" width="200"/>
-</div>
+> **Panzax fork** of [`captainsafia/grove`](https://github.com/captainsafia/grove). Adds
+> a portable agentic-workflow layer (devcontainer-aware setup wizard, multi-agent worktree
+> spawning, file-based collaboration bus, Stop-hook Ralph loop engine) on top of the
+> original worktree-management CLI. Upstream credit preserved; see `LICENSE`.
 
-Grove is a CLI tool that encapsulates the patterns that I use for working with Git worktrees locally on my machine. To learn more about this pattern, you can check out [this blog post](https://blog.safia.rocks/2025/09/03/git-worktrees/).
+Grove is a CLI for managing Git worktrees and driving long-running coding agents inside
+isolated worktrees. The worktree primitives are upstream; the `init` wizard, `spawn`,
+`agents`, `loop`, `msg`, and `integrate` commands are new in this fork.
 
 ## Features
 
+**Worktree management (upstream)**
 - Initialize repos with a bare clone optimized for worktrees
 - Create, list, and remove worktrees
 - Sync with origin and prune stale worktrees
@@ -15,362 +19,318 @@ Grove is a CLI tool that encapsulates the patterns that I use for working with G
 - Shell integration for seamless directory navigation
 - Self-update to the latest version or PR build
 
+**Agentic workflow (this fork)**
+- `grove init` runs a stack-aware setup wizard: scaffolds `.devcontainer/`, proposes
+  mounts (project secrets, `.claude` plugins, GitHub PAT, data dirs), suggests VS Code
+  extensions + container packages tailored to the detected stack.
+- `grove spawn <name>` creates an isolated worktree, seeds an agent profile, and launches
+  a Claude Code session bound to a Stop-hook Ralph loop.
+- `grove agents list|status|kill` to manage running agent sessions.
+- `grove loop [--watch]` to inspect per-agent loop state (iteration, last action, status).
+- `grove msg <to> "<text>"` for direct/broadcast messaging between agents via a
+  per-file event bus.
+- `grove integrate` merges every `agent/*` branch into a disposable integration branch
+  with a headless conflict resolver that reads bus + STATE context.
+
 ## Platform Support
 
 - Linux (x64, arm64)
 - macOS (x64, arm64)
-- Windows (x64)
+- Windows: WSL only (tmux + devcontainer required for the agentic layer)
 
 ## Installation
 
-### Quick Install (Linux/macOS)
+### Build from source
 
 ```bash
-curl https://i.safia.sh/captainsafia/grove | sh
+git clone https://github.com/Panzax/grove.git
+cd grove
+cargo install --path .
 ```
 
-### Quick Install (Windows PowerShell)
+The binary lands at `~/.cargo/bin/grove`.
 
-```powershell
-irm https://i.safia.sh/captainsafia/grove.ps1 | iex
-```
+### Prerequisites for the agentic layer
 
-This will download the appropriate binary for your system and install it to `~/.grove/bin`.
+- [Claude Code CLI](https://docs.claude.com/en/docs/claude-code) installed and authenticated
+- Docker + the [Dev Containers CLI](https://github.com/devcontainers/cli) (`npm i -g @devcontainers/cli`)
+- `tmux`
+- `jq`
 
-To install a specific version:
-
-```bash
-curl https://i.safia.sh/captainsafia/grove/v1.0.0 | sh
-```
-
-For Windows PowerShell:
-
-```powershell
-irm https://i.safia.sh/captainsafia/grove/v1.0.0.ps1 | iex
-```
+Worktree primitives (`add`, `go`, `list`, `remove`, `prune`, `sync`, `pr`) work without
+any of these.
 
 ## Usage
 
-### Initialize a new worktree setup
+### Initialize a new project
 
-Create a new directory structure optimized for git worktree workflows:
+Two modes — pick whichever fits the situation:
 
+**Clone fresh (upstream layout):**
 ```bash
 grove init https://github.com/user/repo.git
 ```
+Produces `<repo>/<repo>.git/` (bare clone) with worktrees as siblings.
 
-This command will:
+**Adopt an existing repo in-place (fork addition):**
+```bash
+cd your-existing-repo
+grove init                # uses cwd by default
+# or
+grove init /path/to/repo  # explicit path
+```
+The supplied directory must already be a git checkout. Worktrees go under
+`<root>/worktrees/<name>/`. Use `--yes` to skip the merge/overwrite prompt
+on existing `.devcontainer/` or `.grove/` files (defaults to overwrite).
 
-- Create a directory named after the repository (e.g., `repo/`)
-- Clone the repository as a bare clone into `repo/repo.git/`
-- Configure the remote fetch to support all branches
-- Provide instructions for creating worktrees
+In both modes:
 
-After initialization, you can create worktrees:
+1. **Phase 1 (deterministic)**: detect stack (Python/Rust/Node/Go/.NET), scaffold
+   `.devcontainer/devcontainer.json` + `.grove/config.toml` + extend `.groverc`
+   bootstrap entry + patch `.gitignore`. For in-place mode, existing `.devcontainer/`
+   or `.grove/` files trigger a `[merge / overwrite / skip]` prompt (or just use
+   `--yes` to default to overwrite, with the Phase 2 wizard refining afterwards).
+2. **Phase 2 (setup wizard, skippable via `--no-agent`)**: launches a Claude Code session
+   that asks five interactive prompts:
+   - Project secrets mount (path, RO/RW, env var name)
+   - `.claude` scope (`scoped` plugins+creds RO, `full` mount, or `none`) + auth strategy
+   - GitHub authentication (read-only fine-grained PAT recommended)
+   - Agent-inferred extra mounts (data dirs, env-var-referenced paths, README hints)
+   - VS Code extensions + container packages (fixed defaults + per-stack inferred)
+
+Re-run Phase 2 only:
 
 ```bash
-cd repo
-grove add main
+grove init --reconfigure
+```
+
+### Worktree commands (upstream behavior preserved)
+
+```bash
 grove add feature/new-feature
+grove add feature/new-feature --track origin/feature/new-feature
+grove list
+grove list --details
+grove remove feature/new-feature
+grove prune --dry-run
+grove sync
+grove go feature-branch
 ```
 
-### Add a new worktree
+See the **Worktree commands** section below for full flag coverage — behavior matches
+upstream `captainsafia/grove` v2.1.0.
 
-Create a new worktree for a branch:
+### Agent commands (new)
+
+#### Spawn an agent in an isolated worktree
 
 ```bash
+grove spawn feat-auth --task "implement OAuth login flow" \
+                     --promise "All workitems in STATE.md are [x]" \
+                     --max-iter 30
+```
+
+Creates a worktree (sibling-to-bare in bare layout, under `worktrees/` in in-place
+layout), seeds `.grove/agents/feat-auth/{PROMPT,STATE,loop,agent}.md`, symlinks
+the project's `.grove/` into the worktree so the Stop hook + agent docs resolve
+from the worktree's cwd, and launches a tmux session with `claude` and
+`GROVE_AGENT_DIR` exported. Per-spawn flags:
+
+- `--task "<text>"` seeds STATE.md with one initial workitem.
+- `--promise "<text>"` sets the `<promise>X</promise>` completion contract.
+- `--max-iter N` caps the loop (default 30; 0 = unlimited).
+- `--branch <existing>` attaches the worktree to an existing branch instead of
+  creating `agent/<name>`. Refuses if the branch is already checked out elsewhere.
+
+#### Inspect loop state
+
+```bash
+grove loop                  # snapshot of every active loop
+grove loop --watch          # live updates via fs watcher
+grove loop --agent feat-auth
+```
+
+#### Manage running agents
+
+```bash
+grove agents list           # one line per agent
+grove agents status feat-auth
+grove agents kill feat-auth
+```
+
+#### Inter-agent messaging
+
+```bash
+grove msg feat-data "hyperliquid client ready on agent/shared"   # direct
+grove msg broadcast "API contract v2 published in contracts/"    # broadcast
+```
+
+Messages land in `.grove/bus/`. Direct goes to `inbox/<recipient>/`; broadcast to
+`log.d/`. Agents read their inboxes each loop iteration.
+
+#### Integrate finished work
+
+```bash
+grove integrate
+```
+
+Creates a disposable `integration/<timestamp>` branch and merges every `agent/*` branch
+into it. On conflict, snapshots bus + per-branch `STATE.md` into a read-only context
+directory and invokes a headless Claude session to resolve with intent. Runs the
+project's `[verify].test_command` between merges if configured. Human reviews and merges
+into the base branch.
+
+### Worktree commands (full reference)
+
+#### Add
+
+```bash
+grove add                                  # auto-generated adjective-noun name
 grove add feature/new-feature
-```
-
-Create a new worktree with an auto-generated adjective-noun name:
-
-```bash
-grove add
-# Example generated name: quiet-meadow
-# If .groverc sets "branchPrefix": "safia", example: safia/quiet-meadow
-# Directory remains: quiet-meadow
-# branchPrefix only accepts alphanumeric characters
-```
-
-Track a remote branch:
-
-```bash
 grove add feature/new-feature --track origin/feature/new-feature
 ```
 
-Bootstrap a newly created worktree with project-scoped commands:
+`.groverc` schema (upstream-compatible):
 
 ```json
 {
-  "branchPrefix": "safia",
+  "branchPrefix": "panzax",
   "bootstrap": {
     "commands": [
-      { "program": "npm", "args": ["install"] },
+      { "program": "devcontainer", "args": ["up", "--workspace-folder", "."] },
       { "program": "cargo", "args": ["check"] }
     ]
   }
 }
 ```
 
-Save this as `.groverc` in your Grove project root (the directory that contains your bare clone, for example `repo/.groverc` next to `repo/repo.git`).
-
-When `grove add` is called without an explicit branch name, Grove generates an adjective-noun name and prepends `branchPrefix` to the branch name when configured. `branchPrefix` must be alphanumeric only (letters and numbers). The worktree directory keeps the generated base name.
-
-When `grove add` creates a worktree, it runs each bootstrap command in order inside that new worktree directory.
-
-- Commands must be portable across Linux/macOS/Windows.
-- Use executable + args only (no shell syntax like pipes, `&&`, or redirects).
-- If one command fails, Grove continues running the remaining commands and reports a partial bootstrap state.
-
-### Remove worktrees
-
-Remove a single worktree:
+#### Remove
 
 ```bash
 grove remove feature/new-feature
+grove remove feature/foo bugfix/bar --force
+grove remove feature/foo --yes
 ```
 
-Remove multiple worktrees at once:
-
-```bash
-grove remove feature/new-feature bugfix/login-flake
-```
-
-Force removal even with uncommitted changes. When `--force` removes a dirty worktree, Grove skips the confirmation prompt and logs a warning after removal:
-
-```bash
-grove remove feature/new-feature bugfix/login-flake --force
-```
-
-Skip the confirmation prompt for clean worktrees:
-
-```bash
-grove remove feature/new-feature --yes
-```
-
-### Navigate to a worktree
-
-Open a new shell session in a worktree directory:
+#### Navigate
 
 ```bash
 grove go feature-branch
 ```
 
-This spawns a new shell in the worktree directory. Exit the shell (Ctrl+D or `exit`) to return to your previous directory.
-
-You can also navigate by partial branch name for nested branches:
+Set up shell integration to make `grove go` change the current shell's directory:
 
 ```bash
-# If you have a worktree for feature/my-feature
-grove go my-feature
+echo 'eval "$(grove shell-init bash)"' >> ~/.bashrc      # bash
+echo 'eval "$(grove shell-init zsh)"'  >> ~/.zshrc       # zsh
+echo 'eval "$(grove shell-init fish)"' >> ~/.config/fish/config.fish  # fish
 ```
 
-The `GROVE_WORKTREE` environment variable is set to the branch name while in the worktree shell.
-
-#### Shell Integration
-
-For a smoother experience, you can set up shell integration so `grove go` changes your current directory instead of spawning a new shell:
-
-**Bash:**
-```bash
-echo 'eval "$(grove shell-init bash)"' >> ~/.bashrc
-source ~/.bashrc
-```
-
-**Zsh:**
-```bash
-echo 'eval "$(grove shell-init zsh)"' >> ~/.zshrc
-source ~/.zshrc
-```
-
-**Fish:**
-```bash
-echo 'eval "$(grove shell-init fish)"' >> ~/.config/fish/config.fish
-source ~/.config/fish/config.fish
-```
-
-With shell integration enabled, `grove go feature-branch` will directly change your working directory.
-
-### Run Commands from Anywhere
-
-Grove commands work from anywhere within your project hierarchy - you don't need to be in the bare clone directory. Whether you're deep inside a worktree's source code or at the project root, grove automatically discovers the repository:
+#### List / Sync / Prune
 
 ```bash
-# Works from inside a worktree
-cd ~/projects/myproject/feature-branch/src/components
-grove list  # Discovers and lists all worktrees
-
-# Works from the worktree root
-cd ~/projects/myproject/feature-branch
-grove add another-feature
-
-# Works from the bare clone
-cd ~/projects/myproject/myproject.git
-grove sync
+grove list [--details|--dirty|--locked]
+grove sync [--branch <name>]
+grove prune [--dry-run|--force] [--base <branch>|--older-than <duration>]
 ```
 
-Grove caches the discovered repository path in the `GROVE_REPO` environment variable for faster subsequent commands.
+`prune --older-than` accepts `30d`, `2w`, `6M`, `1y`, or ISO 8601 (`P30D`, `P2W`, ...).
 
-### List all worktrees
+#### Run commands from anywhere
+
+Grove discovers the bare clone by walking up from `cwd` and caches the path in
+`GROVE_REPO`. Subsequent commands skip the discovery walk.
+
+#### Self-update
 
 ```bash
-grove list
+grove self-update                  # latest release
+grove self-update v1.0.0           # pinned version
+grove self-update --pr 42          # PR build (requires gh CLI)
 ```
-
-Show detailed information:
-
-```bash
-grove list --details
-```
-
-Show only dirty worktrees:
-
-```bash
-grove list --dirty
-```
-
-### Sync with origin
-
-Update the bare clone with the latest changes from origin:
-
-```bash
-grove sync
-```
-
-This fetches the default branch (main or master) from origin and updates the local reference.
-
-Sync a specific branch:
-
-```bash
-grove sync --branch develop
-```
-
-### Prune merged worktrees
-
-Preview what would be removed:
-
-```bash
-grove prune --dry-run
-```
-
-Remove worktrees for branches merged to main:
-
-```bash
-grove prune
-```
-
-Force removal even if worktrees have uncommitted changes:
-
-```bash
-grove prune --force
-```
-
-Use a different base branch:
-
-```bash
-grove prune --base develop
-```
-
-Remove worktrees older than a specific duration (bypasses merge check):
-
-**Note:** When using `--older-than`, the merge status check is bypassed, and all worktrees older than the specified duration will be removed. The `--base` flag cannot be used with `--older-than`.
-
-You can use human-friendly formats (e.g., `30d`, `2w`, `6M`, `1y`) or ISO 8601 duration format (e.g., `P30D`, `P2W`, `P6M`, `P1Y`):
-
-```bash
-# Remove worktrees older than 30 days
-grove prune --older-than 30d
-
-# Remove worktrees older than 6 months
-grove prune --older-than 6M
-
-# Remove worktrees older than 1 year
-grove prune --older-than 1y
-
-# Preview what would be removed for worktrees older than 2 weeks
-grove prune --older-than 2w --dry-run
-
-# ISO 8601 format is also supported
-grove prune --older-than P30D
-```
-
-### Self-update
-
-Update grove to the latest version:
-
-```bash
-grove self-update
-```
-
-Update to a specific version:
-
-```bash
-grove self-update v1.0.0
-# or
-grove self-update 1.0.0
-```
-
-Update to a specific PR build (requires GitHub CLI):
-
-```bash
-grove self-update --pr 42
-```
-
-**Note:** The self-update command uses the same installation script as the initial installation. If you installed grove using the quick install method, this command will update the binary in `~/.grove/bin`. If you installed grove using a different method (e.g., manually downloading the binary), you may need to update it manually.
 
 ## Commands
 
-- `grove init <git-url>` - Create a new worktree setup
-- `grove add [name] [options]` - Create a new worktree
-- `grove go <name>` - Navigate to a worktree
-- `grove remove [names]... [options]` - Remove one or more worktrees
-- `grove list [options]` - List all worktrees
-- `grove sync [options]` - Sync the bare clone with origin
-- `grove prune [options]` - Remove worktrees for merged branches
-- `grove shell-init <shell>` - Output shell integration function (bash, zsh, or fish)
-- `grove self-update [version] [options]` - Update grove to a specific version or PR
-- `grove version` - Show version information
-- `grove help [command]` - Show help
+**Worktree primitives**
+- `grove init <git-url>` — Create a new worktree setup (extended with agentic scaffold)
+- `grove add [name] [options]` — Create a new worktree
+- `grove go <name>` — Navigate to a worktree
+- `grove remove [names]... [options]` — Remove one or more worktrees
+- `grove list [options]` — List all worktrees
+- `grove sync [options]` — Sync the bare clone with origin
+- `grove prune [options]` — Remove worktrees for merged branches
+- `grove pr <number>` — Check out a PR into a worktree
+- `grove shell-init <shell>` — Emit shell integration
+- `grove self-update [version] [options]` — Update grove
+
+**Agentic workflow**
+- `grove spawn <name> [options]` — Spawn agent in isolated worktree
+- `grove agents <list|status|kill>` — Manage running agents
+- `grove loop [--watch] [--agent <name>]` — Inspect Ralph loop state
+- `grove msg <to> "<text>"` — Send a message via the bus
+- `grove integrate` — Merge all `agent/*` branches into an integration branch
+
+## Project layout after `grove init`
+
+```
+<repo_name>/
+├── <repo_name>.git/         # bare clone (managed by grove)
+├── .devcontainer/
+│   └── devcontainer.json    # scaffolded; refined by setup wizard
+├── .grove/
+│   ├── config.toml          # extended config (agent, mounts, verify, caches, ...)
+│   ├── RALPH-LOOP.md        # loop-authoring guide
+│   ├── PROTOCOL.md          # bus + agent/shared spec
+│   ├── SHARED.md            # canonical project context (chmod 0444 in worktrees)
+│   ├── PROMPT.template.md   # skeleton for grove spawn
+│   ├── tools/
+│   │   └── loop-hook.sh     # Stop-hook engine
+│   ├── agents/              # gitignored: per-agent state
+│   │   └── <name>/{PROMPT,STATE,loop}.md
+│   └── bus/                 # gitignored: collaboration channel
+│       ├── log.d/           #   broadcast events (one file per event)
+│       ├── inbox/<agent>/   #   direct mail
+│       └── contracts/       #   negotiated interfaces
+├── .groverc                 # upstream-compatible bootstrap config
+└── worktrees/               # gitignored: agent worktrees
+    └── <name>/
+```
 
 ## Development
 
 ### Prerequisites
 
 - [Rust](https://www.rust-lang.org/tools/install) (stable toolchain)
-- Git
+- Git, jq, tmux (for the agentic layer)
 
 ### Setup
 
 ```bash
-# Clone the repository
-git clone https://github.com/captainsafia/grove.git
+git clone https://github.com/Panzax/grove.git
 cd grove
-
-# Build the project
-cargo build
-
-# Build optimized release binary
 cargo build --release
 ```
 
-### Development Commands
+### Common commands
 
 ```bash
-# Build debug binary
-cargo build
-
-# Build optimized release binary
-cargo build --release
-
-# Run directly in development
-cargo run -- <command>
-
-# Type check without building
-cargo check
-
-# Run all tests
-cargo test
-
-# Clean build artifacts
-cargo clean
+cargo build             # debug binary
+cargo build --release   # optimized binary
+cargo run -- <cmd>      # run without installing
+cargo check             # type-check
+cargo test --all        # unit + integration tests
 ```
+
+## License
+
+MIT. Copyright (c) 2025 Safia Abdalla (upstream). Fork additions copyright (c) 2026
+Panzax. See `LICENSE`.
+
+## Credits
+
+- Upstream: [`captainsafia/grove`](https://github.com/captainsafia/grove) — the worktree
+  primitives. Blog post: ["git worktrees"](https://blog.safia.rocks/2025/09/03/git-worktrees/).
+- Stop-hook loop engine adapted from the official Anthropic
+  [`ralph-loop`](https://github.com/anthropics/claude-plugins-official/tree/main/plugins/ralph-loop)
+  plugin (`stop-hook.sh`).
+- Ralph technique: [Geoffrey Huntley — "Ralph Wiggum as a software engineer"](https://ghuntley.com/ralph/).

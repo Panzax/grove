@@ -1,10 +1,15 @@
 pub mod add;
+pub mod agents;
 pub mod go;
 pub mod init;
+pub mod integrate;
 pub mod list;
+pub mod loop_;
+pub mod msg;
 pub mod pr;
 pub mod prune;
 pub mod remove;
 pub mod self_update;
 pub mod shell_init;
+pub mod spawn;
 pub mod sync;

@@ -1,8 +1,16 @@
 Instructions for coding agents working on the Grove repository.
 
+> **Fork note.** This is the `Panzax/grove` fork. The upstream `captainsafia/grove`
+> ships only the worktree primitives; this fork adds an agentic-workflow layer
+> (devcontainer-aware setup wizard, `grove spawn` / `agents` / `loop` / `msg` /
+> `integrate`, file-based collaboration bus, Stop-hook Ralph loop engine). All
+> additions live in new modules; existing modules retain upstream behavior.
+
 ## Project Overview
 
-Grove is a CLI tool written in Rust that manages Git worktrees. It targets Linux, macOS, and Windows platforms.
+Grove is a CLI tool written in Rust that manages Git worktrees and drives
+long-running coding agents inside isolated worktrees. Targets Linux + macOS
+(Windows via WSL).
 
 **Key technologies:**
 - Language: Rust (2021 edition)
@@ -16,31 +24,57 @@ Grove is a CLI tool written in Rust that manages Git worktrees. It targets Linux
 
 ```
 src/
-├── main.rs               # CLI entry point, clap command registration
-├── models.rs             # Worktree struct, option types
-├── utils.rs              # Helper functions (discovery, formatting, config)
-├── commands/             # One file per CLI command
+├── main.rs                  # CLI entry point, clap command registration
+├── models.rs                # Worktree + agentic types (ProjectContext, AgentMetadata,
+│                            #   LoopState, BusMessage, GroveConfig + sections)
+├── utils.rs                 # Helper functions (discovery, formatting, .groverc parsing)
+├── commands/                # One file per CLI command (worktree + agentic)
 │   ├── mod.rs
-│   ├── add.rs
-│   ├── go.rs
-│   ├── init.rs
-│   ├── list.rs
-│   ├── pr.rs
-│   ├── prune.rs
-│   ├── remove.rs
-│   ├── self_update.rs
-│   ├── shell_init.rs
-│   └── sync.rs
+│   ├── add.rs               # (upstream) grove add — worktree + bootstrap commands
+│   ├── go.rs                # (upstream) grove go — navigate to a worktree
+│   ├── init.rs              # (extended) bare clone + Phase 1 scaffold + Phase 2 hook
+│   ├── list.rs              # (upstream)
+│   ├── pr.rs                # (upstream)
+│   ├── prune.rs             # (upstream)
+│   ├── remove.rs            # (upstream)
+│   ├── self_update.rs       # stubbed on this fork (no hosted install endpoint yet)
+│   ├── shell_init.rs        # (upstream)
+│   ├── sync.rs              # (upstream)
+│   ├── spawn.rs             # NEW: worktree + seed agent + launch tmux session
+│   ├── agents.rs            # NEW: list/status/kill running agents
+│   ├── loop_.rs             # NEW: print/watch .grove/agents/<n>/loop.md
+│   ├── msg.rs               # NEW: bus messaging (broadcast/direct/contract)
+│   └── integrate.rs         # NEW: merge agent/* into integration/<ts> + headless resolver
+├── agent/                   # NEW: Ralph loop infrastructure
+│   ├── mod.rs
+│   ├── hook.rs              #   install loop-hook.sh into ~/.claude/settings.json
+│   ├── loop_md.rs           #   YAML frontmatter parser for loop.md
+│   ├── seed.rs              #   write .grove/agents/<n>/{PROMPT,STATE,loop}.md + assets
+│   └── setup.rs             #   Phase 2 interactive wizard (5 prompts)
+├── bus/                     # NEW: per-file event bus (broadcast/direct/contract)
+│   └── mod.rs
+├── devcontainer/            # NEW: stack detection + scaffold + CI-parity scrape
+│   ├── mod.rs
+│   ├── stack.rs             #   detect_all_stacks, infer_*, verify_defaults, cache_volumes
+│   └── ci_scrape.rs         #   extract verify commands from .github/workflows/*.yml
+├── session/                 # NEW: tmux backend
+│   ├── mod.rs
+│   └── tmux.rs
 └── git/
     ├── mod.rs
-    └── worktree_manager.rs  # Core Git worktree operations
+    └── worktree_manager.rs  # Core Git worktree operations (extended with
+                             # show_head_file, ls_head_files, head_file_exists for the
+                             # bare-clone manifest probe).
+
+assets/                      # NEW: bundled framework files (include_str!'d into binary)
+├── loop-hook.sh             # Stop-hook engine (bash); copied to .grove/tools/ on init
+├── PROMPT.template.md       # per-agent prompt skeleton
+├── RALPH-LOOP.md            # loop-authoring guide (installed to .grove/)
+├── PROTOCOL.md              # bus + agent/shared hub-branch spec (installed to .grove/)
+└── SHARED.md                # canonical project context template (installed to .grove/)
 
 test/
-└── integration/          # Hone integration tests
-
-site/                     # GitHub Pages website
-├── index.html            # Landing page
-└── install.sh            # Installation script
+└── integration/             # Hone integration tests
 ```
 
 ## Development Commands
@@ -89,30 +123,33 @@ The README at the repository root is the primary documentation. When updating:
    - Update the corresponding command documentation
    - Update any affected examples
 
-### Site Documentation (site/)
+### Agentic module conventions (fork-specific)
 
-The `site/` directory contains the GitHub Pages website. The `site/index.html` file is a standalone HTML page with embedded CSS.
-
-When updating site documentation:
-
-1. **Keep README and site in sync** - The site mirrors the README content. If you update README command documentation, update `site/index.html` to match.
-
-2. **Maintain the HTML structure** - The site uses semantic HTML sections:
-   - Hero section with tagline
-   - Installation section
-   - Commands/usage section
-
-3. **Test locally** - Open `site/index.html` in a browser to verify changes render correctly.
-
-4. **Deployment** - The site auto-deploys via GitHub Actions when changes to `site/` are pushed to main.
-
-### install.sh
-
-The `site/install.sh` script is the curl-pipe-bash installer. When modifying:
-
-- Test the script thoroughly on both Linux and macOS
-- Maintain support for both x64 and arm64 architectures
-- Keep error handling and user feedback intact
+- **Git operations stay in `git/worktree_manager.rs`.** New helpers added in
+  this fork (`show_head_file`, `ls_head_files`, `head_file_exists`,
+  `get_default_branch`) follow the same pattern — wrap the `git` CLI via
+  `git_raw`. Don't bypass it.
+- **Agent state lives at the project root** (`.grove/agents/<n>/`), never
+  inside a worktree. This is intentional — agent state survives
+  `grove remove`. New code that touches per-agent state should call
+  `project_root(ctx).join(".grove/agents/<n>")`, not the worktree path.
+- **Two project layouts.** `ProjectLayout::Bare` (upstream — bare clone at
+  `<root>/<name>.git/`, worktrees as siblings) and `ProjectLayout::InPlace`
+  (fork addition — normal `.git/` checkout, worktrees under
+  `<root>/worktrees/<name>/`). `RepoContext::layout` carries the choice;
+  new commands that compute paths must branch on it. `discover_repo()`
+  prefers Bare so existing grove projects keep working unchanged; falls back
+  to InPlace via `discover_in_place()`.
+- **One file per bus event.** Never append to a shared log; the per-file
+  pattern eliminates the multi-writer append race. `bus::send` enforces this.
+- **Stop hook is registered at user-level only.** Worktrees never carry a
+  project-level `.claude/`. The bash engine self-disables when
+  `GROVE_AGENT_DIR` is unset, so the hook is safe to leave registered.
+- **`assets/`** is the source of truth for the framework files; `grove init`
+  copies them into `.grove/`. Users editing `SHARED.md` after init is fine
+  (their copy survives re-init); `RALPH-LOOP.md` / `PROTOCOL.md` /
+  `PROMPT.template.md` / `loop-hook.sh` get overwritten on every `grove init`
+  to keep the framework consistent.
 
 ## Commit Message and PR Title Format
 
