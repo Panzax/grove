@@ -1,7 +1,42 @@
 # Changelog
 
+<a name="v2.2.0-agentic.0"></a>
+## [v2.2.0-agentic.0] - 2026-05-20 — Panzax fork (`agentic-flow`)
+
+Fork point: upstream `v2.1.0`. Worktree primitives unchanged.
+
+### Features (new in fork)
+- `grove init` runs a stack-aware setup wizard: scaffolds `.devcontainer/`, proposes
+  mounts (project secrets, scoped `.claude` plugins+creds, GitHub PAT, agent-inferred
+  data dirs), and suggests VS Code extensions + container packages per detected stack.
+- `grove spawn <name>` — create an isolated worktree, seed
+  `.grove/agents/<name>/{PROMPT,STATE,loop}.md`, launch a Claude Code session in tmux
+  with `GROVE_AGENT_DIR` set so the Stop-hook Ralph loop engages.
+- `grove agents list|status|kill` — manage running agent sessions.
+- `grove loop [--watch] [--agent <name>]` — inspect per-agent loop state.
+- `grove msg <to|broadcast> "<text>"` — direct/broadcast messaging over a per-file
+  event bus (`.grove/bus/{log.d, inbox/<recipient>, contracts}`).
+- `grove integrate` — merge every `agent/*` branch into a disposable
+  `integration/<ts>` branch with a headless Claude conflict resolver that reads bus +
+  STATE context.
+
+### Configuration
+- New `.grove/config.toml` (TOML) carries fork-specific settings:
+  `[agent]`, `[devcontainer]`, `[bus]`, `[hook]`, `[mounts]`, `[stack]`, `[verify]`,
+  `[caches]`, `[hooks]`, `[meta]`, `[[mounts.extra]]`.
+- `.groverc` schema unchanged (upstream-compatible).
+- `grove init --reconfigure` re-runs the Phase 2 wizard only, with current values as
+  defaults.
+
+### Compatibility
+- All upstream commands (`add`, `go`, `init`, `list`, `pr`, `prune`, `remove`,
+  `self-update`, `shell-init`, `sync`) keep their existing flags and behavior when
+  no `.grove/config.toml` is present.
+- `grove self-update` is currently a notice-only stub on this fork (no hosted install
+  endpoint yet).
+
 <a name="v2.1.0"></a>
-## [v2.1.0] - 2026-03-28
+## [v2.1.0] - 2026-03-28 (upstream — captainsafia/grove)
 
 ### Features
 - Support removing multiple worktrees at once (#78)

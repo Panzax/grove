@@ -563,14 +563,14 @@ mod tests {
 
     #[test]
     fn apply_branch_prefix_adds_separator_when_configured() {
-        let prefixed = apply_branch_prefix(Some("safia"), "quiet-meadow").unwrap();
-        assert_eq!(prefixed, "safia/quiet-meadow");
+        let prefixed = apply_branch_prefix(Some("panzax"), "quiet-meadow").unwrap();
+        assert_eq!(prefixed, "panzax/quiet-meadow");
     }
 
     #[test]
     fn apply_branch_prefix_trims_whitespace_and_trailing_slashes() {
-        let prefixed = apply_branch_prefix(Some("  safia123/  "), "quiet-meadow").unwrap();
-        assert_eq!(prefixed, "safia123/quiet-meadow");
+        let prefixed = apply_branch_prefix(Some("  panzax123/  "), "quiet-meadow").unwrap();
+        assert_eq!(prefixed, "panzax123/quiet-meadow");
     }
 
     #[test]
@@ -581,15 +581,15 @@ mod tests {
 
     #[test]
     fn apply_branch_prefix_rejects_non_alphanumeric_prefix() {
-        let err = apply_branch_prefix(Some("teams/safia"), "quiet-meadow").unwrap_err();
+        let err = apply_branch_prefix(Some("teams/panzax"), "quiet-meadow").unwrap_err();
         assert!(err.contains("alphanumeric"));
     }
 
     #[test]
     fn generated_worktree_spec_applies_prefix_only_to_branch_name() {
-        let spec = generated_worktree_spec(Some("safia"), "quiet-meadow").unwrap();
+        let spec = generated_worktree_spec(Some("panzax"), "quiet-meadow").unwrap();
         assert_eq!(spec.directory_name, "quiet-meadow");
-        assert_eq!(spec.branch_name, "safia/quiet-meadow");
+        assert_eq!(spec.branch_name, "panzax/quiet-meadow");
     }
 
     #[test]

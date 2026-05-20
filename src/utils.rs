@@ -732,7 +732,7 @@ mod tests {
         fs::write(
             dir.join(".groverc"),
             r#"{
-  "branchPrefix": "safia",
+  "branchPrefix": "panzax",
   "bootstrap": {
     "commands": [
       { "program": "npm", "args": ["install"] },
@@ -744,7 +744,7 @@ mod tests {
         .unwrap();
 
         let config = read_repo_config(&dir).unwrap();
-        assert_eq!(config.branch_prefix.as_deref(), Some("safia"));
+        assert_eq!(config.branch_prefix.as_deref(), Some("panzax"));
         let bootstrap = config.bootstrap.unwrap();
         assert_eq!(bootstrap.commands.len(), 2);
         assert_eq!(bootstrap.commands[0].program, "npm");
@@ -760,13 +760,13 @@ mod tests {
         fs::write(
             dir.join(".groverc"),
             r#"{
-  "branchPrefix": "  safia123/  "
+  "branchPrefix": "  panzax123/  "
 }"#,
         )
         .unwrap();
 
         let config = read_repo_config(&dir).unwrap();
-        assert_eq!(config.branch_prefix.as_deref(), Some("safia123"));
+        assert_eq!(config.branch_prefix.as_deref(), Some("panzax123"));
         assert!(config.bootstrap.is_none());
         let _ = fs::remove_dir_all(dir);
     }
@@ -777,7 +777,7 @@ mod tests {
         fs::write(
             dir.join(".groverc"),
             r#"{
-  "branchPrefix": "teams/safia"
+  "branchPrefix": "teams/panzax"
 }"#,
         )
         .unwrap();
@@ -808,22 +808,22 @@ mod tests {
     #[test]
     fn sanitize_branch_prefix_accepts_alphanumeric_value() {
         assert_eq!(
-            sanitize_branch_prefix("  safia123  ").unwrap(),
-            Some("safia123".to_string())
+            sanitize_branch_prefix("  panzax123  ").unwrap(),
+            Some("panzax123".to_string())
         );
     }
 
     #[test]
     fn sanitize_branch_prefix_trims_trailing_slashes() {
         assert_eq!(
-            sanitize_branch_prefix("safia123/").unwrap(),
-            Some("safia123".to_string())
+            sanitize_branch_prefix("panzax123/").unwrap(),
+            Some("panzax123".to_string())
         );
     }
 
     #[test]
     fn sanitize_branch_prefix_rejects_non_alphanumeric_value() {
-        let err = sanitize_branch_prefix("team/safia").unwrap_err();
+        let err = sanitize_branch_prefix("team/panzax").unwrap_err();
         assert!(err.contains("alphanumeric"));
     }
 
@@ -1282,7 +1282,7 @@ mod tests {
     #[test]
     #[cfg(windows)]
     fn get_self_update_command_windows() {
-        let (command, args) = get_self_update_command("https://i.safia.sh/captainsafia/grove");
+        let (command, args) = get_self_update_command("https://example.invalid/install");
         assert_eq!(command, "powershell");
         assert!(args.iter().any(|arg| arg == "-NoProfile"));
         assert!(args.iter().any(|arg| arg == "-Command"));
@@ -1293,7 +1293,7 @@ mod tests {
     #[test]
     #[cfg(not(windows))]
     fn get_self_update_command_unix() {
-        let (command, args) = get_self_update_command("https://i.safia.sh/captainsafia/grove");
+        let (command, args) = get_self_update_command("https://example.invalid/install");
         assert_eq!(command, "sh");
         assert!(args.iter().any(|arg| arg == "-c"));
         assert!(args.iter().any(|arg| arg.contains("curl")));
