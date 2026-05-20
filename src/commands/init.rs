@@ -42,6 +42,16 @@ pub fn run(
     match resolve_target(target) {
         Target::Clone(url) => run_clone(&url, no_agent, no_devcontainer, assume_yes),
         Target::InPlace(path) => run_in_place(&path, no_agent, no_devcontainer, assume_yes),
+        Target::InvalidUrl(s) => {
+            eprintln!(
+                "{} Invalid git URL format. Supported formats:\n  - HTTPS: https://github.com/user/repo.git\n  - SSH: git@github.com:user/repo.git\n  - SSH: ssh://git@github.com/user/repo.git\n  Got: {}",
+                "Error:".red(),
+                s
+            );
+            // Exit 2 to match upstream's clap-validator behavior (existing
+            // grove.hone test asserts exit_code == 2 here).
+            std::process::exit(2);
+        }
         Target::AmbiguousNonExistent(s) => {
             eprintln!(
                 "{} '{}' is not a valid git URL and does not exist as a directory.\n  Pass a git URL to clone, OR a path to an existing checkout (default \".\").",
@@ -56,20 +66,26 @@ pub fn run(
 enum Target {
     Clone(String),
     InPlace(PathBuf),
+    InvalidUrl(String),
     AmbiguousNonExistent(String),
 }
 
 /// Disambiguate the positional argument:
-/// - None         → in-place at cwd
-/// - Valid URL    → clone-mode
-/// - Existing dir → in-place at that path
-/// - Otherwise    → error
+/// - None              → in-place at cwd
+/// - Looks like a URL  → either Clone (if valid) or InvalidUrl (matches upstream
+///                       behavior of exiting 2 with "Invalid git URL format")
+/// - Existing dir      → in-place at that path
+/// - Otherwise         → ambiguous error
 fn resolve_target(target: Option<&str>) -> Target {
     let Some(value) = target else {
         return Target::InPlace(PathBuf::from("."));
     };
-    if is_valid_git_url(value) {
-        return Target::Clone(value.to_string());
+    if looks_like_git_url(value) {
+        return if is_valid_git_url(value) {
+            Target::Clone(value.to_string())
+        } else {
+            Target::InvalidUrl(value.to_string())
+        };
     }
     let path = PathBuf::from(value);
     // Must be an existing *directory* to qualify as in-place. A file or missing
@@ -79,6 +95,13 @@ fn resolve_target(target: Option<&str>) -> Target {
         return Target::InPlace(path);
     }
     Target::AmbiguousNonExistent(value.to_string())
+}
+
+/// Heuristic: would a reasonable user type this as a git URL? URLs always
+/// contain `://` or follow the `git@host:path` shape. Anything else is treated
+/// as a candidate path.
+fn looks_like_git_url(value: &str) -> bool {
+    value.contains("://") || value.starts_with("git@")
 }
 
 // =============================================================================
@@ -1022,6 +1045,22 @@ mod tests {
     fn resolve_target_unknown_string_is_ambiguous() {
         let t = resolve_target(Some("not-a-url-not-a-path-xyz123"));
         assert!(matches!(t, Target::AmbiguousNonExistent(_)));
+    }
+
+    #[test]
+    fn resolve_target_url_shaped_but_invalid_is_invalid_url() {
+        let t = resolve_target(Some("https://garbage url with spaces"));
+        assert!(matches!(t, Target::InvalidUrl(_)));
+    }
+
+    #[test]
+    fn looks_like_git_url_detects_common_shapes() {
+        assert!(looks_like_git_url("https://github.com/x/y.git"));
+        assert!(looks_like_git_url("ssh://git@github.com/x/y"));
+        assert!(looks_like_git_url("git@github.com:x/y.git"));
+        assert!(!looks_like_git_url("./relative"));
+        assert!(!looks_like_git_url("Cargo.toml"));
+        assert!(!looks_like_git_url("not-a-url-not-a-path-xyz123"));
     }
 
     #[test]
