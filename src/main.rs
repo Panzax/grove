@@ -3,6 +3,7 @@ use colored::Colorize;
 use regex::Regex;
 use std::path::Path;
 
+mod agent;
 mod commands;
 mod devcontainer;
 mod git;
@@ -98,7 +99,16 @@ enum Commands {
     Init {
         /// Git repository URL to clone
         #[arg(value_parser = validate_git_url)]
-        git_url: String,
+        git_url: Option<String>,
+        /// Skip the Phase 2 setup wizard (no Claude Code invocation)
+        #[arg(long = "no-agent")]
+        no_agent: bool,
+        /// Skip devcontainer scaffolding entirely
+        #[arg(long = "no-devcontainer")]
+        no_devcontainer: bool,
+        /// Re-run the Phase 2 wizard against an already-initialized project (no clone)
+        #[arg(long = "reconfigure", conflicts_with = "git_url")]
+        reconfigure: bool,
     },
     /// List all worktrees
     #[command(alias = "ls")]
@@ -202,8 +212,13 @@ fn main() {
         Some(Commands::Go { name, path_only }) => {
             commands::go::run(name.as_deref(), path_only);
         }
-        Some(Commands::Init { git_url }) => {
-            commands::init::run(&git_url);
+        Some(Commands::Init {
+            git_url,
+            no_agent,
+            no_devcontainer,
+            reconfigure,
+        }) => {
+            commands::init::run(git_url.as_deref(), no_agent, no_devcontainer, reconfigure);
         }
         Some(Commands::List {
             details,

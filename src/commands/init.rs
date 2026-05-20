@@ -1,12 +1,33 @@
 use colored::Colorize;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
+use crate::devcontainer;
 use crate::git::clone_bare_repository;
+use crate::git::worktree_manager;
+use crate::models::{GroveConfig, ProjectContext};
 use crate::utils::{extract_repo_name, find_grove_repo};
 
-pub fn run(git_url: &str) {
-    // Check if we're inside an existing grove repository
+/// `grove init` entry point. Two surface modes:
+///
+/// 1. `grove init <git_url>`              — bare clone + Phase 1 scaffold (+ Phase 2 wizard
+///                                          unless --no-agent).
+/// 2. `grove init --reconfigure`          — Phase 2 wizard only, against an existing
+///                                          grove-initialized project. No clone.
+pub fn run(git_url: Option<&str>, no_agent: bool, no_devcontainer: bool, reconfigure: bool) {
+    if reconfigure {
+        run_reconfigure();
+        return;
+    }
+
+    let Some(git_url) = git_url else {
+        eprintln!(
+            "{} grove init requires a git URL (or --reconfigure to re-run the wizard).",
+            "Error:".red()
+        );
+        std::process::exit(1);
+    };
+
     if let Some(existing) = find_grove_repo(None) {
         eprintln!(
             "{} Cannot initialize grove inside an existing grove repository.\nDetected grove repository at: {}\n\nTo create a new grove setup, run 'grove init' from outside this directory hierarchy.",
@@ -16,7 +37,6 @@ pub fn run(git_url: &str) {
         std::process::exit(1);
     }
 
-    // Extract repository name from URL
     let repo_name = match extract_repo_name(git_url) {
         Ok(name) => name,
         Err(e) => {
@@ -25,10 +45,7 @@ pub fn run(git_url: &str) {
         }
     };
 
-    // Track if we created the directory
     let mut created_dir = false;
-
-    // Create directory with repo name
     if !Path::new(&repo_name).exists() {
         if let Err(e) = fs::create_dir_all(&repo_name) {
             eprintln!("{} Failed to create directory: {}", "Error:".red(), e);
@@ -37,10 +54,7 @@ pub fn run(git_url: &str) {
         created_dir = true;
     }
 
-    // Define bare repo directory
     let bare_repo_dir = format!("{}/{}.git", repo_name, repo_name);
-
-    // Check if directory already exists
     if Path::new(&bare_repo_dir).exists() {
         eprintln!(
             "{} Directory {} already exists",
@@ -51,7 +65,6 @@ pub fn run(git_url: &str) {
     }
 
     if let Err(e) = clone_bare_repository(git_url, &bare_repo_dir) {
-        // Clean up on failure
         if created_dir {
             let _ = fs::remove_dir_all(&repo_name);
         }
@@ -61,12 +74,372 @@ pub fn run(git_url: &str) {
 
     println!(
         "{} {}",
-        "✓ Initialized worktree setup:".green(),
-        repo_name.bold()
+        "✓ Cloned bare repository:".green(),
+        bare_repo_dir.bold()
     );
-    println!("  {} {}", "Bare repository:".dimmed(), bare_repo_dir);
+
+    // ---- Phase 1: deterministic scaffold ----
+    // Re-discover the bare clone so all worktree_manager helpers work.
+    let project_root_path = PathBuf::from(&repo_name);
+    let original_cwd = std::env::current_dir().ok();
+    if std::env::set_current_dir(&project_root_path).is_err() {
+        eprintln!(
+            "{} Could not enter project directory {}",
+            "Warning:".yellow(),
+            project_root_path.display()
+        );
+        return;
+    }
+
+    let context = match worktree_manager::discover_repo() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!(
+                "{} Could not discover the bare clone after init: {}",
+                "Warning:".yellow(),
+                e
+            );
+            if let Some(cwd) = original_cwd {
+                let _ = std::env::set_current_dir(cwd);
+            }
+            return;
+        }
+    };
+
+    let project = devcontainer::detect_project_context(&context, &repo_name);
+    print_detection_summary(&project);
+
+    if no_devcontainer {
+        println!(
+            "  {} --no-devcontainer set; skipping .devcontainer/ scaffold.",
+            "·".dimmed()
+        );
+    } else {
+        match devcontainer::scaffold_devcontainer(&context, &project) {
+            Ok(true) => println!("  {} wrote .devcontainer/devcontainer.json", "·".dimmed()),
+            Ok(false) => println!(
+                "  {} .devcontainer/devcontainer.json already exists; left as-is",
+                "·".dimmed()
+            ),
+            Err(e) => eprintln!("  {} devcontainer scaffold failed: {}", "Warning:".yellow(), e),
+        }
+    }
+
+    if let Err(e) = write_grove_config(worktree_manager::project_root(&context), &project) {
+        eprintln!("  {} failed to write .grove/config.toml: {}", "Warning:".yellow(), e);
+    } else {
+        println!("  {} wrote .grove/config.toml", "·".dimmed());
+    }
+
+    if let Err(e) = ensure_groverc_bootstrap(worktree_manager::project_root(&context)) {
+        eprintln!("  {} failed to update .groverc: {}", "Warning:".yellow(), e);
+    } else {
+        println!("  {} updated .groverc bootstrap commands", "·".dimmed());
+    }
+
+    if let Err(e) = patch_gitignore(worktree_manager::project_root(&context)) {
+        eprintln!("  {} failed to patch .gitignore: {}", "Warning:".yellow(), e);
+    } else {
+        println!("  {} patched .gitignore (.grove/, worktrees/)", "·".dimmed());
+    }
+
+    // ---- Phase 2 hook: setup wizard ----
+    if no_agent {
+        println!(
+            "  {} --no-agent set; skipping the Phase 2 setup wizard.",
+            "·".dimmed()
+        );
+    } else {
+        // Phase 2 dispatcher lives in crate::agent::setup; not yet built — fail soft.
+        match crate::agent::setup::run_setup_wizard(&context, &project, false) {
+            Ok(()) => {}
+            Err(e) => eprintln!(
+                "  {} setup wizard did not complete: {} (you can retry with `grove init --reconfigure`)",
+                "Warning:".yellow(),
+                e
+            ),
+        }
+    }
+
     println!();
     println!("{}", "Next steps:".bold());
-    println!("  {} {}", "cd".dimmed(), bare_repo_dir);
-    println!("  {} <branch-name>", "grove add".dimmed());
+    println!("  {} {}", "cd".dimmed(), repo_name);
+    println!("  {} <name>                  # create a regular worktree", "grove add".dimmed());
+    println!(
+        "  {} <name> --task \"...\"   # spawn an agent in an isolated worktree",
+        "grove spawn".dimmed()
+    );
+
+    if let Some(cwd) = original_cwd {
+        let _ = std::env::set_current_dir(cwd);
+    }
+}
+
+/// `grove init --reconfigure` — re-run Phase 2 only.
+fn run_reconfigure() {
+    let context = match worktree_manager::discover_repo() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!(
+                "{} grove init --reconfigure must run inside a grove-initialized project: {}",
+                "Error:".red(),
+                e
+            );
+            std::process::exit(1);
+        }
+    };
+
+    let repo_root = worktree_manager::project_root(&context).to_path_buf();
+    let repo_name = repo_root
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("project")
+        .to_string();
+    let project = devcontainer::detect_project_context(&context, &repo_name);
+    print_detection_summary(&project);
+
+    match crate::agent::setup::run_setup_wizard(&context, &project, true) {
+        Ok(()) => {}
+        Err(e) => eprintln!(
+            "  {} setup wizard did not complete: {}",
+            "Warning:".yellow(),
+            e
+        ),
+    }
+}
+
+fn print_detection_summary(project: &ProjectContext) {
+    let stack = project
+        .stack
+        .map(|s| s.as_str())
+        .unwrap_or("unknown");
+    let pm = project.package_manager.as_deref().unwrap_or("none");
+    let tc = project.toolchain_version.as_deref().unwrap_or("unspecified");
+    println!(
+        "{} stack={} pm={} toolchain={} tests={} dockerfile={} CLAUDE.md={}",
+        "Detected:".dimmed(),
+        stack,
+        pm,
+        tc,
+        project.has_tests,
+        project.has_dockerfile,
+        project.has_claude_md
+    );
+}
+
+/// Persist a baseline `.grove/config.toml` capturing the Phase 1 detection. Refuses
+/// to overwrite an existing file so user edits survive `grove init` re-runs.
+fn write_grove_config(project_root: &Path, project: &ProjectContext) -> Result<(), String> {
+    let dir = project_root.join(".grove");
+    fs::create_dir_all(&dir).map_err(|e| format!("create .grove/: {}", e))?;
+    let path = dir.join("config.toml");
+    if path.exists() {
+        return Ok(()); // respect existing user config
+    }
+
+    let mut config = GroveConfig::default();
+    if let Some(s) = project.stack {
+        config.stack.detected = Some(s.as_str().to_string());
+    }
+    config.stack.toolchain = project.toolchain_version.clone();
+    config.stack.package_mgr = project.package_manager.clone();
+    config.stack.default_branch = project.default_branch.clone();
+    config.devcontainer.enabled = true;
+    config.devcontainer.auto_up = true;
+    config.meta.initialized_at = Some(chrono::Utc::now());
+    config.meta.schema_version = 1;
+
+    let body = toml::to_string_pretty(&config)
+        .map_err(|e| format!("serialize .grove/config.toml: {}", e))?;
+    fs::write(&path, body).map_err(|e| format!("write .grove/config.toml: {}", e))?;
+    Ok(())
+}
+
+/// Extend (or create) `.groverc` so `grove add` brings the devcontainer up on each new
+/// worktree. Upstream-compatible: if `.groverc` already exists, we read its JSON,
+/// append the missing bootstrap command, and rewrite.
+fn ensure_groverc_bootstrap(project_root: &Path) -> Result<(), String> {
+    let path = project_root.join(".groverc");
+    let mut value: serde_json::Value = if path.exists() {
+        let raw = fs::read_to_string(&path).map_err(|e| format!("read .groverc: {}", e))?;
+        if raw.trim().is_empty() {
+            serde_json::json!({})
+        } else {
+            serde_json::from_str(&raw).map_err(|e| format!("parse .groverc: {}", e))?
+        }
+    } else {
+        serde_json::json!({})
+    };
+
+    // Ensure bootstrap.commands is an array.
+    let obj = value
+        .as_object_mut()
+        .ok_or_else(|| ".groverc is not a JSON object".to_string())?;
+    let bootstrap = obj
+        .entry("bootstrap")
+        .or_insert_with(|| serde_json::json!({ "commands": [] }));
+    let commands = bootstrap
+        .as_object_mut()
+        .and_then(|b| b.entry("commands").or_insert_with(|| serde_json::json!([])).as_array_mut())
+        .ok_or_else(|| ".groverc bootstrap.commands is not an array".to_string())?;
+
+    let devcontainer_cmd = serde_json::json!({
+        "program": "devcontainer",
+        "args": ["up", "--workspace-folder", "."]
+    });
+    let already_present = commands.iter().any(|c| {
+        c.get("program").and_then(|p| p.as_str()) == Some("devcontainer")
+            && c.get("args")
+                .and_then(|a| a.as_array())
+                .map(|a| a.iter().any(|v| v == "up"))
+                .unwrap_or(false)
+    });
+    if !already_present {
+        commands.insert(0, devcontainer_cmd);
+    }
+
+    let body =
+        serde_json::to_string_pretty(&value).map_err(|e| format!("serialize .groverc: {}", e))?;
+    fs::write(&path, body).map_err(|e| format!("write .groverc: {}", e))?;
+    Ok(())
+}
+
+/// Idempotent: append grove-specific gitignore entries if missing. Never rewrites or
+/// reorders existing lines.
+fn patch_gitignore(project_root: &Path) -> Result<(), String> {
+    let path = project_root.join(".gitignore");
+    let existing = fs::read_to_string(&path).unwrap_or_default();
+    let entries = [
+        "# grove",
+        ".grove/agents/",
+        ".grove/bus/",
+        "worktrees/",
+        ".devcontainer/.local/",
+    ];
+    let mut out = existing.clone();
+    if !out.ends_with('\n') && !out.is_empty() {
+        out.push('\n');
+    }
+    let mut needs_header = !existing.contains("# grove");
+    for entry in entries.iter().skip(1) {
+        // entries[0] is the header
+        if !existing.lines().any(|l| l.trim() == *entry) {
+            if needs_header {
+                out.push_str("\n# grove\n");
+                needs_header = false;
+            }
+            out.push_str(entry);
+            out.push('\n');
+        }
+    }
+    fs::write(&path, out).map_err(|e| format!("write .gitignore: {}", e))?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn tmp(name: &str) -> PathBuf {
+        let base = std::env::temp_dir().join(format!("grove-init-test-{}", name));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).unwrap();
+        base
+    }
+
+    #[test]
+    fn write_grove_config_creates_toml() {
+        let dir = tmp("config");
+        let project = ProjectContext {
+            stack: Some(crate::models::ProjectStack::Rust),
+            package_manager: Some("cargo".into()),
+            toolchain_version: Some("rust-stable".into()),
+            default_branch: Some("main".into()),
+            repo_name: "demo".into(),
+            ..Default::default()
+        };
+        write_grove_config(&dir, &project).unwrap();
+        let body = fs::read_to_string(dir.join(".grove/config.toml")).unwrap();
+        assert!(body.contains("detected = \"rust\""));
+        assert!(body.contains("package_mgr = \"cargo\""));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn write_grove_config_does_not_overwrite_existing() {
+        let dir = tmp("config-existing");
+        fs::create_dir_all(dir.join(".grove")).unwrap();
+        fs::write(dir.join(".grove/config.toml"), "# user-edited\n").unwrap();
+        write_grove_config(&dir, &ProjectContext::default()).unwrap();
+        let body = fs::read_to_string(dir.join(".grove/config.toml")).unwrap();
+        assert!(body.contains("# user-edited"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ensure_groverc_bootstrap_creates_file_when_absent() {
+        let dir = tmp("groverc-fresh");
+        ensure_groverc_bootstrap(&dir).unwrap();
+        let body = fs::read_to_string(dir.join(".groverc")).unwrap();
+        assert!(body.contains("devcontainer"));
+        assert!(body.contains("\"up\""));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ensure_groverc_bootstrap_extends_existing_config() {
+        let dir = tmp("groverc-extend");
+        fs::write(
+            dir.join(".groverc"),
+            r#"{"branchPrefix":"panzax","bootstrap":{"commands":[{"program":"npm","args":["install"]}]}}"#,
+        )
+        .unwrap();
+        ensure_groverc_bootstrap(&dir).unwrap();
+        let body = fs::read_to_string(dir.join(".groverc")).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let cmds = v["bootstrap"]["commands"].as_array().unwrap();
+        assert_eq!(v["branchPrefix"], "panzax");
+        // devcontainer up should be first, npm install still present
+        assert_eq!(cmds.len(), 2);
+        assert_eq!(cmds[0]["program"], "devcontainer");
+        assert_eq!(cmds[1]["program"], "npm");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ensure_groverc_bootstrap_is_idempotent() {
+        let dir = tmp("groverc-idem");
+        ensure_groverc_bootstrap(&dir).unwrap();
+        let body1 = fs::read_to_string(dir.join(".groverc")).unwrap();
+        ensure_groverc_bootstrap(&dir).unwrap();
+        let body2 = fs::read_to_string(dir.join(".groverc")).unwrap();
+        assert_eq!(body1, body2);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn patch_gitignore_appends_grove_block() {
+        let dir = tmp("gitignore-new");
+        fs::write(dir.join(".gitignore"), "target/\nnode_modules/\n").unwrap();
+        patch_gitignore(&dir).unwrap();
+        let body = fs::read_to_string(dir.join(".gitignore")).unwrap();
+        assert!(body.contains("target/"));
+        assert!(body.contains("# grove"));
+        assert!(body.contains(".grove/agents/"));
+        assert!(body.contains(".grove/bus/"));
+        assert!(body.contains("worktrees/"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn patch_gitignore_is_idempotent() {
+        let dir = tmp("gitignore-idem");
+        patch_gitignore(&dir).unwrap();
+        let body1 = fs::read_to_string(dir.join(".gitignore")).unwrap();
+        patch_gitignore(&dir).unwrap();
+        let body2 = fs::read_to_string(dir.join(".gitignore")).unwrap();
+        assert_eq!(body1, body2);
+        let _ = fs::remove_dir_all(&dir);
+    }
 }
