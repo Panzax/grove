@@ -5,4 +5,5 @@
 // survives detach, can be re-attached, and we can list/kill via tmux's named-
 // session API.
 
+pub mod container;
 pub mod tmux;
