@@ -14,7 +14,8 @@ use crate::agent::seed;
 use crate::git::worktree_manager::{
     add_worktree, branch_exists, discover_repo, layout, project_root,
 };
-use crate::models::{AgentMetadata, ProjectLayout};
+use crate::models::{AgentMetadata, GroveConfig, ProjectLayout};
+use crate::session::container::{self, ContainerInfo};
 use crate::session::tmux::{launch_detached, SessionSpec};
 
 const DEFAULT_MAX_ITERATIONS: u32 = 30;
@@ -190,19 +191,36 @@ pub fn run(
         env,
         command: cmd_tokens.clone(),
     };
-    // C3: host target for now. C5 plugs in container::ensure_up so the
-    // session lives inside the devcontainer.
-    match launch_detached(&spec, None) {
+
+    // Resolve the spawn target: container or host. When
+    // `.grove/config.toml [devcontainer] enabled = true`, ensure the
+    // devcontainer is up and route tmux through `devcontainer exec`. When
+    // disabled, fall back to host tmux (legacy behavior, useful for
+    // grove projects that don't use containers).
+    let container = resolve_container(&project_root_path);
+    if let Some(info) = &container {
+        println!(
+            "  {} devcontainer ready (workspace_target {})",
+            "·".dimmed(),
+            info.workspace_target.display()
+        );
+    }
+    match launch_detached(&spec, container.as_ref()) {
         Ok(session_name) => {
             println!(
-                "{} launched tmux session {} ({})",
+                "{} launched tmux session {} ({}) {}",
                 "✓".green(),
                 session_name.bold(),
-                cmd_tokens.join(" ")
+                cmd_tokens.join(" "),
+                if container.is_some() {
+                    "[in container]".dimmed().to_string()
+                } else {
+                    "[host]".dimmed().to_string()
+                }
             );
             println!(
                 "  attach: {}",
-                crate::session::tmux::attach_instructions(name, None)
+                crate::session::tmux::attach_instructions(name, container.as_ref())
             );
         }
         Err(e) => {
@@ -256,6 +274,33 @@ fn branch_already_checked_out(project_root: &Path, branch: &str) -> Option<Strin
         }
     }
     None
+}
+
+/// Decide whether to run the spawned session in the project's devcontainer.
+///
+/// Reads `.grove/config.toml [devcontainer]`. When `enabled = false`, returns
+/// None (host tmux). When `enabled = true`, calls `container::ensure_up` and
+/// returns the resulting ContainerInfo. On any failure to ensure the
+/// container, prints a warning and falls back to host tmux so the user isn't
+/// hard-blocked.
+fn resolve_container(project_root: &Path) -> Option<ContainerInfo> {
+    let cfg_path = project_root.join(".grove").join("config.toml");
+    let raw = std::fs::read_to_string(&cfg_path).ok()?;
+    let cfg: GroveConfig = toml::from_str(&raw).ok()?;
+    if !cfg.devcontainer.enabled {
+        return None;
+    }
+    match container::ensure_up(project_root) {
+        Ok(info) => Some(info),
+        Err(e) => {
+            eprintln!(
+                "  {} `devcontainer up` failed: {} — falling back to host tmux.",
+                "Warning:".yellow(),
+                e
+            );
+            None
+        }
+    }
 }
 
 /// Command vec passed to tmux. Honors `GROVE_AGENT_COMMAND` env override so tests
