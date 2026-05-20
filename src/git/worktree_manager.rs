@@ -385,6 +385,35 @@ pub fn get_default_branch(context: &RepoContext) -> Result<String, String> {
     Err("Could not determine default branch. Please specify with --branch.".to_string())
 }
 
+/// Read a file from HEAD against the bare clone without a working tree.
+///
+/// Used by the agentic init Phase 1 / Phase 2 to inspect manifests
+/// (`pyproject.toml`, `Cargo.toml`, `package.json`, ...) immediately after
+/// `clone_bare_repository`. Returns the file contents on success.
+pub fn show_head_file(context: &RepoContext, file: &str) -> Result<String, String> {
+    git_raw(context, &["show", &format!("HEAD:{}", file)])
+        .map_err(|e| format!("Failed to read HEAD:{}: {}", file, e))
+}
+
+/// List every tracked path at HEAD against the bare clone.
+///
+/// Used by the agentic init Phase 1 to detect monorepo structures and find every
+/// candidate manifest without a working tree.
+pub fn ls_head_files(context: &RepoContext) -> Result<Vec<String>, String> {
+    let output = git_raw(context, &["ls-tree", "-r", "--name-only", "HEAD"])
+        .map_err(|e| format!("Failed to ls-tree HEAD: {}", e))?;
+    Ok(output
+        .lines()
+        .filter(|line| !line.is_empty())
+        .map(|s| s.to_string())
+        .collect())
+}
+
+/// Check whether `HEAD:<file>` exists as a regular blob.
+pub fn head_file_exists(context: &RepoContext, file: &str) -> bool {
+    git_raw(context, &["cat-file", "-e", &format!("HEAD:{}", file)]).is_ok()
+}
+
 pub fn sync_branch(context: &RepoContext, branch: &str) -> Result<(), String> {
     git_raw(
         context,
