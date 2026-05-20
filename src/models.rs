@@ -289,6 +289,33 @@ pub struct ProjectSection {
     pub root: Option<String>,
 }
 
+/// Agent-isolation strategy. `Shared` = one devcontainer hosts every agent's
+/// worktree (current default; matches the freqtrade harness). `PerWorktree` is
+/// a future flag — accepted by config parsing for forward-compat but currently
+/// rejected at runtime with a "not implemented" notice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum AgentIsolation {
+    Shared,
+    PerWorktree,
+}
+
+impl Default for AgentIsolation {
+    fn default() -> Self {
+        AgentIsolation::Shared
+    }
+}
+
+impl AgentIsolation {
+    #[allow(dead_code)]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            AgentIsolation::Shared => "shared",
+            AgentIsolation::PerWorktree => "per-worktree",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentSection {
     #[serde(default = "default_provider")]
@@ -297,6 +324,8 @@ pub struct AgentSection {
     pub max_iterations: u32,
     #[serde(default = "default_session_backend")]
     pub session_backend: String, // "tmux" | "background"
+    #[serde(default)]
+    pub isolation: AgentIsolation, // shared (default) | per-worktree (future)
 }
 
 impl Default for AgentSection {
@@ -305,6 +334,7 @@ impl Default for AgentSection {
             provider: default_provider(),
             max_iterations: default_max_iterations(),
             session_backend: default_session_backend(),
+            isolation: AgentIsolation::default(),
         }
     }
 }
@@ -319,6 +349,15 @@ pub struct DevcontainerSection {
     pub enabled: bool,
     #[serde(default = "default_true")]
     pub auto_up: bool,
+    /// Container-side path that the host project root is mounted at.
+    /// Detected from devcontainer.json's `workspaceFolder` field; defaults to
+    /// `/workspaces/<repo>` when scaffolded.
+    #[serde(default)]
+    pub workspace_target: Option<String>,
+    /// Container user, matches devcontainer.json `remoteUser`. Default
+    /// "vscode" for the Microsoft base images.
+    #[serde(default = "default_remote_user")]
+    pub remote_user: String,
 }
 
 impl Default for DevcontainerSection {
@@ -326,8 +365,14 @@ impl Default for DevcontainerSection {
         Self {
             enabled: true,
             auto_up: true,
+            workspace_target: None,
+            remote_user: default_remote_user(),
         }
     }
+}
+
+fn default_remote_user() -> String {
+    "vscode".to_string()
 }
 
 fn default_true() -> bool {
