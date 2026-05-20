@@ -250,6 +250,11 @@ enum Commands {
         #[command(subcommand)]
         command: DevcontainerCommand,
     },
+    /// Re-attach to a running agent's tmux session inside the devcontainer
+    Attach {
+        /// Agent name (the tmux session is grove-<name>)
+        name: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -420,6 +425,7 @@ fn main() {
             DevcontainerCommand::Logs => commands::devcontainer::logs(),
             DevcontainerCommand::Doctor => commands::devcontainer::doctor(),
         },
+        Some(Commands::Attach { name }) => commands::attach::run(&name),
         None => {
             // No command provided - show help
             eprintln!(
