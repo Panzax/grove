@@ -164,12 +164,12 @@ fn prompt_claude_scope(config: &mut GroveConfig, devcontainer: &mut Value) -> Re
     println!();
     println!(
         "{}",
-        "Spawned agents need access to your Claude Code plugins/skills. Choose how:".dimmed()
+        "Spawned agents need access to your Claude Code plugins/skills AND the Stop hook (registered in settings.json). Choose how:".dimmed()
     );
     let options = vec![
-        "Scoped: mount ~/.claude/plugins (RO) + ~/.claude/.credentials.json (RO) — recommended",
-        "Full:   mount ~/.claude (RW) — matches the freqtrade default, NOT recommended (exposes session history + lets the container write user settings)",
-        "None:   no Claude inheritance (you'll authenticate inside the container per rebuild)",
+        "Scoped: mount ~/.claude/{plugins, .credentials.json, settings.json} all RO — recommended",
+        "Full:   mount ~/.claude (RW) — exposes session history + lets the container write user settings; NOT recommended",
+        "None:   no Claude inheritance (you'll authenticate + register the Stop hook inside the container per rebuild)",
     ];
     let default_idx = match config.mounts.claude_inherit.as_deref() {
         Some("full") => 1,
@@ -189,6 +189,11 @@ fn prompt_claude_scope(config: &mut GroveConfig, devcontainer: &mut Value) -> Re
     };
     config.mounts.claude_inherit = Some(key.to_string());
 
+    // Trade-off note for the scoped path: mounting settings.json RO is what
+    // gets the Stop hook (and your plugin enables) visible inside the
+    // container. Side effect: any prefs in settings.json — theme, MCP server
+    // URLs / configs, plugin-specific data — become readable from inside.
+    // Acceptable for most users; the "Full" option's RW exposure is worse.
     match key {
         "scoped" => {
             add_mount(
@@ -202,6 +207,20 @@ fn prompt_claude_scope(config: &mut GroveConfig, devcontainer: &mut Value) -> Re
                 "${localEnv:HOME}/.claude/.credentials.json",
                 "/home/vscode/.claude/.credentials.json",
                 "ro",
+            );
+            // settings.json (RO) brings the Stop hook + enabledPlugins into
+            // the container. Without it, the Stop hook never fires for
+            // claude sessions inside the container, so the Ralph loop
+            // doesn't engage.
+            add_mount(
+                devcontainer,
+                "${localEnv:HOME}/.claude/settings.json",
+                "/home/vscode/.claude/settings.json",
+                "ro",
+            );
+            println!(
+                "  {} settings.json mounted RO so the Stop hook reaches the in-container claude. Your prefs (theme, MCP configs, plugin enables) become readable from inside the container.",
+                "Note:".cyan()
             );
         }
         "full" => {
