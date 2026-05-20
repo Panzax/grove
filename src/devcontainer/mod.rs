@@ -115,13 +115,20 @@ pub fn scaffold_devcontainer(ctx: &RepoContext, project: &ProjectContext) -> Res
 
 /// Build the JSON skeleton (deterministic Phase 1). Phase 2 mutates this structure to
 /// add mounts, extensions, and language-specific features.
+///
+/// `workspaceFolder` is set to `/workspaces/<repo_name>` so the container-side
+/// path is stable and matches the default of the Microsoft devcontainers base
+/// images. `container::host_to_container_path` derives container paths from
+/// this, so the skeleton stays the source of truth.
 pub fn build_devcontainer_skeleton(project: &ProjectContext) -> Value {
+    let workspace_folder = format!("/workspaces/{}", project.repo_name);
     let mut root = json!({
         "name": project.repo_name,
         "image": project.default_image,
         "remoteUser": "vscode",
         "containerUser": "vscode",
         "updateRemoteUserUID": true,
+        "workspaceFolder": workspace_folder,
         "postCreateCommand": "",
         "containerEnv": {},
         "mounts": [],
@@ -172,6 +179,25 @@ pub fn write_devcontainer_json(project_root_path: &Path, value: &Value) -> Resul
 /// can do simple substring probes without juggling Result).
 pub fn read_head_or_empty(ctx: &RepoContext, file: &str) -> String {
     show_head_file(ctx, file).unwrap_or_default()
+}
+
+/// Extract `(workspaceFolder, remoteUser)` from a parsed devcontainer.json.
+/// Used by `grove init` to populate `.grove/config.toml [devcontainer]
+/// workspace_target` + `remote_user` so the `container` module can translate
+/// host paths without re-parsing the JSON every call.
+///
+/// Returns None for either field if it isn't in the JSON. Callers fall back
+/// to the conventional defaults (`/workspaces/<basename>`, `vscode`).
+pub fn extract_workspace_metadata(value: &Value) -> (Option<String>, Option<String>) {
+    let workspace_folder = value
+        .get("workspaceFolder")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let remote_user = value
+        .get("remoteUser")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    (workspace_folder, remote_user)
 }
 
 #[cfg(test)]

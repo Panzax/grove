@@ -740,6 +740,24 @@ fn write_grove_config(
     let mut config = build_grove_config(project, scraped, layout);
     config.devcontainer.enabled = true;
     config.devcontainer.auto_up = true;
+    // Capture workspaceFolder + remoteUser from devcontainer.json if present so
+    // src/session/container.rs::ensure_up has the host→container path map
+    // without re-parsing JSON each call. Falls back to /workspaces/<repo> +
+    // "vscode" when devcontainer.json is absent (e.g., --no-devcontainer).
+    if let Ok(value) = crate::devcontainer::read_devcontainer_json(project_root) {
+        let (workspace_target, remote_user) =
+            crate::devcontainer::extract_workspace_metadata(&value);
+        if let Some(t) = workspace_target {
+            config.devcontainer.workspace_target = Some(t);
+        }
+        if let Some(u) = remote_user {
+            config.devcontainer.remote_user = u;
+        }
+    }
+    if config.devcontainer.workspace_target.is_none() {
+        config.devcontainer.workspace_target =
+            Some(format!("/workspaces/{}", project.repo_name));
+    }
     config.meta.initialized_at = Some(chrono::Utc::now());
     config.meta.schema_version = 1;
 
@@ -810,6 +828,21 @@ fn merge_configs(mut existing: GroveConfig, defaults: GroveConfig) -> GroveConfi
     existing.project.layout = defaults.project.layout;
     if existing.project.root.is_none() {
         existing.project.root = defaults.project.root;
+    }
+    // Devcontainer workspace metadata: prefer existing user-set values; fall
+    // back to defaults derived from devcontainer.json on this run. The
+    // workspace_target Option semantics differ from remote_user (which has
+    // a non-Option default), so handle each.
+    if existing.devcontainer.workspace_target.is_none() {
+        existing.devcontainer.workspace_target = defaults.devcontainer.workspace_target;
+    }
+    // remote_user always has a default; only swap if the existing config
+    // still has the literal default and the new detection produced something
+    // different.
+    if existing.devcontainer.remote_user == "vscode"
+        && defaults.devcontainer.remote_user != "vscode"
+    {
+        existing.devcontainer.remote_user = defaults.devcontainer.remote_user;
     }
     existing
 }
