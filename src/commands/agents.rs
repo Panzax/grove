@@ -234,6 +234,112 @@ pub fn purge(name: &str) {
     }
 }
 
+/// `grove agents repair-pointers [<name>]` — rewrite a worktree's two `.git`
+/// pointer files (forward + back) from absolute → relative paths so they
+/// resolve identically on host and inside the devcontainer.
+///
+/// Without `<name>` repairs every agent that has an `agent.toml` recording
+/// a `worktree` path. With `<name>` repairs just that one. Missing worktrees
+/// (e.g. user ran `grove remove`) are skipped with a note.
+pub fn repair_pointers(name: Option<&str>) {
+    let ctx = match discover_repo() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("{} {}", "Error:".red(), e);
+            std::process::exit(1);
+        }
+    };
+    let agents_dir = project_root(&ctx).join(".grove").join("agents");
+
+    let targets: Vec<(String, std::path::PathBuf)> = match name {
+        Some(n) => {
+            let dir = agents_dir.join(n);
+            if !dir.exists() {
+                eprintln!(
+                    "{} no agent named {}: dir {} does not exist",
+                    "Error:".red(),
+                    n,
+                    dir.display()
+                );
+                std::process::exit(1);
+            }
+            match load_agent(&dir) {
+                Ok(row) => vec![(row.metadata.name, std::path::PathBuf::from(row.metadata.worktree))],
+                Err(e) => {
+                    eprintln!("{} {}", "Error:".red(), e);
+                    std::process::exit(1);
+                }
+            }
+        }
+        None => match collect_agents(&agents_dir) {
+            Ok(rows) => rows
+                .into_iter()
+                .map(|r| {
+                    (
+                        r.metadata.name,
+                        std::path::PathBuf::from(r.metadata.worktree),
+                    )
+                })
+                .collect(),
+            Err(e) => {
+                eprintln!("{} {}", "Error:".red(), e);
+                std::process::exit(1);
+            }
+        },
+    };
+
+    if targets.is_empty() {
+        println!("(no agents found in {})", agents_dir.display());
+        return;
+    }
+
+    let mut fixed = 0u32;
+    let mut skipped = 0u32;
+    let mut failed = 0u32;
+    for (agent_name, worktree_path) in &targets {
+        if !worktree_path.exists() {
+            println!(
+                "  {} {} — worktree {} missing; skipping",
+                "·".dimmed(),
+                agent_name,
+                worktree_path.display()
+            );
+            skipped += 1;
+            continue;
+        }
+        match crate::git::worktree_paths::make_worktree_pointers_relative(worktree_path) {
+            Ok(()) => {
+                println!(
+                    "  {} {} — pointers relative ({})",
+                    "✓".green(),
+                    agent_name,
+                    worktree_path.display()
+                );
+                fixed += 1;
+            }
+            Err(e) => {
+                eprintln!(
+                    "  {} {} — {}",
+                    "✗".red(),
+                    agent_name,
+                    e
+                );
+                failed += 1;
+            }
+        }
+    }
+    println!(
+        "{} repair-pointers: {} fixed, {} skipped, {} failed",
+        if failed == 0 { "✓".green() } else { "!".yellow() },
+        fixed,
+        skipped,
+        failed
+    );
+    if failed > 0 {
+        std::process::exit(1);
+    }
+}
+
 struct AgentRow {
     metadata: AgentMetadata,
     iteration: u32,

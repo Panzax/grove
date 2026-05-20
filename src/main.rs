@@ -295,6 +295,13 @@ enum AgentsCommand {
         /// Agent name
         name: String,
     },
+    /// Rewrite worktree .git pointer files to relative paths so they resolve
+    /// on host AND inside the devcontainer. Fixes worktrees that were created
+    /// by older grove versions that wrote absolute host paths.
+    RepairPointers {
+        /// Agent name (repairs every agent if omitted)
+        name: Option<String>,
+    },
 }
 
 fn main() {
@@ -386,6 +393,9 @@ fn main() {
             AgentsCommand::Status { name } => commands::agents::status(&name),
             AgentsCommand::Kill { name } => commands::agents::kill(&name),
             AgentsCommand::Purge { name } => commands::agents::purge(&name),
+            AgentsCommand::RepairPointers { name } => {
+                commands::agents::repair_pointers(name.as_deref())
+            }
         },
         Some(Commands::Loop { agent, watch }) => {
             commands::loop_::run(agent.as_deref(), watch);
