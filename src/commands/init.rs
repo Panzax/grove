@@ -909,9 +909,23 @@ fn merge_devcontainer_into_existing(
     Ok(())
 }
 
+/// Ensure `.groverc` exists with a valid (possibly empty) bootstrap section.
+///
+/// Earlier revisions of this fork inserted a `devcontainer up
+/// --workspace-folder .` entry here so `grove add` would bring the container
+/// up. That's been **removed**: `grove spawn` is now the single entry point
+/// that brings the container up via `container::ensure_up` (operates on the
+/// project root, not the new worktree). `grove add` stays a generic worktree
+/// CLI with no container responsibility.
+///
+/// To preserve idempotency on projects that previously had the entry, this
+/// function also REMOVES any pre-existing `devcontainer up ...` bootstrap
+/// command. User-added entries (`npm install`, `cargo check`, etc.) are
+/// preserved.
 fn ensure_groverc_bootstrap(project_root: &Path) -> Result<(), String> {
     let path = project_root.join(".groverc");
-    let mut value: serde_json::Value = if path.exists() {
+    let existed = path.exists();
+    let mut value: serde_json::Value = if existed {
         let raw = fs::read_to_string(&path).map_err(|e| format!("read .groverc: {}", e))?;
         if raw.trim().is_empty() {
             serde_json::json!({})
@@ -925,31 +939,27 @@ fn ensure_groverc_bootstrap(project_root: &Path) -> Result<(), String> {
     let obj = value
         .as_object_mut()
         .ok_or_else(|| ".groverc is not a JSON object".to_string())?;
-    let bootstrap = obj
-        .entry("bootstrap")
-        .or_insert_with(|| serde_json::json!({ "commands": [] }));
-    let commands = bootstrap
-        .as_object_mut()
-        .and_then(|b| {
-            b.entry("commands")
-                .or_insert_with(|| serde_json::json!([]))
-                .as_array_mut()
-        })
-        .ok_or_else(|| ".groverc bootstrap.commands is not an array".to_string())?;
+    if let Some(bootstrap) = obj.get_mut("bootstrap") {
+        if let Some(bootstrap_obj) = bootstrap.as_object_mut() {
+            if let Some(commands) = bootstrap_obj.get_mut("commands").and_then(|c| c.as_array_mut())
+            {
+                commands.retain(|c| {
+                    !(c.get("program").and_then(|p| p.as_str()) == Some("devcontainer")
+                        && c.get("args")
+                            .and_then(|a| a.as_array())
+                            .map(|a| a.iter().any(|v| v == "up"))
+                            .unwrap_or(false))
+                });
+            }
+        }
+    }
 
-    let devcontainer_cmd = serde_json::json!({
-        "program": "devcontainer",
-        "args": ["up", "--workspace-folder", "."]
-    });
-    let already_present = commands.iter().any(|c| {
-        c.get("program").and_then(|p| p.as_str()) == Some("devcontainer")
-            && c.get("args")
-                .and_then(|a| a.as_array())
-                .map(|a| a.iter().any(|v| v == "up"))
-                .unwrap_or(false)
-    });
-    if !already_present {
-        commands.insert(0, devcontainer_cmd);
+    // If we created the file from scratch (no prior `.groverc`), make sure
+    // there's at least an empty bootstrap.commands block so future user edits
+    // have something to extend.
+    if !existed {
+        obj.entry("bootstrap")
+            .or_insert_with(|| serde_json::json!({ "commands": [] }));
     }
 
     let body =
@@ -1248,13 +1258,17 @@ mod tests {
         let dir = tmp("groverc-fresh");
         ensure_groverc_bootstrap(&dir).unwrap();
         let body = fs::read_to_string(dir.join(".groverc")).unwrap();
-        assert!(body.contains("devcontainer"));
-        assert!(body.contains("\"up\""));
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        // Fresh file gets an empty bootstrap.commands block so user can
+        // extend later. No devcontainer entry — `grove spawn` handles that.
+        assert!(v["bootstrap"]["commands"].is_array());
+        assert_eq!(v["bootstrap"]["commands"].as_array().unwrap().len(), 0);
+        assert!(!body.contains("devcontainer"));
         let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn ensure_groverc_bootstrap_extends_existing_config() {
+    fn ensure_groverc_bootstrap_preserves_user_entries() {
         let dir = tmp("groverc-extend");
         fs::write(
             dir.join(".groverc"),
@@ -1266,9 +1280,36 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&body).unwrap();
         let cmds = v["bootstrap"]["commands"].as_array().unwrap();
         assert_eq!(v["branchPrefix"], "panzax");
-        assert_eq!(cmds.len(), 2);
-        assert_eq!(cmds[0]["program"], "devcontainer");
-        assert_eq!(cmds[1]["program"], "npm");
+        assert_eq!(cmds.len(), 1);
+        assert_eq!(cmds[0]["program"], "npm");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ensure_groverc_bootstrap_strips_legacy_devcontainer_entry() {
+        // Older grove versions wrote a devcontainer-up bootstrap entry. Make
+        // sure re-running init removes it (it ran from worktree cwd, which
+        // is wrong for the shared-container model — grove spawn handles
+        // container lifecycle now).
+        let dir = tmp("groverc-strip-legacy");
+        fs::write(
+            dir.join(".groverc"),
+            r#"{
+              "bootstrap": {
+                "commands": [
+                  {"program":"devcontainer","args":["up","--workspace-folder","."]},
+                  {"program":"npm","args":["install"]}
+                ]
+              }
+            }"#,
+        )
+        .unwrap();
+        ensure_groverc_bootstrap(&dir).unwrap();
+        let body = fs::read_to_string(dir.join(".groverc")).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let cmds = v["bootstrap"]["commands"].as_array().unwrap();
+        assert_eq!(cmds.len(), 1);
+        assert_eq!(cmds[0]["program"], "npm");
         let _ = fs::remove_dir_all(&dir);
     }
 
