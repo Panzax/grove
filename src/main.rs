@@ -181,6 +181,70 @@ enum Commands {
         #[arg(short = 'b', long = "branch")]
         branch: Option<String>,
     },
+    /// Spawn an agent in an isolated worktree (Panzax fork addition)
+    Spawn {
+        /// Worktree / agent name
+        #[arg(value_parser = validate_branch_name)]
+        name: String,
+        /// Attach the worktree to an existing branch instead of creating agent/<name>
+        #[arg(long = "branch", value_parser = validate_branch_name)]
+        branch: Option<String>,
+        /// Task description seeded into the agent's PROMPT.md
+        #[arg(short = 't', long = "task")]
+        task: Option<String>,
+    },
+    /// Manage running agent sessions (list, status, kill)
+    Agents {
+        #[command(subcommand)]
+        command: AgentsCommand,
+    },
+    /// Inspect Ralph loop state for one or every agent
+    Loop {
+        /// Filter to a specific agent name
+        #[arg(long = "agent")]
+        agent: Option<String>,
+        /// Print live updates as loop files change
+        #[arg(long = "watch")]
+        watch: bool,
+    },
+    /// Send a message to another agent (or broadcast)
+    Msg {
+        /// Recipient agent name, or "broadcast"
+        to: String,
+        /// Message body
+        text: String,
+        /// Override the sender name (default: $GROVE_AGENT_NAME or "human")
+        #[arg(long = "from")]
+        from: Option<String>,
+        /// Treat this as a contract message; provide the contract filename slug
+        #[arg(long = "contract")]
+        contract: Option<String>,
+    },
+    /// Merge every agent/* branch into a disposable integration branch
+    Integrate {
+        /// Target branch to base the integration on (default: integration/<ts>)
+        #[arg(long = "into")]
+        into: Option<String>,
+        /// Skip the per-merge verify command
+        #[arg(long = "no-test")]
+        no_test: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum AgentsCommand {
+    /// List every known agent
+    List,
+    /// Show detailed status for one agent
+    Status {
+        /// Agent name
+        name: String,
+    },
+    /// Send SIGTERM to the agent's tmux session and mark the loop failed
+    Kill {
+        /// Agent name
+        name: String,
+    },
 }
 
 fn main() {
@@ -251,6 +315,28 @@ fn main() {
         }
         Some(Commands::Sync { branch }) => {
             commands::sync::run(branch.as_deref());
+        }
+        Some(Commands::Spawn { name, branch, task }) => {
+            commands::spawn::run(&name, branch.as_deref(), task.as_deref());
+        }
+        Some(Commands::Agents { command }) => match command {
+            AgentsCommand::List => commands::agents::list(),
+            AgentsCommand::Status { name } => commands::agents::status(&name),
+            AgentsCommand::Kill { name } => commands::agents::kill(&name),
+        },
+        Some(Commands::Loop { agent, watch }) => {
+            commands::loop_::run(agent.as_deref(), watch);
+        }
+        Some(Commands::Msg {
+            to,
+            text,
+            from,
+            contract,
+        }) => {
+            commands::msg::run(&to, &text, from.as_deref(), contract.as_deref());
+        }
+        Some(Commands::Integrate { into, no_test }) => {
+            commands::integrate::run(into.as_deref(), no_test);
         }
         None => {
             // No command provided - show help
