@@ -1,5 +1,6 @@
 pub mod add;
 pub mod agents;
+pub mod devcontainer;
 pub mod go;
 pub mod init;
 pub mod integrate;

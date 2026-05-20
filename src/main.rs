@@ -244,6 +244,31 @@ enum Commands {
         #[arg(long = "no-test")]
         no_test: bool,
     },
+    /// Manage the project's devcontainer (up/down/status/exec/rebuild/logs)
+    Devcontainer {
+        #[command(subcommand)]
+        command: DevcontainerCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum DevcontainerCommand {
+    /// Ensure the devcontainer is up (idempotent)
+    Up,
+    /// Stop the devcontainer
+    Down,
+    /// Report whether the container is up + list in-container grove tmux sessions
+    Status,
+    /// Run a command inside the container (e.g. `grove devcontainer exec bash`)
+    Exec {
+        /// Command + args
+        #[arg(required = true, trailing_var_arg = true, num_args = 1..)]
+        argv: Vec<String>,
+    },
+    /// Force a rebuild (`devcontainer up --remove-existing-container`)
+    Rebuild,
+    /// Tail container logs (`devcontainer logs`)
+    Logs,
 }
 
 #[derive(Subcommand)]
@@ -372,6 +397,14 @@ fn main() {
         Some(Commands::Integrate { into, no_test }) => {
             commands::integrate::run(into.as_deref(), no_test);
         }
+        Some(Commands::Devcontainer { command }) => match command {
+            DevcontainerCommand::Up => commands::devcontainer::up(),
+            DevcontainerCommand::Down => commands::devcontainer::down(),
+            DevcontainerCommand::Status => commands::devcontainer::status(),
+            DevcontainerCommand::Exec { argv } => commands::devcontainer::exec(&argv),
+            DevcontainerCommand::Rebuild => commands::devcontainer::rebuild(),
+            DevcontainerCommand::Logs => commands::devcontainer::logs(),
+        },
         None => {
             // No command provided - show help
             eprintln!(
