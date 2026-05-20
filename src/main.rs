@@ -4,6 +4,7 @@ use regex::Regex;
 use std::path::Path;
 
 mod agent;
+mod bus;
 mod commands;
 mod devcontainer;
 mod git;
