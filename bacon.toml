@@ -1,0 +1,55 @@
+# Bacon — incremental Rust compiler watch for grove development.
+#
+# https://dystroy.org/bacon/
+#
+# Usage from the repo root:
+#   bacon            # default: `cargo check --all-targets` — fast type errors
+#   bacon build      # keeps target/debug/grove warm so the `grove` shell
+#                    # function's next invocation is ~50ms
+#   bacon test       # runs `cargo test` on every save
+#   bacon clippy     # linter on save
+#
+# See the "Development workflow" section of README.md for the recommended
+# shell-function setup.
+
+default_job = "check-all"
+
+# Quiet a few directories we never want bacon to react to.
+ignored_directories = ["target", ".git", "worktrees"]
+
+[jobs.check-all]
+command = ["cargo", "check", "--all-targets", "--color", "always"]
+need_stdout = false
+watch = ["src", "tests", "Cargo.toml"]
+
+[jobs.build]
+command = ["cargo", "build", "--color", "always"]
+need_stdout = false
+watch = ["src", "tests", "Cargo.toml"]
+
+# `bacon release` — keeps `target/release/grove` current so a symlink at
+# `~/.cargo/bin/grove -> target/release/grove` works as a PATH-resolvable
+# "editable install". See README "Development workflow" section.
+[jobs.release]
+command = ["cargo", "build", "--release", "--color", "always"]
+need_stdout = false
+watch = ["src", "tests", "Cargo.toml"]
+
+[jobs.test]
+command = ["cargo", "test", "--color", "always", "--", "--nocapture"]
+need_stdout = true
+watch = ["src", "tests", "Cargo.toml"]
+
+[jobs.clippy]
+command = [
+  "cargo",
+  "clippy",
+  "--all-targets",
+  "--color",
+  "always",
+  "--",
+  "-D",
+  "warnings",
+]
+need_stdout = false
+watch = ["src", "tests", "Cargo.toml"]
