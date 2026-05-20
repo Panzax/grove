@@ -9,6 +9,7 @@ mod commands;
 mod devcontainer;
 mod git;
 mod models;
+mod session;
 mod utils;
 
 use crate::git::normalize_tracking_reference_input;
