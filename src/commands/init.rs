@@ -755,8 +755,7 @@ fn write_grove_config(
         }
     }
     if config.devcontainer.workspace_target.is_none() {
-        config.devcontainer.workspace_target =
-            Some(format!("/workspaces/{}", project.repo_name));
+        config.devcontainer.workspace_target = Some(format!("/workspaces/{}", project.repo_name));
     }
     config.meta.initialized_at = Some(chrono::Utc::now());
     config.meta.schema_version = 1;
@@ -941,7 +940,9 @@ fn ensure_groverc_bootstrap(project_root: &Path) -> Result<(), String> {
         .ok_or_else(|| ".groverc is not a JSON object".to_string())?;
     if let Some(bootstrap) = obj.get_mut("bootstrap") {
         if let Some(bootstrap_obj) = bootstrap.as_object_mut() {
-            if let Some(commands) = bootstrap_obj.get_mut("commands").and_then(|c| c.as_array_mut())
+            if let Some(commands) = bootstrap_obj
+                .get_mut("commands")
+                .and_then(|c| c.as_array_mut())
             {
                 commands.retain(|c| {
                     !(c.get("program").and_then(|p| p.as_str()) == Some("devcontainer")

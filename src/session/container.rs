@@ -32,11 +32,7 @@ pub struct ContainerInfo {
 }
 
 impl ContainerInfo {
-    pub fn new(
-        workspace_root: PathBuf,
-        workspace_target: PathBuf,
-        remote_user: String,
-    ) -> Self {
+    pub fn new(workspace_root: PathBuf, workspace_target: PathBuf, remote_user: String) -> Self {
         Self {
             workspace_root,
             workspace_target,
@@ -81,8 +77,8 @@ pub fn ensure_up(project_root: &Path) -> Result<ContainerInfo, String> {
     // `remoteUser`, `composeProjectName`. The CLI version varies; we
     // tolerate missing fields and fall back to config hints.
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let parsed: serde_json::Value = serde_json::from_str(stdout.trim())
-        .unwrap_or(serde_json::Value::Null);
+    let parsed: serde_json::Value =
+        serde_json::from_str(stdout.trim()).unwrap_or(serde_json::Value::Null);
 
     let remote_user = parsed
         .get("remoteUser")
@@ -194,10 +190,7 @@ pub fn exec_streaming(info: &ContainerInfo, argv: &[&str]) -> Result<ExitStatus,
 /// Translate a host-side path under `workspace_root` to its container-side
 /// equivalent under `workspace_target`. Returns Err if the path is outside
 /// the workspace root.
-pub fn host_to_container_path(
-    info: &ContainerInfo,
-    host_path: &Path,
-) -> Result<PathBuf, String> {
+pub fn host_to_container_path(info: &ContainerInfo, host_path: &Path) -> Result<PathBuf, String> {
     let host_canon = host_path
         .canonicalize()
         .unwrap_or_else(|_| host_path.to_path_buf());
@@ -224,10 +217,7 @@ pub fn attach_instructions(info: &ContainerInfo, session_name: &str) -> String {
     format!(
         "{} {} -- tmux attach -t {}",
         default_command(),
-        format_args!(
-            "exec --workspace-folder {}",
-            info.workspace_root.display()
-        ),
+        format_args!("exec --workspace-folder {}", info.workspace_root.display()),
         session_name
     )
 }
@@ -275,7 +265,10 @@ fn read_config_hints(project_root: &Path) -> (Option<String>, Option<String>) {
         Ok(c) => c,
         Err(_) => return (None, None),
     };
-    (cfg.devcontainer.workspace_target, Some(cfg.devcontainer.remote_user))
+    (
+        cfg.devcontainer.workspace_target,
+        Some(cfg.devcontainer.remote_user),
+    )
 }
 
 #[cfg(test)]
