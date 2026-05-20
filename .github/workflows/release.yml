@@ -259,7 +259,8 @@ jobs:
             ## Installation
 
             ```bash
-            curl -fsSL https://i.safia.sh/captainsafia/grove/v${{ needs.build-linux.outputs.version }} | sh
+            # self-update install URL not yet hosted for the Panzax fork; build from source:
+            cargo install --git https://github.com/Panzax/grove --tag v${{ needs.build-linux.outputs.version }}
             ```
 
             ## Manual Downloads
@@ -344,7 +345,8 @@ jobs:
             ## Installation
 
             ```bash
-            curl -fsSL https://i.safia.sh/captainsafia/grove/${{ github.ref_name }} | sh
+            # self-update install URL not yet hosted for the Panzax fork; build from source:
+            cargo install --git https://github.com/Panzax/grove --tag ${{ github.ref_name }}
             ```
 
             ## Manual Downloads

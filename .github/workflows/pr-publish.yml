@@ -263,7 +263,8 @@ jobs:
 
             **Install with:**
             \`\`\`bash
-            curl https://i.safia.sh/captainsafia/grove/pr/${prNumber} | sh
+            # self-update install URL not yet hosted for the Panzax fork; build from source:
+            cargo install --git https://github.com/Panzax/grove --branch agentic-flow
             \`\`\`
 
             **Or if you already have grove installed:**

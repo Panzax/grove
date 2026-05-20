@@ -72,7 +72,11 @@ fn validate_tracking_reference(value: &str) -> Result<String, String> {
 }
 
 #[derive(Parser)]
-#[command(name = "grove", about = "Grove is a Git worktree management tool", version = VERSION)]
+#[command(
+    name = "grove",
+    about = "Grove is a Git worktree management tool with an agentic multi-agent workflow (Panzax fork)",
+    version = VERSION
+)]
 struct Cli {
     #[command(subcommand)]
     command: Option<Commands>,
