@@ -27,21 +27,15 @@ enum ConflictAction {
 /// 2. `grove init [<path>]`      — in-place: adopt an existing checkout (defaults to ".").
 /// 3. `grove init --reconfigure` — Phase 2 wizard only, against an already-initialized
 ///                                 project; no clone, no scaffold.
-pub fn run(
-    target: Option<&str>,
-    no_agent: bool,
-    no_devcontainer: bool,
-    reconfigure: bool,
-    assume_yes: bool,
-) {
+pub fn run(target: Option<&str>, no_agent: bool, reconfigure: bool, assume_yes: bool) {
     if reconfigure {
         run_reconfigure();
         return;
     }
 
     match resolve_target(target) {
-        Target::Clone(url) => run_clone(&url, no_agent, no_devcontainer, assume_yes),
-        Target::InPlace(path) => run_in_place(&path, no_agent, no_devcontainer, assume_yes),
+        Target::Clone(url) => run_clone(&url, no_agent, assume_yes),
+        Target::InPlace(path) => run_in_place(&path, no_agent, assume_yes),
         Target::InvalidUrl(s) => {
             eprintln!(
                 "{} Invalid git URL format. Supported formats:\n  - HTTPS: https://github.com/user/repo.git\n  - SSH: git@github.com:user/repo.git\n  - SSH: ssh://git@github.com/user/repo.git\n  Got: {}",
@@ -119,7 +113,7 @@ fn looks_like_path(value: &str) -> bool {
 // Mode 1 — clone-mode (upstream behavior, preserved)
 // =============================================================================
 
-fn run_clone(git_url: &str, no_agent: bool, no_devcontainer: bool, assume_yes: bool) {
+fn run_clone(git_url: &str, no_agent: bool, assume_yes: bool) {
     if let Some(existing) = find_grove_repo(None) {
         eprintln!(
             "{} Cannot initialize grove inside an existing grove repository.\nDetected grove repository at: {}\n",
@@ -198,7 +192,7 @@ fn run_clone(git_url: &str, no_agent: bool, no_devcontainer: bool, assume_yes: b
         }
     };
     let project = devcontainer::detect_project_context(&context, &repo_name);
-    run_phase1_and_phase2(&context, &project, no_agent, no_devcontainer, assume_yes);
+    run_phase1_and_phase2(&context, &project, no_agent, assume_yes);
 
     println!();
     println!("{}", "Next steps:".bold());
@@ -221,7 +215,7 @@ fn run_clone(git_url: &str, no_agent: bool, no_devcontainer: bool, assume_yes: b
 // Mode 2 — in-place adoption (fork addition)
 // =============================================================================
 
-fn run_in_place(path: &Path, no_agent: bool, no_devcontainer: bool, assume_yes: bool) {
+fn run_in_place(path: &Path, no_agent: bool, assume_yes: bool) {
     let canonical = match path.canonicalize() {
         Ok(p) => p,
         Err(e) => {
@@ -277,7 +271,7 @@ fn run_in_place(path: &Path, no_agent: bool, no_devcontainer: bool, assume_yes: 
     let project = devcontainer::detect_project_context(&context, &repo_name);
     print_detection_summary(&project);
 
-    run_phase1_and_phase2(&context, &project, no_agent, no_devcontainer, assume_yes);
+    run_phase1_and_phase2(&context, &project, no_agent, assume_yes);
 
     println!();
     println!("{}", "Next steps:".bold());
@@ -299,40 +293,46 @@ fn run_phase1_and_phase2(
     context: &worktree_manager::RepoContext,
     project: &ProjectContext,
     no_agent: bool,
-    no_devcontainer: bool,
     assume_yes: bool,
 ) {
     let project_root = worktree_manager::project_root(context);
 
-    // ---- Phase 1 ----
-    if no_devcontainer {
-        println!(
-            "  {} --no-devcontainer set; skipping .devcontainer/ scaffold.",
-            "·".dimmed()
-        );
-    } else {
-        handle_devcontainer(context, project, assume_yes);
-    }
-
+    // ---- Phase 1 (deterministic; always runs, even with --no-agent) ----
+    handle_devcontainer(context, project, assume_yes);
     handle_grove_config(context, project, assume_yes);
     handle_groverc(project_root);
     handle_gitignore(project_root);
     if project.has_dockerfile {
         handle_dockerignore(project_root);
     }
-    if !no_devcontainer {
-        if let Err(e) = apply_cache_volumes_to_devcontainer(project_root, project) {
-            eprintln!(
-                "  {} failed to add cache volumes to devcontainer.json: {}",
-                "Warning:".yellow(),
-                e
-            );
-        } else {
-            println!(
-                "  {} applied named cache volumes to devcontainer.json",
-                "·".dimmed()
-            );
-        }
+    if let Err(e) = apply_cache_volumes_to_devcontainer(project_root, project) {
+        eprintln!(
+            "  {} failed to add cache volumes to devcontainer.json: {}",
+            "Warning:".yellow(),
+            e
+        );
+    } else {
+        println!(
+            "  {} applied named cache volumes to devcontainer.json",
+            "·".dimmed()
+        );
+    }
+    // Baseline .claude/* mounts so the in-container claude can authenticate
+    // and see the Stop hook even when the Phase 2 wizard is skipped (e.g.
+    // `grove init --no-agent`). Phase 2's prompt_claude_scope can later
+    // swap these for "full" or "none" — but the default is "scoped" so
+    // agent-spawning works out of the box.
+    if let Err(e) = apply_baseline_claude_mounts(project_root) {
+        eprintln!(
+            "  {} failed to add baseline .claude/* mounts: {}",
+            "Warning:".yellow(),
+            e
+        );
+    } else {
+        println!(
+            "  {} added baseline .claude/{{settings.json, .credentials.json, plugins}} RO mounts (scoped default)",
+            "·".dimmed()
+        );
     }
 
     match crate::agent::hook::install_engine(context) {
@@ -738,8 +738,6 @@ fn write_grove_config(
     let scraped = crate::devcontainer::ci_scrape::scrape(ctx);
     let layout = worktree_manager::layout(ctx);
     let mut config = build_grove_config(project, scraped, layout);
-    config.devcontainer.enabled = true;
-    config.devcontainer.auto_up = true;
     // Capture workspaceFolder + remoteUser from devcontainer.json if present so
     // src/session/container.rs::ensure_up has the host→container path map
     // without re-parsing JSON each call. Falls back to /workspaces/<repo> +
@@ -989,6 +987,64 @@ fn patch_dockerignore(project_root: &Path) -> Result<(), String> {
         }
     }
     fs::write(&path, out).map_err(|e| format!("write .dockerignore: {}", e))?;
+    Ok(())
+}
+
+/// Phase-1 baseline: mount `~/.claude/{settings.json, .credentials.json,
+/// plugins}` RO into the container. These are load-bearing for grove's
+/// agentic workflow:
+///   - `.credentials.json` → in-container claude can authenticate
+///   - `settings.json`     → Stop hook + enabledPlugins flow into the container
+///   - `plugins/`          → claude plugins (skills, hooks) available
+///
+/// The mounts use `${localEnv:HOME}` so they resolve to the host user's home
+/// at devcontainer-up time. The Phase 2 wizard's `prompt_claude_scope` can
+/// later REMOVE these mounts and replace them with the "full" or "none"
+/// alternative if the user wants different isolation.
+fn apply_baseline_claude_mounts(project_root: &Path) -> Result<(), String> {
+    let dev_path = project_root.join(".devcontainer").join("devcontainer.json");
+    if !dev_path.exists() {
+        return Ok(());
+    }
+    let raw =
+        fs::read_to_string(&dev_path).map_err(|e| format!("read {}: {}", dev_path.display(), e))?;
+    let mut value: serde_json::Value =
+        serde_json::from_str(&raw).map_err(|e| format!("parse {}: {}", dev_path.display(), e))?;
+    let obj = value
+        .as_object_mut()
+        .ok_or_else(|| "devcontainer.json top-level is not a JSON object".to_string())?;
+    let mounts = obj
+        .entry("mounts")
+        .or_insert_with(|| serde_json::json!([]))
+        .as_array_mut()
+        .ok_or_else(|| "devcontainer.json `mounts` is not an array".to_string())?;
+
+    let baseline = [
+        (
+            "${localEnv:HOME}/.claude/plugins",
+            "/home/vscode/.claude/plugins",
+        ),
+        (
+            "${localEnv:HOME}/.claude/.credentials.json",
+            "/home/vscode/.claude/.credentials.json",
+        ),
+        (
+            "${localEnv:HOME}/.claude/settings.json",
+            "/home/vscode/.claude/settings.json",
+        ),
+    ];
+    for (source, target) in baseline {
+        let entry = format!("source={},target={},type=bind,readonly", source, target);
+        if !mounts
+            .iter()
+            .any(|v| v == &serde_json::Value::String(entry.clone()))
+        {
+            mounts.push(serde_json::Value::String(entry));
+        }
+    }
+    let body = serde_json::to_string_pretty(&value)
+        .map_err(|e| format!("serialize {}: {}", dev_path.display(), e))?;
+    fs::write(&dev_path, body).map_err(|e| format!("write {}: {}", dev_path.display(), e))?;
     Ok(())
 }
 

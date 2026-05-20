@@ -345,10 +345,6 @@ fn default_session_backend() -> String {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DevcontainerSection {
-    #[serde(default = "default_true")]
-    pub enabled: bool,
-    #[serde(default = "default_true")]
-    pub auto_up: bool,
     /// Container-side path that the host project root is mounted at.
     /// Detected from devcontainer.json's `workspaceFolder` field; defaults to
     /// `/workspaces/<repo>` when scaffolded.
@@ -363,8 +359,6 @@ pub struct DevcontainerSection {
 impl Default for DevcontainerSection {
     fn default() -> Self {
         Self {
-            enabled: true,
-            auto_up: true,
             workspace_target: None,
             remote_user: default_remote_user(),
         }

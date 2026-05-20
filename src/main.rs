@@ -104,15 +104,16 @@ enum Commands {
     },
     /// Initialize a new worktree setup. Pass a git URL to clone fresh, or pass a path
     /// (default ".") to adopt an existing checkout in-place.
+    ///
+    /// grove is built for agentic workflows; the devcontainer is always scaffolded.
     Init {
         /// Git URL to clone, OR path to an existing git checkout (default ".")
         target: Option<String>,
-        /// Skip the Phase 2 setup wizard (no Claude Code invocation)
+        /// Skip the Phase 2 setup wizard (Phase 1 alone produces a working agentic setup —
+        /// container with grove prereqs + .claude/* mounts; wizard only refines secrets,
+        /// extra mounts, and VS Code extensions).
         #[arg(long = "no-agent")]
         no_agent: bool,
-        /// Skip devcontainer scaffolding entirely
-        #[arg(long = "no-devcontainer")]
-        no_devcontainer: bool,
         /// Re-run the Phase 2 wizard against an already-initialized project (no clone)
         #[arg(long = "reconfigure", conflicts_with = "target")]
         reconfigure: bool,
@@ -287,6 +288,13 @@ enum AgentsCommand {
         /// Agent name
         name: String,
     },
+    /// Fully delete an agent's state (loop.md, STATE.md, agent.toml). Worktree
+    /// is NOT removed (use `grove remove <name>`). Refuses if the agent is
+    /// still running.
+    Purge {
+        /// Agent name
+        name: String,
+    },
 }
 
 fn main() {
@@ -322,17 +330,10 @@ fn main() {
         Some(Commands::Init {
             target,
             no_agent,
-            no_devcontainer,
             reconfigure,
             assume_yes,
         }) => {
-            commands::init::run(
-                target.as_deref(),
-                no_agent,
-                no_devcontainer,
-                reconfigure,
-                assume_yes,
-            );
+            commands::init::run(target.as_deref(), no_agent, reconfigure, assume_yes);
         }
         Some(Commands::List {
             details,
@@ -384,6 +385,7 @@ fn main() {
             AgentsCommand::List => commands::agents::list(),
             AgentsCommand::Status { name } => commands::agents::status(&name),
             AgentsCommand::Kill { name } => commands::agents::kill(&name),
+            AgentsCommand::Purge { name } => commands::agents::purge(&name),
         },
         Some(Commands::Loop { agent, watch }) => {
             commands::loop_::run(agent.as_deref(), watch);

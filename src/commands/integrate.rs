@@ -460,19 +460,16 @@ verification. Conflicted files:\n{}",
     Ok(())
 }
 
-/// Resolve a ContainerInfo if the project's devcontainer is enabled AND
-/// currently up. Does NOT bring the container up — integrate expects the
-/// operator to have spawned at least one agent already.
+/// Resolve a ContainerInfo if the project's devcontainer is currently up.
+/// Does NOT bring the container up — integrate expects the operator to have
+/// spawned at least one agent already, so the container should be running.
 fn resolve_container_for_integrate(project_root: &Path) -> Option<ContainerInfo> {
-    let cfg_path = project_root.join(".grove").join("config.toml");
-    let raw = std::fs::read_to_string(&cfg_path).ok()?;
-    let cfg: GroveConfig = toml::from_str(&raw).ok()?;
-    if !cfg.devcontainer.enabled {
-        return None;
-    }
     if !container::is_up(project_root) {
         return None;
     }
+    let cfg_path = project_root.join(".grove").join("config.toml");
+    let raw = std::fs::read_to_string(&cfg_path).ok()?;
+    let cfg: GroveConfig = toml::from_str(&raw).ok()?;
     let workspace_target = cfg.devcontainer.workspace_target.unwrap_or_else(|| {
         format!(
             "/workspaces/{}",

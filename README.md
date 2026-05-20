@@ -83,6 +83,14 @@ The supplied directory must already be a git checkout. Worktrees go under
 `<root>/worktrees/<name>/`. Use `--yes` to skip the merge/overwrite prompt
 on existing `.devcontainer/` or `.grove/` files (defaults to overwrite).
 
+**grove is agentic by design — devcontainer is required.** Phase 1 always
+scaffolds a devcontainer with grove's runtime prereqs (tmux, jq, perl,
+Claude Code CLI) auto-installed via `postCreateCommand`, plus three RO
+mounts of `~/.claude/{plugins, .credentials.json, settings.json}` so the
+in-container claude can authenticate and the Stop hook engages. `grove
+spawn` hard-fails if it can't bring up a devcontainer; if your project
+doesn't need agentic spawning, you don't need grove.
+
 In both modes:
 
 1. **Phase 1 (deterministic)**: detect stack (Python/Rust/Node/Go/.NET), scaffold
@@ -207,10 +215,22 @@ grove loop --agent feat-auth
 #### Manage running agents
 
 ```bash
-grove agents list           # one line per agent
+grove agents list                # one line per agent
 grove agents status feat-auth
-grove agents kill feat-auth
+grove agents kill feat-auth      # stop the tmux session; loop.md flipped active:false
+grove agents purge feat-auth     # delete .grove/agents/<name>/ entirely (so next spawn starts FRESH instead of resuming). Worktree NOT removed — use `grove remove`.
 ```
+
+#### Resume semantics
+
+`grove spawn <name>` with an existing agent state RESUMES:
+- Refuses if the tmux session is already alive (run `grove agents kill <name>` first).
+- Re-creates the worktree if it was removed via `grove remove`.
+- Re-creates the `.grove` symlink if missing.
+- Clears any stale `session_id` in `loop.md` so the new claude session is accepted by the Stop hook.
+- Preserves PROMPT.md, STATE.md, agent.toml, and the loop's `active` / `iteration` state.
+
+`--task`, `--promise`, `--max-iter`, `--branch` are ignored on resume; edit the files directly or `grove agents purge <name>` and respawn to change them.
 
 #### Inter-agent messaging
 

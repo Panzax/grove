@@ -14,7 +14,6 @@ use crate::session::tmux;
 
 pub fn up() {
     let (_ctx, root) = discover_or_exit();
-    require_enabled(&root);
     match container::ensure_up(&root) {
         Ok(info) => {
             println!(
@@ -33,7 +32,6 @@ pub fn up() {
 
 pub fn down() {
     let (_ctx, root) = discover_or_exit();
-    require_enabled(&root);
     match container::down(&root) {
         Ok(()) => println!("{} container stopped", "✓".green()),
         Err(e) => {
@@ -46,13 +44,6 @@ pub fn down() {
 pub fn status() {
     let (_ctx, root) = discover_or_exit();
     let cfg = read_config(&root);
-    if !cfg.devcontainer.enabled {
-        println!(
-            "{} devcontainer is disabled in .grove/config.toml [devcontainer] enabled = false",
-            "Note:".yellow()
-        );
-        return;
-    }
     let is_up = container::is_up(&root);
     if !is_up {
         println!(
@@ -97,7 +88,6 @@ pub fn status() {
 
 pub fn exec(argv: &[String]) {
     let (_ctx, root) = discover_or_exit();
-    require_enabled(&root);
     if argv.is_empty() {
         eprintln!(
             "{} grove devcontainer exec needs a command (e.g. `grove devcontainer exec bash`)",
@@ -128,7 +118,6 @@ pub fn exec(argv: &[String]) {
 
 pub fn rebuild() {
     let (_ctx, root) = discover_or_exit();
-    require_enabled(&root);
     // The devcontainer CLI has `--remove-existing-container` for `up` to
     // force a rebuild. Wrap that.
     let output = Command::new("devcontainer")
@@ -163,14 +152,7 @@ pub fn rebuild() {
 /// before spawning a swarm of agents.
 pub fn doctor() {
     let (_ctx, root) = discover_or_exit();
-    let cfg = read_config(&root);
-    if !cfg.devcontainer.enabled {
-        eprintln!(
-            "{} [devcontainer] enabled = false; nothing to check.",
-            "Note:".yellow()
-        );
-        return;
-    }
+    let _cfg = read_config(&root);
     let info = match container::ensure_up(&root) {
         Ok(i) => i,
         Err(e) => {
@@ -219,9 +201,7 @@ pub fn doctor() {
         "Fix: ensure your `.devcontainer/devcontainer.json` postCreateCommand installs these,"
     );
     eprintln!("then run `grove devcontainer rebuild` to re-apply.");
-    eprintln!(
-        "grove's default scaffold installs them via apt-get + npm; if you edited the file,"
-    );
+    eprintln!("grove's default scaffold installs them via apt-get + npm; if you edited the file,");
     eprintln!("compare against the prereqs line in `src/devcontainer/mod.rs::grove_container_prereqs_command`.");
     std::process::exit(1);
 }
@@ -237,7 +217,6 @@ fn is_tool_in_container(info: &ContainerInfo, tool: &str) -> bool {
 
 pub fn logs() {
     let (_ctx, root) = discover_or_exit();
-    require_enabled(&root);
     let status = Command::new("devcontainer")
         .arg("logs")
         .arg("--workspace-folder")
@@ -267,17 +246,6 @@ fn discover_or_exit() -> (crate::git::worktree_manager::RepoContext, PathBuf) {
             eprintln!("{} {}", "Error:".red(), e);
             std::process::exit(1);
         }
-    }
-}
-
-fn require_enabled(project_root: &std::path::Path) {
-    let cfg = read_config(project_root);
-    if !cfg.devcontainer.enabled {
-        eprintln!(
-            "{} [devcontainer] enabled = false in .grove/config.toml. Edit the file or re-run `grove init --reconfigure` to enable.",
-            "Error:".red()
-        );
-        std::process::exit(1);
     }
 }
 

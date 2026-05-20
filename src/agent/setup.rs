@@ -159,17 +159,34 @@ fn prompt_secrets_mount(
     Ok(())
 }
 
+/// Phase-2 refinement of the `.claude/*` mounts.
+///
+/// Phase 1 already added the three `scoped` mounts as baseline:
+///   ~/.claude/plugins              (RO)
+///   ~/.claude/.credentials.json    (RO)
+///   ~/.claude/settings.json        (RO)
+///
+/// This prompt offers three choices:
+///   - **Scoped (default)** — keep the baseline as-is.
+///   - **Full (override)**  — REMOVE the three RO mounts, add `~/.claude` RW.
+///                            Exposes more (session history, write access);
+///                            recommended only for advanced users.
+///   - **None (remove)**    — REMOVE the three RO mounts entirely. User
+///                            authenticates inside the container per rebuild
+///                            (interactive `claude login` won't work in a
+///                            detached tmux; mostly useful for custom
+///                            container images that bake in auth + hooks).
 fn prompt_claude_scope(config: &mut GroveConfig, devcontainer: &mut Value) -> Result<(), String> {
     let theme = ColorfulTheme::default();
     println!();
     println!(
         "{}",
-        "Spawned agents need access to your Claude Code plugins/skills AND the Stop hook (registered in settings.json). Choose how:".dimmed()
+        "grove init already added the recommended `scoped` mounts (~/.claude/{plugins, .credentials.json, settings.json} RO). Adjust if needed:".dimmed()
     );
     let options = vec![
-        "Scoped: mount ~/.claude/{plugins, .credentials.json, settings.json} all RO — recommended",
-        "Full:   mount ~/.claude (RW) — exposes session history + lets the container write user settings; NOT recommended",
-        "None:   no Claude inheritance (you'll authenticate + register the Stop hook inside the container per rebuild)",
+        "Keep scoped (recommended) — the three RO mounts grove init added",
+        "Switch to full (RW)       — exposes session history + container can write settings; advanced only",
+        "Remove all .claude mounts — bring your own auth + hooks inside the container",
     ];
     let default_idx = match config.mounts.claude_inherit.as_deref() {
         Some("full") => 1,
@@ -189,51 +206,57 @@ fn prompt_claude_scope(config: &mut GroveConfig, devcontainer: &mut Value) -> Re
     };
     config.mounts.claude_inherit = Some(key.to_string());
 
-    // Trade-off note for the scoped path: mounting settings.json RO is what
-    // gets the Stop hook (and your plugin enables) visible inside the
-    // container. Side effect: any prefs in settings.json — theme, MCP server
-    // URLs / configs, plugin-specific data — become readable from inside.
-    // Acceptable for most users; the "Full" option's RW exposure is worse.
     match key {
         "scoped" => {
-            add_mount(
-                devcontainer,
-                "${localEnv:HOME}/.claude/plugins",
-                "/home/vscode/.claude/plugins",
-                "ro",
-            );
-            add_mount(
-                devcontainer,
-                "${localEnv:HOME}/.claude/.credentials.json",
-                "/home/vscode/.claude/.credentials.json",
-                "ro",
-            );
-            // settings.json (RO) brings the Stop hook + enabledPlugins into
-            // the container. Without it, the Stop hook never fires for
-            // claude sessions inside the container, so the Ralph loop
-            // doesn't engage.
-            add_mount(
-                devcontainer,
-                "${localEnv:HOME}/.claude/settings.json",
-                "/home/vscode/.claude/settings.json",
-                "ro",
-            );
+            // Baseline mounts are already in place from Phase 1. No-op.
             println!(
-                "  {} settings.json mounted RO so the Stop hook reaches the in-container claude. Your prefs (theme, MCP configs, plugin enables) become readable from inside the container.",
-                "Note:".cyan()
+                "  {} keeping Phase 1 baseline mounts (scoped).",
+                "·".dimmed()
             );
         }
         "full" => {
+            // Remove the three RO mounts, add one RW. Adjusts Phase 1's choice.
+            remove_claude_mounts(devcontainer);
             add_mount(
                 devcontainer,
                 "${localEnv:HOME}/.claude",
                 "/home/vscode/.claude",
                 "rw",
             );
+            println!(
+                "  {} swapped baseline → full ~/.claude RW. WARNING: session history readable + container writes propagate to host.",
+                "Note:".cyan()
+            );
+        }
+        "none" => {
+            remove_claude_mounts(devcontainer);
+            println!(
+                "  {} removed all .claude mounts. You'll need to provision claude + Stop hook inside the container (custom image or postCreateCommand).",
+                "Note:".cyan()
+            );
         }
         _ => {}
     }
     Ok(())
+}
+
+/// Strip every `source=...claude...,target=...claude...` mount entry from
+/// `devcontainer.json mounts`. Used when switching from scoped → full / none.
+fn remove_claude_mounts(devcontainer: &mut Value) {
+    let Some(mounts) = devcontainer
+        .as_object_mut()
+        .and_then(|o| o.get_mut("mounts"))
+        .and_then(|m| m.as_array_mut())
+    else {
+        return;
+    };
+    mounts.retain(|v| {
+        let s = match v.as_str() {
+            Some(s) => s,
+            None => return true,
+        };
+        !(s.contains(".claude"))
+    });
 }
 
 fn prompt_github_auth(config: &mut GroveConfig, devcontainer: &mut Value) -> Result<(), String> {

@@ -3,16 +3,15 @@
 
 # Grove devcontainer integration tests.
 #
-# These tests verify the container-routing wiring in isolation — they do NOT
-# spin up a real devcontainer (CI runners can't reliably provide one). The
-# real devcontainer CLI is substituted via GROVE_DEVCONTAINER_COMMAND with an
-# echo-like shim where helpful, OR the test ensures grove falls back to host
-# behavior when devcontainer is unavailable.
+# These tests verify the container-routing wiring without spinning up a real
+# devcontainer (CI runners can't reliably provide one). The real devcontainer
+# CLI is substituted via GROVE_DEVCONTAINER_COMMAND.
 #
-# Cross-cutting: every test that needs an initialized grove project uses a
-# disposable repo under /tmp.
+# grove is agent-only; there is no `--no-devcontainer` flag and no
+# `[devcontainer] enabled = false` escape hatch. spawn HARD-FAILS when the
+# container can't come up; these tests verify the error paths are clear.
 
-TEST "grove devcontainer --help surfaces the new subcommands"
+TEST "grove devcontainer --help surfaces all subcommands"
 
 RUN grove devcontainer --help
 ASSERT exit_code == 0
@@ -24,19 +23,31 @@ ASSERT stdout contains "rebuild"
 ASSERT stdout contains "logs"
 ASSERT stdout contains "doctor"
 
-TEST "grove init writes grove-prereqs into postCreateCommand"
+TEST "grove init writes grove prereqs into postCreateCommand"
 
 ENV TEST_DIR=/tmp/grove-init-postcreate-prereqs
 RUN setup: rm -rf $TEST_DIR && mkdir -p $TEST_DIR && cd $TEST_DIR && git init -q && git -c user.email=t@t -c user.name=t commit --allow-empty -q -m init
 RUN init: cd $TEST_DIR && grove init --no-agent
 ASSERT init.exit_code == 0
 RUN read-config: cat $TEST_DIR/.devcontainer/devcontainer.json
-# Each grove prereq is in the postCreateCommand line.
 ASSERT read-config.stdout contains "command -v tmux"
 ASSERT read-config.stdout contains "command -v jq"
 ASSERT read-config.stdout contains "command -v perl"
 ASSERT read-config.stdout contains "command -v claude"
 ASSERT read-config.stdout contains "@anthropic-ai/claude-code"
+RUN cleanup: rm -rf $TEST_DIR
+
+TEST "grove init adds baseline claude mounts"
+
+ENV TEST_DIR=/tmp/grove-init-claude-baseline
+RUN setup: rm -rf $TEST_DIR && mkdir -p $TEST_DIR && cd $TEST_DIR && git init -q && git -c user.email=t@t -c user.name=t commit --allow-empty -q -m init
+RUN init: cd $TEST_DIR && grove init --no-agent
+ASSERT init.exit_code == 0
+RUN read-mounts: cat $TEST_DIR/.devcontainer/devcontainer.json
+ASSERT read-mounts.stdout contains "/.claude/plugins"
+ASSERT read-mounts.stdout contains "/.claude/.credentials.json"
+ASSERT read-mounts.stdout contains "/.claude/settings.json"
+ASSERT read-mounts.stdout contains "readonly"
 RUN cleanup: rm -rf $TEST_DIR
 
 TEST "grove devcontainer doctor outside a grove repo errors cleanly"
@@ -57,18 +68,17 @@ ASSERT no-repo.exit_code != 0
 ASSERT no-repo.stderr contains "Not in a grove repository"
 RUN cleanup: rm -rf $TEST_DIR
 
-TEST "grove devcontainer status reports DOWN when not initialized"
+TEST "grove devcontainer status reports DOWN when CLI stub fails"
 
 ENV TEST_DIR=/tmp/grove-devcontainer-status-init
 RUN setup: rm -rf $TEST_DIR && mkdir -p $TEST_DIR && cd $TEST_DIR && git init -q && git -c user.email=t@t -c user.name=t commit --allow-empty -q -m init && grove init --no-agent
-# Use the stub override so we don't try to talk to a real devcontainer.
 ENV GROVE_DEVCONTAINER_COMMAND=/usr/bin/false
 RUN st: cd $TEST_DIR && grove devcontainer status
 ASSERT st.exit_code == 0
 ASSERT st.stdout contains "DOWN"
 RUN cleanup: rm -rf $TEST_DIR
 
-TEST "grove devcontainer up reports the stub failure cleanly"
+TEST "grove devcontainer up reports stub failure cleanly"
 
 ENV TEST_DIR=/tmp/grove-devcontainer-up-fail
 RUN setup: rm -rf $TEST_DIR && mkdir -p $TEST_DIR && cd $TEST_DIR && git init -q && git -c user.email=t@t -c user.name=t commit --allow-empty -q -m init && grove init --no-agent
@@ -78,36 +88,42 @@ ASSERT up-fail.exit_code != 0
 ASSERT up-fail.stderr contains "devcontainer up failed"
 RUN cleanup: rm -rf $TEST_DIR
 
-TEST "grove spawn falls back to host tmux when devcontainer is disabled"
-
-ENV TEST_DIR=/tmp/grove-spawn-no-container
-RUN setup: rm -rf $TEST_DIR && mkdir -p $TEST_DIR && cd $TEST_DIR && git init -q && git -c user.email=t@t -c user.name=t commit --allow-empty -q -m init && grove init --no-agent
-# Flip [devcontainer] enabled = false in the config.
-RUN disable: cd $TEST_DIR && sed -i 's/^enabled = true$/enabled = false/' .grove/config.toml
-# Use a stub command so we don't actually try to run claude.
-ENV GROVE_AGENT_COMMAND=sleep 1
-RUN spawn-host: cd $TEST_DIR && grove spawn smoke-host
-ASSERT spawn-host.exit_code == 0
-ASSERT spawn-host.stdout contains "[host]"
-ASSERT spawn-host.stdout contains "tmux attach -t grove-smoke-host"
-# Clean up the tmux session if it actually launched.
-RUN tmux-cleanup: tmux kill-session -t grove-smoke-host 2>/dev/null || true
-RUN cleanup: rm -rf $TEST_DIR
-
-TEST "grove spawn warns + falls back when devcontainer CLI is missing"
+TEST "grove spawn hard-fails when devcontainer CLI is missing"
 
 ENV TEST_DIR=/tmp/grove-spawn-missing-cli
 RUN setup: rm -rf $TEST_DIR && mkdir -p $TEST_DIR && cd $TEST_DIR && git init -q && git -c user.email=t@t -c user.name=t commit --allow-empty -q -m init && grove init --no-agent
-# Point GROVE_DEVCONTAINER_COMMAND at a binary that doesn't exist — emulates
-# "devcontainer CLI not installed".
 ENV GROVE_DEVCONTAINER_COMMAND=/nonexistent/devcontainer-binary
 ENV GROVE_AGENT_COMMAND=sleep 1
 RUN spawn-missing: cd $TEST_DIR && grove spawn smoke-missing
-ASSERT spawn-missing.exit_code == 0
-# Stderr quotes the command in backticks: "Warning: `devcontainer up` failed: …"
+ASSERT spawn-missing.exit_code != 0
 ASSERT spawn-missing.stderr contains "devcontainer up"
-ASSERT spawn-missing.stderr contains "falling back to host tmux"
-ASSERT spawn-missing.stdout contains "[host]"
-# Clean up.
-RUN tmux-cleanup: tmux kill-session -t grove-smoke-missing 2>/dev/null || true
+ASSERT spawn-missing.stderr contains "grove requires a working devcontainer"
 RUN cleanup: rm -rf $TEST_DIR
+
+TEST "grove agents purge outside a grove repo errors cleanly"
+
+ENV TEST_DIR=/tmp/grove-agents-purge-no-repo
+RUN setup: rm -rf $TEST_DIR && mkdir -p $TEST_DIR
+RUN purge: cd $TEST_DIR && grove agents purge feat-a
+ASSERT purge.exit_code != 0
+ASSERT purge.stderr contains "Not in a grove repository"
+RUN cleanup: rm -rf $TEST_DIR
+
+TEST "grove agents purge with no agent state succeeds (no-op)"
+
+ENV TEST_DIR=/tmp/grove-agents-purge-empty
+RUN setup: rm -rf $TEST_DIR && mkdir -p $TEST_DIR && cd $TEST_DIR && git init -q && git -c user.email=t@t -c user.name=t commit --allow-empty -q -m init && grove init --no-agent
+ENV GROVE_DEVCONTAINER_COMMAND=/usr/bin/false
+RUN purge: cd $TEST_DIR && grove agents purge feat-a
+ASSERT purge.exit_code == 0
+ASSERT purge.stdout contains "nothing to purge"
+RUN cleanup: rm -rf $TEST_DIR
+
+TEST "grove agents --help shows the new purge subcommand"
+
+RUN grove agents --help
+ASSERT exit_code == 0
+ASSERT stdout contains "list"
+ASSERT stdout contains "status"
+ASSERT stdout contains "kill"
+ASSERT stdout contains "purge"

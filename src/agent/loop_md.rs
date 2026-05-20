@@ -37,6 +37,26 @@ pub fn write_loop_md(path: &Path, state: &LoopState) -> Result<(), String> {
     Ok(())
 }
 
+/// Clear the `session_id` field in a loop.md frontmatter. Called by
+/// `grove spawn` on the RESUME path: the previous claude session crashed
+/// or was killed, so its session_id in loop.md is stale. The Stop hook's
+/// session-isolation guard would silently block the new session from
+/// driving the loop if we left the stale value in place.
+///
+/// Idempotent: if the field is already empty (or loop.md is missing /
+/// malformed), no-op.
+pub fn clear_session_id(loop_path: &Path) -> Result<(), String> {
+    if !loop_path.exists() {
+        return Ok(());
+    }
+    let mut state = read_loop_md(loop_path)?;
+    if state.session_id.is_empty() {
+        return Ok(());
+    }
+    state.session_id.clear();
+    write_loop_md(loop_path, &state)
+}
+
 pub fn parse(raw: &str) -> Result<LoopState, String> {
     let mut state = LoopState {
         active: false,
@@ -184,6 +204,58 @@ mod tests {
         assert_eq!(state.completion_promise, "DONE");
         assert!(state.body.contains("body one"));
         assert!(state.body.contains("body two"));
+    }
+
+    #[test]
+    fn clear_session_id_clears_non_empty_value() {
+        let tmpdir = std::env::temp_dir().join(format!(
+            "grove-clear-session-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&tmpdir).unwrap();
+        let path = tmpdir.join("loop.md");
+        std::fs::write(
+            &path,
+            "---\nactive: true\niteration: 4\nmax_iterations: 30\ncompletion_promise: \"DONE\"\nsession_id: \"stale-abc-123\"\n---\nbody\n",
+        )
+        .unwrap();
+        clear_session_id(&path).unwrap();
+        let after = read_loop_md(&path).unwrap();
+        assert_eq!(after.session_id, "");
+        // Other fields preserved.
+        assert!(after.active);
+        assert_eq!(after.iteration, 4);
+        assert_eq!(after.completion_promise, "DONE");
+        let _ = std::fs::remove_dir_all(&tmpdir);
+    }
+
+    #[test]
+    fn clear_session_id_noop_if_already_empty() {
+        let tmpdir = std::env::temp_dir().join(format!(
+            "grove-clear-session-noop-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&tmpdir).unwrap();
+        let path = tmpdir.join("loop.md");
+        std::fs::write(
+            &path,
+            "---\nactive: false\niteration: 0\nmax_iterations: 30\ncompletion_promise: \"\"\nsession_id: \"\"\n---\n",
+        )
+        .unwrap();
+        let before = std::fs::read_to_string(&path).unwrap();
+        clear_session_id(&path).unwrap();
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(before, after);
+        let _ = std::fs::remove_dir_all(&tmpdir);
+    }
+
+    #[test]
+    fn clear_session_id_missing_file_is_ok() {
+        let nonexistent = std::env::temp_dir().join(format!(
+            "grove-no-such-loop-{}.md",
+            uuid::Uuid::new_v4().simple()
+        ));
+        assert!(clear_session_id(&nonexistent).is_ok());
     }
 
     #[test]

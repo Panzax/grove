@@ -29,7 +29,6 @@ TEST "grove init --help advertises --no-agent and --reconfigure"
 RUN grove init --help
 ASSERT exit_code == 0
 ASSERT stdout contains "no-agent"
-ASSERT stdout contains "no-devcontainer"
 ASSERT stdout contains "reconfigure"
 
 TEST "grove agents list outside a grove repo errors cleanly"

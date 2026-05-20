@@ -184,6 +184,56 @@ pub fn kill(name: &str) {
     }
 }
 
+/// `grove agents purge <name>` — fully delete an agent's state.
+///
+/// `grove remove <name>` removes the worktree but keeps `.grove/agents/<n>/`
+/// (intentional — survives crashes so resume works). `purge` deletes the
+/// agent dir + agent.toml so a subsequent `grove spawn <n>` starts FRESH
+/// instead of resuming. Refuses if the tmux session is still alive.
+pub fn purge(name: &str) {
+    let ctx = match discover_repo() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("{} {}", "Error:".red(), e);
+            std::process::exit(1);
+        }
+    };
+    let project_root_path = project_root(&ctx).to_path_buf();
+    let session_name = tmux::session_name(name);
+    let container = resolve_container_for_query(&project_root_path);
+    if tmux::has_session(&session_name, container.as_ref()).unwrap_or(false) {
+        eprintln!(
+            "{} agent '{}' is still running (tmux session {}). Run `grove agents kill {}` first.",
+            "Error:".red(),
+            name,
+            session_name,
+            name
+        );
+        std::process::exit(1);
+    }
+    let agent_dir = project_root_path.join(".grove").join("agents").join(name);
+    if !agent_dir.exists() {
+        println!(
+            "{} no agent state at {} — nothing to purge.",
+            "Note:".yellow(),
+            agent_dir.display()
+        );
+        return;
+    }
+    match fs::remove_dir_all(&agent_dir) {
+        Ok(()) => println!(
+            "{} purged {} (worktree, if any, was NOT removed — use `grove remove {}`)",
+            "✓".green(),
+            agent_dir.display(),
+            name
+        ),
+        Err(e) => {
+            eprintln!("{} remove {}: {}", "Error:".red(), agent_dir.display(), e);
+            std::process::exit(1);
+        }
+    }
+}
+
 struct AgentRow {
     metadata: AgentMetadata,
     iteration: u32,
@@ -262,24 +312,17 @@ fn load_agent(agent_dir: &Path) -> Result<AgentRow, String> {
     })
 }
 
-/// Resolve a ContainerInfo for queries (list/status/kill) WITHOUT bringing
-/// the container up. If `[devcontainer] enabled` and the container is
-/// already running, return Some; otherwise None (we'll query host tmux).
-///
-/// `grove spawn` is the one place that auto-starts the container — read
-/// operations should never trigger a 30-60s container boot.
+/// Resolve a ContainerInfo for read queries (list/status/kill) WITHOUT
+/// bringing the container up. If the container is already running, return
+/// Some; otherwise None (read commands report "not running" rather than
+/// triggering a 30-60s container boot).
 fn resolve_container_for_query(project_root: &Path) -> Option<ContainerInfo> {
-    let cfg_path = project_root.join(".grove").join("config.toml");
-    let raw = std::fs::read_to_string(&cfg_path).ok()?;
-    let cfg: GroveConfig = toml::from_str(&raw).ok()?;
-    if !cfg.devcontainer.enabled {
-        return None;
-    }
     if !container::is_up(project_root) {
         return None;
     }
-    // Container is running — build a ContainerInfo from config. This avoids
-    // re-shelling out for metadata we already wrote at init time.
+    let cfg_path = project_root.join(".grove").join("config.toml");
+    let raw = std::fs::read_to_string(&cfg_path).ok()?;
+    let cfg: GroveConfig = toml::from_str(&raw).ok()?;
     let workspace_target = cfg
         .devcontainer
         .workspace_target
