@@ -72,14 +72,21 @@ enum Target {
 
 /// Disambiguate the positional argument:
 /// - None              → in-place at cwd
-/// - Looks like a URL  → either Clone (if valid) or InvalidUrl (matches upstream
-///                       behavior of exiting 2 with "Invalid git URL format")
 /// - Existing dir      → in-place at that path
-/// - Otherwise         → ambiguous error
+/// - Looks like a URL  → Clone (if valid) or InvalidUrl
+/// - Looks like a path → AmbiguousNonExistent (path that doesn't exist or isn't a dir)
+/// - Anything else     → InvalidUrl (preserves upstream behavior: bare strings
+///                       that aren't URL-shaped AND aren't path-shaped get the
+///                       upstream "Invalid git URL format" error with exit 2)
 fn resolve_target(target: Option<&str>) -> Target {
     let Some(value) = target else {
         return Target::InPlace(PathBuf::from("."));
     };
+    // Existing dir wins regardless of shape — `grove init my-existing-repo`.
+    let path = PathBuf::from(value);
+    if path.is_dir() {
+        return Target::InPlace(path);
+    }
     if looks_like_git_url(value) {
         return if is_valid_git_url(value) {
             Target::Clone(value.to_string())
@@ -87,21 +94,28 @@ fn resolve_target(target: Option<&str>) -> Target {
             Target::InvalidUrl(value.to_string())
         };
     }
-    let path = PathBuf::from(value);
-    // Must be an existing *directory* to qualify as in-place. A file or missing
-    // path is treated as ambiguous so we don't silently misinterpret e.g.
-    // `grove init Cargo.toml`.
-    if path.is_dir() {
-        return Target::InPlace(path);
+    if looks_like_path(value) {
+        return Target::AmbiguousNonExistent(value.to_string());
     }
-    Target::AmbiguousNonExistent(value.to_string())
+    // Not URL-shaped, not path-shaped, doesn't exist — most likely a typo'd URL
+    // (e.g. `not-a-valid-url`). Upstream's clap validator rejected these with
+    // exit 2; we preserve that here.
+    Target::InvalidUrl(value.to_string())
 }
 
 /// Heuristic: would a reasonable user type this as a git URL? URLs always
-/// contain `://` or follow the `git@host:path` shape. Anything else is treated
-/// as a candidate path.
+/// contain `://` or follow the `git@host:path` shape.
 fn looks_like_git_url(value: &str) -> bool {
     value.contains("://") || value.starts_with("git@")
+}
+
+/// Heuristic: looks like a filesystem path? Either contains a path separator
+/// or starts with a directory-prefix marker.
+fn looks_like_path(value: &str) -> bool {
+    value.contains('/')
+        || value.contains('\\')
+        || value.starts_with('.')
+        || value.starts_with('~')
 }
 
 // =============================================================================
@@ -1042,8 +1056,18 @@ mod tests {
     }
 
     #[test]
-    fn resolve_target_unknown_string_is_ambiguous() {
+    fn resolve_target_bare_string_is_invalid_url() {
+        // not-a-url-not-a-path: not a URL, no path separators → treated as a
+        // typo'd URL (matches upstream grove.hone:41).
         let t = resolve_target(Some("not-a-url-not-a-path-xyz123"));
+        assert!(matches!(t, Target::InvalidUrl(_)));
+    }
+
+    #[test]
+    fn resolve_target_path_shaped_non_existent_is_ambiguous() {
+        let t = resolve_target(Some("./does-not-exist-zzz"));
+        assert!(matches!(t, Target::AmbiguousNonExistent(_)));
+        let t = resolve_target(Some("/tmp/grove-resolve-nonexistent-zzz"));
         assert!(matches!(t, Target::AmbiguousNonExistent(_)));
     }
 
@@ -1061,6 +1085,16 @@ mod tests {
         assert!(!looks_like_git_url("./relative"));
         assert!(!looks_like_git_url("Cargo.toml"));
         assert!(!looks_like_git_url("not-a-url-not-a-path-xyz123"));
+    }
+
+    #[test]
+    fn looks_like_path_detects_separators() {
+        assert!(looks_like_path("./relative"));
+        assert!(looks_like_path("/abs/path"));
+        assert!(looks_like_path("~/home/path"));
+        assert!(looks_like_path("nested/dir"));
+        assert!(!looks_like_path("bare-string"));
+        assert!(!looks_like_path("not-a-url-not-a-path-xyz123"));
     }
 
     #[test]
