@@ -2,10 +2,12 @@ use colored::Colorize;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
+use crate::git::worktree_manager::layout;
 use crate::git::{
     add_worktree, branch_exists, discover_repo, normalize_tracking_reference_input, project_root,
     tracked_branch_name, RepoContext,
 };
+use crate::models::ProjectLayout;
 use crate::utils::{
     default_worktree_name_seed, generate_default_worktree_name, read_repo_config,
     sanitize_branch_prefix, BootstrapCommand, RepoConfig, DEFAULT_WORKTREE_NAME_ATTEMPTS,
@@ -48,7 +50,21 @@ pub fn run(name: Option<&str>, track: Option<&str>) {
             std::process::exit(1);
         }
     };
-    let worktree_path = match get_worktree_path(&worktree.directory_name, project_root) {
+    // Bare layout: worktrees sit as siblings to the bare clone (upstream behavior).
+    // In-place layout: nest worktrees under <root>/worktrees/ so they don't scatter
+    // across the project root. `grove spawn` already uses this nested location.
+    let parent_root: PathBuf = match layout(&repo) {
+        ProjectLayout::Bare => project_root.to_path_buf(),
+        ProjectLayout::InPlace => {
+            let nested = project_root.join("worktrees");
+            if let Err(e) = std::fs::create_dir_all(&nested) {
+                eprintln!("{} create worktrees/: {}", "Error:".red(), e);
+                std::process::exit(1);
+            }
+            nested
+        }
+    };
+    let worktree_path = match get_worktree_path(&worktree.directory_name, &parent_root) {
         Ok(p) => p,
         Err(e) => {
             eprintln!("{} {}", "Error:".red(), e);

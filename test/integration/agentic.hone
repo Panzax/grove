@@ -67,3 +67,36 @@ RUN cd: $TEST_DIR
 RUN grove integrate
 ASSERT exit_code == 1
 ASSERT stderr contains "Error"
+
+TEST "grove init with no args adopts a fresh git repo in cwd"
+
+ENV TEST_DIR=/tmp/grove-init-in-place
+RUN setup: rm -rf $TEST_DIR && mkdir -p $TEST_DIR && cd $TEST_DIR && git init -q && git -c user.email=t@t -c user.name=t commit --allow-empty -q -m init
+RUN cd: $TEST_DIR
+RUN grove init --no-agent
+ASSERT exit_code == 0
+ASSERT stdout contains "Adopting"
+ASSERT stdout contains "in-place"
+RUN ls -la $TEST_DIR/.grove
+ASSERT stdout contains "config.toml"
+ASSERT stdout contains "PROMPT.template.md"
+
+TEST "grove init <path> adopts the supplied directory"
+
+ENV TEST_DIR=/tmp/grove-init-explicit-path
+RUN setup: rm -rf $TEST_DIR && mkdir -p $TEST_DIR && cd $TEST_DIR && git init -q && git -c user.email=t@t -c user.name=t commit --allow-empty -q -m init
+RUN cd: /tmp
+RUN grove init /tmp/grove-init-explicit-path --no-agent
+ASSERT exit_code == 0
+ASSERT stdout contains "Adopting"
+RUN test -f $TEST_DIR/.grove/config.toml
+ASSERT exit_code == 0
+
+TEST "grove init refuses path that isn't a git repo"
+
+ENV TEST_DIR=/tmp/grove-init-non-git
+RUN setup: rm -rf $TEST_DIR && mkdir -p $TEST_DIR
+RUN cd: $TEST_DIR
+RUN grove init --no-agent
+ASSERT exit_code == 1
+ASSERT stderr contains "not a git repository"

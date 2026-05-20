@@ -38,6 +38,36 @@ pub struct PruneOptions {
 // config files keep deserializing cleanly.
 // =============================================================================
 
+/// Where the project's git directory lives relative to grove's view of it.
+///
+/// - `Bare`    — the upstream layout: `<root>/<name>.git/` (created by `grove init <url>`)
+///               with worktrees as siblings: `<root>/<branch>/`.
+/// - `InPlace` — the fork-added layout: a normal `.git/` checkout adopted via
+///               `grove init [<path>]`; worktrees go under `<root>/worktrees/<name>/`
+///               to avoid scattering them in the project root.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ProjectLayout {
+    Bare,
+    InPlace,
+}
+
+impl Default for ProjectLayout {
+    fn default() -> Self {
+        ProjectLayout::Bare
+    }
+}
+
+impl ProjectLayout {
+    #[allow(dead_code)]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ProjectLayout::Bare => "bare",
+            ProjectLayout::InPlace => "in-place",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ProjectStack {
@@ -228,6 +258,8 @@ impl MessageKind {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct GroveConfig {
     #[serde(default)]
+    pub project: ProjectSection,
+    #[serde(default)]
     pub agent: AgentSection,
     #[serde(default)]
     pub devcontainer: DevcontainerSection,
@@ -247,6 +279,14 @@ pub struct GroveConfig {
     pub hooks: HooksSection,
     #[serde(default)]
     pub meta: MetaSection,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ProjectSection {
+    #[serde(default)]
+    pub layout: ProjectLayout,
+    #[serde(default)]
+    pub root: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

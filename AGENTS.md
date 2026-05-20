@@ -133,6 +133,13 @@ The README at the repository root is the primary documentation. When updating:
   inside a worktree. This is intentional — agent state survives
   `grove remove`. New code that touches per-agent state should call
   `project_root(ctx).join(".grove/agents/<n>")`, not the worktree path.
+- **Two project layouts.** `ProjectLayout::Bare` (upstream — bare clone at
+  `<root>/<name>.git/`, worktrees as siblings) and `ProjectLayout::InPlace`
+  (fork addition — normal `.git/` checkout, worktrees under
+  `<root>/worktrees/<name>/`). `RepoContext::layout` carries the choice;
+  new commands that compute paths must branch on it. `discover_repo()`
+  prefers Bare so existing grove projects keep working unchanged; falls back
+  to InPlace via `discover_in_place()`.
 - **One file per bus event.** Never append to a shared log; the per-file
   pattern eliminates the multi-writer append race. `bus::send` enforces this.
 - **Stop hook is registered at user-level only.** Worktrees never carry a

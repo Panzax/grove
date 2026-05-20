@@ -4,7 +4,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use crate::models::Worktree;
+use crate::models::{ProjectLayout, Worktree};
 use crate::utils::{discover_bare_clone, get_project_root, trim_trailing_branch_slashes};
 
 pub const MAIN_BRANCHES: &[&str] = &["main", "master"];
@@ -13,20 +13,70 @@ pub const DETACHED_HEAD: &str = "detached HEAD";
 pub struct RepoContext {
     repo_path: PathBuf,
     project_root: PathBuf,
+    layout: ProjectLayout,
 }
 
 /// Discover the grove repository and return the repo context.
+///
+/// Search order:
+///   1. `GROVE_REPO` env var (set by a previous `discover_repo` / `grove go`).
+///   2. Walk up from cwd looking for a bare clone (`<name>.git/`) — upstream layout.
+///   3. Walk up from cwd looking for an in-place `.git/` checkout — fork addition.
+///
+/// In-place mode is matched only as a fallback so existing bare-clone projects keep
+/// working unchanged.
 pub fn discover_repo() -> Result<RepoContext, String> {
-    let bare_clone_path = discover_bare_clone(None).map_err(|e| e.message)?;
-    let project_root = get_project_root(&bare_clone_path);
+    if let Ok(bare_clone_path) = discover_bare_clone(None).map_err(|e| e.message) {
+        let project_root = get_project_root(&bare_clone_path);
+        env::set_var("GROVE_REPO", &bare_clone_path);
+        return Ok(RepoContext {
+            repo_path: bare_clone_path,
+            project_root,
+            layout: ProjectLayout::Bare,
+        });
+    }
+    discover_in_place(None)
+}
 
-    // Cache the discovered path
-    env::set_var("GROVE_REPO", &bare_clone_path);
-
-    Ok(RepoContext {
-        repo_path: bare_clone_path,
-        project_root,
-    })
+/// Adopt the supplied path (or cwd) as an in-place grove project. Verifies that the
+/// path is a git working copy (a `.git/` dir or a `.git` file pointing into one),
+/// then returns a `RepoContext` whose `repo_path == project_root` (both refer to the
+/// repo's working-tree root). All git operations issue `git -C <root>` via
+/// `git_raw`, which handles both bare and non-bare paths transparently.
+pub fn discover_in_place(start: Option<&Path>) -> Result<RepoContext, String> {
+    let start_path = match start {
+        Some(p) => p.to_path_buf(),
+        None => std::env::current_dir().map_err(|e| format!("cwd: {}", e))?,
+    };
+    let mut cursor: PathBuf = start_path
+        .canonicalize()
+        .unwrap_or_else(|_| start_path.clone());
+    loop {
+        let dot_git = cursor.join(".git");
+        if dot_git.exists() {
+            // Either a real `.git/` directory or a `.git` file pointing into one — git
+            // handles both via rev-parse; we just need to verify we're inside something.
+            let probe = Command::new("git")
+                .args(["rev-parse", "--is-inside-work-tree"])
+                .current_dir(&cursor)
+                .output()
+                .map_err(|e| format!("git rev-parse: {}", e))?;
+            if probe.status.success() {
+                env::set_var("GROVE_REPO", &cursor);
+                return Ok(RepoContext {
+                    repo_path: cursor.clone(),
+                    project_root: cursor,
+                    layout: ProjectLayout::InPlace,
+                });
+            }
+        }
+        if !cursor.pop() {
+            return Err(format!(
+                "Not inside a grove or git project: searched up from {}",
+                start_path.display()
+            ));
+        }
+    }
 }
 
 pub fn repo_path(context: &RepoContext) -> &Path {
@@ -35,6 +85,25 @@ pub fn repo_path(context: &RepoContext) -> &Path {
 
 pub fn project_root(context: &RepoContext) -> &Path {
     &context.project_root
+}
+
+pub fn layout(context: &RepoContext) -> ProjectLayout {
+    context.layout
+}
+
+/// Convenience constructor for tests and the init-time in-place flow, which needs to
+/// produce a RepoContext for a path before git knows about it.
+#[allow(dead_code)]
+pub fn make_context(
+    repo_path: PathBuf,
+    project_root: PathBuf,
+    layout: ProjectLayout,
+) -> RepoContext {
+    RepoContext {
+        repo_path,
+        project_root,
+        layout,
+    }
 }
 
 fn git_raw(context: &RepoContext, args: &[&str]) -> Result<String, String> {

@@ -36,6 +36,7 @@ fn validate_branch_name(value: &str) -> Result<String, String> {
     Ok(trimmed.to_string())
 }
 
+#[allow(dead_code)] // kept for upstream compatibility; init's dispatch validates URLs itself
 fn validate_git_url(value: &str) -> Result<String, String> {
     if is_valid_git_url(value) {
         Ok(value.to_string())
@@ -101,11 +102,11 @@ enum Commands {
         #[arg(short = 'p', long = "path-only")]
         path_only: bool,
     },
-    /// Initialize a new worktree setup
+    /// Initialize a new worktree setup. Pass a git URL to clone fresh, or pass a path
+    /// (default ".") to adopt an existing checkout in-place.
     Init {
-        /// Git repository URL to clone
-        #[arg(value_parser = validate_git_url)]
-        git_url: Option<String>,
+        /// Git URL to clone, OR path to an existing git checkout (default ".")
+        target: Option<String>,
         /// Skip the Phase 2 setup wizard (no Claude Code invocation)
         #[arg(long = "no-agent")]
         no_agent: bool,
@@ -113,8 +114,11 @@ enum Commands {
         #[arg(long = "no-devcontainer")]
         no_devcontainer: bool,
         /// Re-run the Phase 2 wizard against an already-initialized project (no clone)
-        #[arg(long = "reconfigure", conflicts_with = "git_url")]
+        #[arg(long = "reconfigure", conflicts_with = "target")]
         reconfigure: bool,
+        /// Don't ask before overwriting existing .devcontainer/ or .grove/ files
+        #[arg(long = "yes", short = 'y')]
+        assume_yes: bool,
     },
     /// List all worktrees
     #[command(alias = "ls")]
@@ -283,12 +287,19 @@ fn main() {
             commands::go::run(name.as_deref(), path_only);
         }
         Some(Commands::Init {
-            git_url,
+            target,
             no_agent,
             no_devcontainer,
             reconfigure,
+            assume_yes,
         }) => {
-            commands::init::run(git_url.as_deref(), no_agent, no_devcontainer, reconfigure);
+            commands::init::run(
+                target.as_deref(),
+                no_agent,
+                no_devcontainer,
+                reconfigure,
+                assume_yes,
+            );
         }
         Some(Commands::List {
             details,

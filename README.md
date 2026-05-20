@@ -64,15 +64,32 @@ any of these.
 
 ### Initialize a new project
 
+Two modes — pick whichever fits the situation:
+
+**Clone fresh (upstream layout):**
 ```bash
 grove init https://github.com/user/repo.git
 ```
+Produces `<repo>/<repo>.git/` (bare clone) with worktrees as siblings.
 
-What happens:
+**Adopt an existing repo in-place (fork addition):**
+```bash
+cd your-existing-repo
+grove init                # uses cwd by default
+# or
+grove init /path/to/repo  # explicit path
+```
+The supplied directory must already be a git checkout. Worktrees go under
+`<root>/worktrees/<name>/`. Use `--yes` to skip the merge/overwrite prompt
+on existing `.devcontainer/` or `.grove/` files (defaults to overwrite).
 
-1. **Phase 1 (deterministic)**: bare clone, detect stack (Python/Rust/Node/Go/.NET),
-   scaffold `.devcontainer/devcontainer.json` + `.grove/config.toml` + extend `.groverc`
-   bootstrap entry + patch `.gitignore`.
+In both modes:
+
+1. **Phase 1 (deterministic)**: detect stack (Python/Rust/Node/Go/.NET), scaffold
+   `.devcontainer/devcontainer.json` + `.grove/config.toml` + extend `.groverc`
+   bootstrap entry + patch `.gitignore`. For in-place mode, existing `.devcontainer/`
+   or `.grove/` files trigger a `[merge / overwrite / skip]` prompt (or just use
+   `--yes` to default to overwrite, with the Phase 2 wizard refining afterwards).
 2. **Phase 2 (setup wizard, skippable via `--no-agent`)**: launches a Claude Code session
    that asks five interactive prompts:
    - Project secrets mount (path, RO/RW, env var name)
