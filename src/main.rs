@@ -208,6 +208,10 @@ enum Commands {
         /// Max loop iterations (default 30; 0 = unlimited)
         #[arg(long = "max-iter")]
         max_iter: Option<u32>,
+        /// Skip the bootstrap prompt injection so claude launches without
+        /// any initial message. Advanced — the default is the recommended path.
+        #[arg(long = "no-bootstrap")]
+        no_bootstrap: bool,
     },
     /// Manage running agent sessions (list, status, kill)
     Agents {
@@ -384,6 +388,7 @@ fn main() {
             task,
             promise,
             max_iter,
+            no_bootstrap,
         }) => {
             commands::spawn::run(
                 &name,
@@ -391,6 +396,7 @@ fn main() {
                 task.as_deref(),
                 promise.as_deref(),
                 max_iter,
+                no_bootstrap,
             );
         }
         Some(Commands::Agents { command }) => match command {

@@ -9,6 +9,7 @@
 // The Stop-hook engine itself is the bash script in `assets/loop-hook.sh`, which is
 // `include_str!`'d and dropped into `.grove/tools/loop-hook.sh` during init.
 
+pub mod bootstrap;
 pub mod hook;
 pub mod loop_md;
 pub mod seed;

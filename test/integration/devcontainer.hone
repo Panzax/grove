@@ -163,6 +163,13 @@ ASSERT attach.exit_code != 0
 ASSERT attach.stderr contains "Not in a grove repository"
 RUN cleanup: rm -rf $TEST_DIR
 
+TEST "grove spawn --help advertises --no-bootstrap"
+
+RUN grove spawn --help
+ASSERT exit_code == 0
+ASSERT stdout contains "--no-bootstrap"
+ASSERT stdout contains "bootstrap prompt"
+
 TEST "grove attach errors when devcontainer is down"
 
 ENV TEST_DIR=/tmp/grove-attach-down

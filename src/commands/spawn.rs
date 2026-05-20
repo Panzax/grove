@@ -28,6 +28,7 @@ pub fn run(
     task: Option<&str>,
     promise: Option<&str>,
     max_iter: Option<u32>,
+    no_bootstrap: bool,
 ) {
     let ctx = match discover_repo() {
         Ok(c) => c,
@@ -133,7 +134,47 @@ pub fn run(
     );
     env.insert("GROVE_AGENT_NAME".into(), name.to_string());
 
-    let cmd_tokens = launch_command_tokens();
+    let mut cmd_tokens = launch_command_tokens();
+
+    // Append the bootstrap prompt as the final argv token. Claude treats a
+    // trailing positional arg as its initial user message, so the spawned
+    // session starts with a turn that explains grove + (when --task is set)
+    // instructs the agent to bootstrap its own loop. `--no-bootstrap`
+    // suppresses this for users who want a raw claude session.
+    if !no_bootstrap {
+        let container_worktree_path = container::host_to_container_path(&container, &worktree_path)
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_else(|_| worktree_path.to_string_lossy().to_string());
+        let container_agent_dir = container::host_to_container_path(&container, &agent_dir)
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_else(|_| agent_dir.to_string_lossy().to_string());
+        let repo_name = project_root_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("workspace");
+        let spec = crate::agent::bootstrap::BootstrapSpec {
+            agent_name: name,
+            repo_name,
+            container_worktree_path: &container_worktree_path,
+            container_agent_dir: &container_agent_dir,
+            task,
+            resume,
+        };
+        let prompt = crate::agent::bootstrap::build_bootstrap_prompt(&spec);
+        cmd_tokens.push(prompt);
+        println!(
+            "  {} bootstrap prompt injected ({})",
+            "·".dimmed(),
+            if resume {
+                "resume"
+            } else if task.is_some() {
+                "fresh + task"
+            } else {
+                "fresh + no-task"
+            }
+        );
+    }
+
     let spec = SessionSpec {
         name,
         workdir: &worktree_path,
@@ -141,6 +182,7 @@ pub fn run(
         command: cmd_tokens.clone(),
     };
 
+    let cmd_summary = summarize_command(&cmd_tokens);
     match launch_detached(&spec, Some(&container)) {
         Ok(session_name_str) => {
             let verb = if resume { "Resumed" } else { "Spawned" };
@@ -151,7 +193,7 @@ pub fn run(
                 name.bold(),
                 target_branch.bold(),
                 session_name_str.bold(),
-                cmd_tokens.join(" ").dimmed()
+                cmd_summary.dimmed()
             );
             println!(
                 "  attach: {}",
@@ -171,7 +213,7 @@ pub fn run(
                 "    cd {} && GROVE_AGENT_DIR={} {}",
                 worktree_path.display(),
                 agent_dir.display(),
-                cmd_tokens.join(" ")
+                cmd_summary
             );
         }
     }
@@ -470,6 +512,24 @@ fn tool_in_container(info: &ContainerInfo, tool: &str) -> bool {
     container::exec(info, &argv)
         .map(|out| out.status.success())
         .unwrap_or(false)
+}
+
+/// Render `cmd_tokens` for human display without flooding the terminal with
+/// the multi-KB bootstrap prompt. Tokens shorter than 200 chars are kept
+/// verbatim; longer ones are abbreviated to first 60 chars + "…".
+fn summarize_command(cmd_tokens: &[String]) -> String {
+    cmd_tokens
+        .iter()
+        .map(|tok| {
+            if tok.len() <= 200 {
+                tok.clone()
+            } else {
+                let head: String = tok.chars().take(60).collect();
+                format!("'{}…' ({} chars)", head, tok.len())
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// Command vec passed to tmux. Honors `GROVE_AGENT_COMMAND` env override so tests
