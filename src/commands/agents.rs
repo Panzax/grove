@@ -264,7 +264,10 @@ pub fn repair_pointers(name: Option<&str>) {
                 std::process::exit(1);
             }
             match load_agent(&dir) {
-                Ok(row) => vec![(row.metadata.name, std::path::PathBuf::from(row.metadata.worktree))],
+                Ok(row) => vec![(
+                    row.metadata.name,
+                    std::path::PathBuf::from(row.metadata.worktree),
+                )],
                 Err(e) => {
                     eprintln!("{} {}", "Error:".red(), e);
                     std::process::exit(1);
@@ -318,19 +321,18 @@ pub fn repair_pointers(name: Option<&str>) {
                 fixed += 1;
             }
             Err(e) => {
-                eprintln!(
-                    "  {} {} — {}",
-                    "✗".red(),
-                    agent_name,
-                    e
-                );
+                eprintln!("  {} {} — {}", "✗".red(), agent_name, e);
                 failed += 1;
             }
         }
     }
     println!(
         "{} repair-pointers: {} fixed, {} skipped, {} failed",
-        if failed == 0 { "✓".green() } else { "!".yellow() },
+        if failed == 0 {
+            "✓".green()
+        } else {
+            "!".yellow()
+        },
         fixed,
         skipped,
         failed

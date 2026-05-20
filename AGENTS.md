@@ -171,6 +171,23 @@ The README at the repository root is the primary documentation. When updating:
   .credentials.json, settings.json}` RO. The settings.json mount is what
   brings the Stop hook into the container; without it, the loop never
   engages for in-container claude sessions.
+- **Worktree `.git` pointers must be relative.** `git worktree add`
+  writes absolute host paths into `<worktree>/.git` and the back-pointer
+  at `<gitdir>/worktrees/<n>/gitdir`. Those don't resolve inside the
+  bind-mounted container. `grove spawn` calls
+  `git::worktree_paths::make_worktree_pointers_relative` immediately
+  after `add_worktree` (in both fresh and resume paths) to rewrite both
+  files to relative paths. `grove agents repair-pointers` exposes the
+  same helper as a one-shot bulk fix.
+- **Bootstrap prompt asset conventions.** `assets/AGENT_BOOTSTRAP*.md`
+  files are baked into the binary via `include_str!`. Placeholders use
+  `<UPPER_SNAKE>` (e.g. `<AGENT_NAME>`, `<CONTAINER_WORKTREE_PATH>`).
+  `agent::bootstrap::build_bootstrap_prompt` concatenates a fixed
+  orientation section with one of three variant sections (task,
+  no-task, resume) and substitutes the placeholders. Paths in the
+  prompt are **container-side** (translated via
+  `container::host_to_container_path`) because the prompt is consumed
+  inside the container by claude.
 
 ## Commit Message and PR Title Format
 
