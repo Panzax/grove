@@ -120,6 +120,11 @@ pub fn scaffold_devcontainer(ctx: &RepoContext, project: &ProjectContext) -> Res
 /// path is stable and matches the default of the Microsoft devcontainers base
 /// images. `container::host_to_container_path` derives container paths from
 /// this, so the skeleton stays the source of truth.
+///
+/// `postCreateCommand` is seeded with grove's container prereqs (tmux, jq,
+/// perl, claude). Phase 2's `apply_post_create` APPENDS project-stack installs
+/// (uv sync, npm ci, pre-commit install) so even `grove init --no-agent`
+/// users get a usable container.
 pub fn build_devcontainer_skeleton(project: &ProjectContext) -> Value {
     let workspace_folder = format!("/workspaces/{}", project.repo_name);
     let mut root = json!({
@@ -129,7 +134,7 @@ pub fn build_devcontainer_skeleton(project: &ProjectContext) -> Value {
         "containerUser": "vscode",
         "updateRemoteUserUID": true,
         "workspaceFolder": workspace_folder,
-        "postCreateCommand": "",
+        "postCreateCommand": grove_container_prereqs_command(),
         "containerEnv": {},
         "mounts": [],
         "customizations": {
@@ -151,6 +156,34 @@ pub fn build_devcontainer_skeleton(project: &ProjectContext) -> Value {
     }
 
     root
+}
+
+/// Idempotent install line for grove's container prereqs. Runs as part of
+/// `postCreateCommand`. Each tool is gated on `command -v <tool>` so
+/// images that already include the tool (or come with newer alternatives)
+/// don't get clobbered.
+///
+/// Uses `apt-get` because all Microsoft devcontainers base images we
+/// scaffold against (ubuntu, python:3.12, rust, javascript-node, go,
+/// dotnet:8.0) are Debian-based. Users on Alpine or custom images can
+/// edit `.devcontainer/devcontainer.json` after `grove init`; we document
+/// this in README.
+///
+/// `sudo` is included because the postCreateCommand sometimes runs as the
+/// remoteUser (vscode), which lacks root by default. devcontainer base
+/// images include passwordless sudo for the default user.
+pub fn grove_container_prereqs_command() -> String {
+    [
+        // Apt step bundled so we don't repeat update for each tool.
+        r#"(command -v tmux >/dev/null && command -v jq >/dev/null && command -v perl >/dev/null) || sudo apt-get update"#,
+        r#"(command -v tmux >/dev/null || sudo apt-get install -y tmux)"#,
+        r#"(command -v jq   >/dev/null || sudo apt-get install -y jq)"#,
+        r#"(command -v perl >/dev/null || sudo apt-get install -y perl)"#,
+        // Claude Code via official npm install. Skipped if claude is already
+        // on PATH (user can pre-bake it into a custom image).
+        r#"(command -v claude >/dev/null || sudo npm install -g @anthropic-ai/claude-code)"#,
+    ]
+    .join(" && ")
 }
 
 /// Read whatever devcontainer.json is currently on disk, returning its parsed JSON.
@@ -222,6 +255,26 @@ mod tests {
             .unwrap();
         let ids: Vec<&str> = exts.iter().filter_map(|v| v.as_str()).collect();
         assert!(ids.iter().any(|s| *s == "rust-lang.rust-analyzer"));
+    }
+
+    #[test]
+    fn skeleton_seeds_grove_prereqs_in_post_create() {
+        let project = ProjectContext {
+            stack: Some(ProjectStack::Rust),
+            default_image: ProjectStack::Rust.default_image().to_string(),
+            repo_name: "demo".to_string(),
+            ..Default::default()
+        };
+        let skel = build_devcontainer_skeleton(&project);
+        let post = skel["postCreateCommand"].as_str().unwrap();
+        // Each prereq is gated on `command -v` first; idempotent on images
+        // that already have them.
+        assert!(post.contains("command -v tmux"));
+        assert!(post.contains("command -v jq"));
+        assert!(post.contains("command -v perl"));
+        assert!(post.contains("command -v claude"));
+        // Claude install path is npm (most portable). Devs can override.
+        assert!(post.contains("@anthropic-ai/claude-code"));
     }
 
     #[test]

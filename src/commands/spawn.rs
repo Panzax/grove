@@ -204,6 +204,24 @@ pub fn run(
             "·".dimmed(),
             info.workspace_target.display()
         );
+        // Hard-fail (not silent host fallback) when the container is up but
+        // grove's session backend isn't in it. Silent fallback was hiding
+        // bad container images from the user.
+        if !crate::session::container::is_up(&project_root_path)
+            || !tool_in_container(info, "tmux")
+        {
+            eprintln!(
+                "{} devcontainer is enabled but tmux is missing inside the container.",
+                "Error:".red()
+            );
+            eprintln!(
+                "  Add tmux to your devcontainer's postCreateCommand (grove init's scaffold does this automatically), then `grove devcontainer rebuild`."
+            );
+            eprintln!(
+                "  Run `grove devcontainer doctor` to audit every prereq (tmux, jq, perl, claude)."
+            );
+            std::process::exit(1);
+        }
     }
     match launch_detached(&spec, container.as_ref()) {
         Ok(session_name) => {
@@ -301,6 +319,17 @@ fn resolve_container(project_root: &Path) -> Option<ContainerInfo> {
             None
         }
     }
+}
+
+/// Probe whether `tool` is on PATH inside the running container. Used to
+/// hard-fail spawn when a prereq is missing rather than silently fall back
+/// to host tmux.
+fn tool_in_container(info: &ContainerInfo, tool: &str) -> bool {
+    let script = format!("command -v {} >/dev/null 2>&1", tool);
+    let argv: Vec<&str> = vec!["sh", "-c", &script];
+    container::exec(info, &argv)
+        .map(|out| out.status.success())
+        .unwrap_or(false)
 }
 
 /// Command vec passed to tmux. Honors `GROVE_AGENT_COMMAND` env override so tests

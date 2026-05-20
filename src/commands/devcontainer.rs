@@ -156,6 +156,85 @@ pub fn rebuild() {
     }
 }
 
+/// Audit the running container for grove's prereqs. Reports which of
+/// `tmux`, `jq`, `perl`, `claude` are present / missing.
+///
+/// Exits 0 if all present, 1 if any missing. Useful in CI / health checks /
+/// before spawning a swarm of agents.
+pub fn doctor() {
+    let (_ctx, root) = discover_or_exit();
+    let cfg = read_config(&root);
+    if !cfg.devcontainer.enabled {
+        eprintln!(
+            "{} [devcontainer] enabled = false; nothing to check.",
+            "Note:".yellow()
+        );
+        return;
+    }
+    let info = match container::ensure_up(&root) {
+        Ok(i) => i,
+        Err(e) => {
+            eprintln!("{} devcontainer up: {}", "Error:".red(), e);
+            std::process::exit(1);
+        }
+    };
+
+    println!(
+        "{} checking grove prereqs in container ({})...",
+        "·".dimmed(),
+        info.workspace_target.display()
+    );
+
+    let prereqs = [
+        ("tmux", "agent session multiplexer"),
+        ("jq", "Stop-hook JSON parsing"),
+        ("perl", "Stop-hook <promise> extraction"),
+        ("claude", "Claude Code CLI (the agent itself)"),
+    ];
+
+    let mut missing: Vec<&str> = Vec::new();
+    for (tool, reason) in &prereqs {
+        let present = is_tool_in_container(&info, tool);
+        if present {
+            println!("  {} {} present ({})", "✓".green(), tool.bold(), reason);
+        } else {
+            println!("  {} {} MISSING ({})", "✗".red(), tool.bold(), reason);
+            missing.push(*tool);
+        }
+    }
+
+    if missing.is_empty() {
+        println!();
+        println!("{} all grove prereqs are installed", "✓".green());
+        return;
+    }
+
+    eprintln!();
+    eprintln!(
+        "{} missing in container: {}",
+        "Error:".red(),
+        missing.join(", ")
+    );
+    eprintln!(
+        "Fix: ensure your `.devcontainer/devcontainer.json` postCreateCommand installs these,"
+    );
+    eprintln!("then run `grove devcontainer rebuild` to re-apply.");
+    eprintln!(
+        "grove's default scaffold installs them via apt-get + npm; if you edited the file,"
+    );
+    eprintln!("compare against the prereqs line in `src/devcontainer/mod.rs::grove_container_prereqs_command`.");
+    std::process::exit(1);
+}
+
+fn is_tool_in_container(info: &ContainerInfo, tool: &str) -> bool {
+    // `command -v <tool>` exits 0 if the tool is on PATH inside the container.
+    let script = format!("command -v {} >/dev/null 2>&1", tool);
+    let argv: Vec<&str> = vec!["sh", "-c", &script];
+    container::exec(info, &argv)
+        .map(|out| out.status.success())
+        .unwrap_or(false)
+}
+
 pub fn logs() {
     let (_ctx, root) = discover_or_exit();
     require_enabled(&root);

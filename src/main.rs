@@ -269,6 +269,8 @@ enum DevcontainerCommand {
     Rebuild,
     /// Tail container logs (`devcontainer logs`)
     Logs,
+    /// Audit container for grove's prereqs (tmux, jq, perl, claude)
+    Doctor,
 }
 
 #[derive(Subcommand)]
@@ -404,6 +406,7 @@ fn main() {
             DevcontainerCommand::Exec { argv } => commands::devcontainer::exec(&argv),
             DevcontainerCommand::Rebuild => commands::devcontainer::rebuild(),
             DevcontainerCommand::Logs => commands::devcontainer::logs(),
+            DevcontainerCommand::Doctor => commands::devcontainer::doctor(),
         },
         None => {
             // No command provided - show help
