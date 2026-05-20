@@ -133,14 +133,68 @@ grove spawn feat-auth --task "implement OAuth login flow" \
 Creates a worktree (sibling-to-bare in bare layout, under `worktrees/` in in-place
 layout), seeds `.grove/agents/feat-auth/{PROMPT,STATE,loop,agent}.md`, symlinks
 the project's `.grove/` into the worktree so the Stop hook + agent docs resolve
-from the worktree's cwd, and launches a tmux session with `claude` and
-`GROVE_AGENT_DIR` exported. Per-spawn flags:
+from the worktree's cwd, brings the devcontainer up (idempotent), and launches a
+tmux session **inside the container** with `claude` and `GROVE_AGENT_DIR`
+exported. Per-spawn flags:
 
 - `--task "<text>"` seeds STATE.md with one initial workitem.
 - `--promise "<text>"` sets the `<promise>X</promise>` completion contract.
 - `--max-iter N` caps the loop (default 30; 0 = unlimited).
 - `--branch <existing>` attaches the worktree to an existing branch instead of
   creating `agent/<name>`. Refuses if the branch is already checked out elsewhere.
+
+##### How spawn finds the agent across host/container
+
+```
+HOST                                    CONTAINER
+~/Documents/GitHub/myrepo/              /workspaces/myrepo/
+├── .git/                               ├── .git/
+├── .grove/                             ├── .grove/                  (same files)
+│   ├── agents/feat-auth/               │   ├── agents/feat-auth/
+│   │   ├── PROMPT.md                   │   │   ├── PROMPT.md
+│   │   ├── STATE.md                    │   │   ├── STATE.md
+│   │   ├── loop.md                     │   │   ├── loop.md
+│   │   └── agent.toml                  │   │   └── agent.toml
+│   ├── bus/                            │   ├── bus/                 (collab channel)
+│   └── tools/loop-hook.sh              │   └── tools/loop-hook.sh
+├── worktrees/feat-auth/                ├── worktrees/feat-auth/
+│   └── .grove ─→ ../../.grove          │   └── .grove ─→ ../../.grove
+└── ...                                 └── ...
+
+                                        $GROVE_AGENT_DIR = /workspaces/myrepo/.grove/agents/feat-auth
+                                        claude --dangerously-skip-permissions
+                                            │
+                                            └─ Stop hook fires → bash loop-hook.sh
+                                                  → re-feed PROMPT.md as next turn
+```
+
+The container mounts the host project root at `/workspaces/<repo>/`. `grove
+spawn` brings the devcontainer up (one container per repo, shared by all
+agents), translates host paths to container paths, and launches the tmux
+session via `devcontainer exec -- tmux new-session -d ...`. The Stop hook
+(installed in `~/.claude/settings.json`, mounted RO into the container)
+re-injects the prompt as each turn ends.
+
+##### Devcontainer fallback
+
+When `.grove/config.toml [devcontainer] enabled = false`, or when the
+`devcontainer` CLI isn't installed, spawn falls back to host tmux and prints
+`[host]` next to the launched session — useful for grove projects that
+don't use containers, or for development against a remote dev VM.
+
+#### Manual devcontainer control
+
+```bash
+grove devcontainer up        # ensure container is up (idempotent)
+grove devcontainer down      # stop
+grove devcontainer status    # up/down + list grove- tmux sessions inside
+grove devcontainer exec bash # one-off shell in the container
+grove devcontainer rebuild   # `devcontainer up --remove-existing-container`
+grove devcontainer logs      # `devcontainer logs`
+```
+
+`grove spawn` calls `up` automatically; these are for debugging, teardown,
+and one-off in-container commands.
 
 #### Inspect loop state
 

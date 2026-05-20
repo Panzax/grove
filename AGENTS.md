@@ -150,6 +150,27 @@ The README at the repository root is the primary documentation. When updating:
   (their copy survives re-init); `RALPH-LOOP.md` / `PROTOCOL.md` /
   `PROMPT.template.md` / `loop-hook.sh` get overwritten on every `grove init`
   to keep the framework consistent.
+- **Devcontainer integration.** Spawned agents run inside ONE devcontainer
+  per repo (`[agent] isolation = "shared"`; per-worktree containers are a
+  future flag). `src/session/container.rs` wraps the `devcontainer` CLI;
+  `src/session/tmux.rs` takes `Option<&ContainerInfo>` and routes through
+  `devcontainer exec` when present. Path translation (host → container)
+  happens at the `tmux.rs` boundary; downstream code never sees raw host
+  paths.
+- **Container lifecycle ownership.** `grove spawn` is the *only* command
+  that auto-`up`s the container. `agents list/status/kill` and `integrate`
+  adopt the container if it's already running but never bring it up. This
+  is so read-only operations don't trigger a 30-60s container boot. The
+  manual `grove devcontainer up/down/...` subcommand is for debugging.
+- **Env override pattern.** `GROVE_DEVCONTAINER_COMMAND`,
+  `GROVE_AGENT_COMMAND`, `GROVE_RESOLVE_COMMAND` substitute stub binaries
+  in tests. Always check for the override at the top of the relevant
+  `*_command_tokens()` helper.
+- **Stop hook visibility inside the container.** The Phase-2 wizard's
+  `scoped` claude mount option mounts `~/.claude/{plugins,
+  .credentials.json, settings.json}` RO. The settings.json mount is what
+  brings the Stop hook into the container; without it, the loop never
+  engages for in-container claude sessions.
 
 ## Commit Message and PR Title Format
 
