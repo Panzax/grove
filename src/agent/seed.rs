@@ -75,13 +75,19 @@ pub fn seed_agent(
         ));
     }
     let dir = project_root_path.join(".grove/agents").join(name);
-    if dir.exists() {
+    // Ensure the parent exists, then atomically create the agent dir. The
+    // non-recursive create fails with AlreadyExists if a concurrent spawn won
+    // the race; the prior exists() check we used to do had a TOCTOU window.
+    if let Some(parent) = dir.parent() {
+        fs::create_dir_all(parent).map_err(|e| format!("create {}: {}", parent.display(), e))?;
+    }
+    if let Err(e) = fs::DirBuilder::new().recursive(false).create(&dir) {
         return Err(format!(
-            "agent dir already exists: {} (rename, or `grove remove` the worktree and edit the loop state)",
-            dir.display()
+            "agent dir already exists or could not be created: {} ({}). Rename or `grove remove` the worktree and edit the loop state.",
+            dir.display(),
+            e
         ));
     }
-    fs::create_dir_all(&dir).map_err(|e| format!("create {}: {}", dir.display(), e))?;
 
     let prompt = PROMPT_TEMPLATE.replace("<AGENT_NAME>", name);
     fs::write(dir.join("PROMPT.md"), prompt).map_err(|e| format!("write PROMPT.md: {}", e))?;
@@ -130,25 +136,119 @@ fn loop_md_template(completion_promise: &str, max_iterations: u32) -> String {
     )
 }
 
-/// Chmod SHARED.md to 0444 inside a worktree (per-worktree speedbump). Unix-only;
-/// no-op on other platforms.
+/// Symlink the project's `.grove/` into the worktree so the Stop-hook command
+/// `$CLAUDE_PROJECT_DIR/.grove/tools/loop-hook.sh` resolves from inside the
+/// worktree, AND so the agent's PROMPT.md references like `.grove/PROTOCOL.md`
+/// work from the agent's cwd (without `../..` gymnastics).
+///
+/// The symlink is relative so the worktree stays portable. We also append `.grove`
+/// to the worktree's local `info/exclude` so `git status` inside the worktree
+/// doesn't flag the symlink as untracked.
+///
+/// Unix-only (Linux + macOS, per v1 target platforms). No-op on other platforms.
 #[cfg(unix)]
-pub fn chmod_shared_md_in_worktree(worktree_path: &Path) -> Result<(), String> {
-    use std::os::unix::fs::PermissionsExt;
-    let path = worktree_path.join(".grove").join("SHARED.md");
-    if !path.exists() {
+pub fn link_grove_into_worktree(worktree_path: &Path, project_root: &Path) -> Result<(), String> {
+    use std::os::unix::fs::symlink;
+
+    let link_path = worktree_path.join(".grove");
+    if link_path.exists() || link_path.is_symlink() {
+        // Already linked (or, more likely, a stale prior link) — idempotent.
         return Ok(());
     }
-    let mut perms = fs::metadata(&path)
-        .map_err(|e| format!("stat {}: {}", path.display(), e))?
-        .permissions();
-    perms.set_mode(0o444);
-    fs::set_permissions(&path, perms).map_err(|e| format!("chmod {}: {}", path.display(), e))?;
+
+    // Compute a relative path from the worktree to the project's .grove/.
+    // We can't rely on `pathdiff` (extra dep); spell out the canonical case.
+    // Worktrees live at <project_root>/<a>/.../<b>/  (1 level for bare-sibling
+    // layout, 2 levels for `worktrees/<name>/` in-place layout). Walk parents
+    // to count the depth.
+    let target = relative_path_to_grove(worktree_path, project_root).ok_or_else(|| {
+        format!(
+            "worktree {} is not inside project root {}",
+            worktree_path.display(),
+            project_root.display()
+        )
+    })?;
+    symlink(&target, &link_path).map_err(|e| {
+        format!(
+            "symlink {} -> {}: {}",
+            link_path.display(),
+            target.display(),
+            e
+        )
+    })?;
+    // Add `.grove` to the worktree's local exclude so `git status` stays clean.
+    // Failure is non-fatal — the symlink is the load-bearing piece.
+    let _ = add_grove_to_worktree_exclude(worktree_path);
     Ok(())
 }
 
 #[cfg(not(unix))]
-pub fn chmod_shared_md_in_worktree(_worktree_path: &Path) -> Result<(), String> {
+pub fn link_grove_into_worktree(_worktree_path: &Path, _project_root: &Path) -> Result<(), String> {
+    eprintln!(
+        "Warning: grove symlinks .grove/ into each worktree on Unix only; the hook \
+         engine will not auto-resolve from worktree sessions on this platform."
+    );
+    Ok(())
+}
+
+/// Compute `../../...../.grove` such that, when used as a symlink target inside
+/// the worktree, it resolves to `<project_root>/.grove`.
+fn relative_path_to_grove(worktree_path: &Path, project_root: &Path) -> Option<PathBuf> {
+    let worktree_canon = worktree_path
+        .canonicalize()
+        .unwrap_or_else(|_| worktree_path.to_path_buf());
+    let root_canon = project_root
+        .canonicalize()
+        .unwrap_or_else(|_| project_root.to_path_buf());
+    let relative = worktree_canon.strip_prefix(&root_canon).ok()?;
+    let depth = relative.components().count();
+    if depth == 0 {
+        return None; // worktree == project root? Shouldn't happen.
+    }
+    let mut up = PathBuf::new();
+    for _ in 0..depth {
+        up.push("..");
+    }
+    up.push(".grove");
+    Some(up)
+}
+
+/// Find the per-worktree gitdir and append `.grove` to its `info/exclude`.
+///
+/// For linked worktrees, `git rev-parse --git-dir` returns `<main_gitdir>/worktrees/<wt_name>`.
+/// Each linked worktree has its own `info/exclude` there.
+fn add_grove_to_worktree_exclude(worktree_path: &Path) -> Result<(), String> {
+    let out = std::process::Command::new("git")
+        .args(["rev-parse", "--git-dir"])
+        .current_dir(worktree_path)
+        .output()
+        .map_err(|e| format!("git rev-parse: {}", e))?;
+    if !out.status.success() {
+        return Err(format!(
+            "git rev-parse failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    let gitdir_raw = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    let gitdir = if gitdir_raw.starts_with('/') {
+        PathBuf::from(gitdir_raw)
+    } else {
+        worktree_path.join(gitdir_raw)
+    };
+    let exclude = gitdir.join("info").join("exclude");
+    if let Some(parent) = exclude.parent() {
+        fs::create_dir_all(parent).map_err(|e| format!("create {}: {}", parent.display(), e))?;
+    }
+    let existing = fs::read_to_string(&exclude).unwrap_or_default();
+    if existing.lines().any(|l| l.trim() == ".grove") {
+        return Ok(());
+    }
+    let mut out = existing.clone();
+    if !out.is_empty() && !out.ends_with('\n') {
+        out.push('\n');
+    }
+    out.push_str(".grove\n");
+    fs::write(&exclude, out).map_err(|e| format!("write {}: {}", exclude.display(), e))?;
     Ok(())
 }
 
@@ -207,6 +307,46 @@ mod tests {
         assert_eq!(state.iteration, 0);
         assert_eq!(state.max_iterations, 5);
         assert_eq!(state.completion_promise, "DONE");
+    }
+
+    #[test]
+    fn relative_path_to_grove_one_level() {
+        let root = tmp("rp1");
+        let wt = root.join("feat-a");
+        std::fs::create_dir_all(&wt).unwrap();
+        let target = relative_path_to_grove(&wt, &root).unwrap();
+        assert_eq!(target, PathBuf::from("..").join(".grove"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn relative_path_to_grove_two_levels() {
+        let root = tmp("rp2");
+        let wt = root.join("worktrees").join("feat-a");
+        std::fs::create_dir_all(&wt).unwrap();
+        let target = relative_path_to_grove(&wt, &root).unwrap();
+        assert_eq!(target, PathBuf::from("..").join("..").join(".grove"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn relative_path_to_grove_outside_root_is_none() {
+        let root = tmp("rp-outside");
+        let elsewhere = std::env::temp_dir().join("grove-rp-outside-other");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        assert!(relative_path_to_grove(&elsewhere, &root).is_none());
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&elsewhere);
+    }
+
+    #[test]
+    fn seed_atomic_create_rejects_concurrent_double_spawn() {
+        // First seed succeeds; second seed with the same name fails with AlreadyExists.
+        let dir = tmp("atomic");
+        seed_agent(&dir, "feat-a", None, "DONE", 10).unwrap();
+        let second = seed_agent(&dir, "feat-a", None, "DONE", 10);
+        assert!(second.is_err());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

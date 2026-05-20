@@ -506,6 +506,12 @@ fn is_bare_repository(repo_path: &Path) -> bool {
 }
 
 /// Check if a path looks like a bare git repository by examining its structure.
+///
+/// A *normal* repo's `.git/` directory has the same HEAD/refs/objects layout as a
+/// bare clone — the only authoritative difference is `core.bare = true`. So we
+/// require BOTH the structural fingerprint AND `core.bare == true` before
+/// accepting a path as a bare clone. Without this confirmation, walking up from
+/// inside a normal git checkout misidentifies `.git/` as a grove bare clone.
 fn is_bare_repo_by_structure(repo_path: &Path) -> bool {
     let head_path = repo_path.join("HEAD");
     let refs_path = repo_path.join("refs");
@@ -518,7 +524,13 @@ fn is_bare_repo_by_structure(repo_path: &Path) -> bool {
     }
 
     // Must have HEAD file, refs directory, objects directory
-    head_path.is_file() && refs_path.is_dir() && objects_path.is_dir()
+    if !(head_path.is_file() && refs_path.is_dir() && objects_path.is_dir()) {
+        return false;
+    }
+
+    // Confirm `core.bare = true` to avoid false-matching a normal `.git/` dir
+    // (which has the same structural fingerprint).
+    is_bare_repository(repo_path)
 }
 
 /// Check if a path contains a .git FILE (worktree) vs a .git DIRECTORY (regular repo).
@@ -680,6 +692,11 @@ pub fn get_shell_for_platform() -> String {
 /// Get the command and arguments for running the self-update installer.
 /// On Windows, uses PowerShell with Invoke-RestMethod.
 /// On Unix, uses sh with curl.
+///
+/// Currently unused at runtime — `self_update.rs` is stubbed for the Panzax fork
+/// until we have our own hosted install endpoint. Kept for upstream
+/// unit-test parity (see tests below).
+#[allow(dead_code)]
 pub fn get_self_update_command(install_url: &str) -> (String, Vec<String>) {
     if is_windows() {
         let ps_install_url = format!("{}.ps1", install_url);

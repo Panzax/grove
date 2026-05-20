@@ -198,9 +198,15 @@ enum Commands {
         /// Attach the worktree to an existing branch instead of creating agent/<name>
         #[arg(long = "branch", value_parser = validate_branch_name)]
         branch: Option<String>,
-        /// Task description seeded into the agent's PROMPT.md
+        /// Task description seeded into the agent's STATE.md
         #[arg(short = 't', long = "task")]
         task: Option<String>,
+        /// Completion promise the agent emits as <promise>...</promise> to stop the loop
+        #[arg(long = "promise")]
+        promise: Option<String>,
+        /// Max loop iterations (default 30; 0 = unlimited)
+        #[arg(long = "max-iter")]
+        max_iter: Option<u32>,
     },
     /// Manage running agent sessions (list, status, kill)
     Agents {
@@ -332,8 +338,20 @@ fn main() {
         Some(Commands::Sync { branch }) => {
             commands::sync::run(branch.as_deref());
         }
-        Some(Commands::Spawn { name, branch, task }) => {
-            commands::spawn::run(&name, branch.as_deref(), task.as_deref());
+        Some(Commands::Spawn {
+            name,
+            branch,
+            task,
+            promise,
+            max_iter,
+        }) => {
+            commands::spawn::run(
+                &name,
+                branch.as_deref(),
+                task.as_deref(),
+                promise.as_deref(),
+                max_iter,
+            );
         }
         Some(Commands::Agents { command }) => match command {
             AgentsCommand::List => commands::agents::list(),

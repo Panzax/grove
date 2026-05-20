@@ -50,26 +50,31 @@ pub fn parse(raw: &str) -> Result<LoopState, String> {
         body: String::new(),
     };
 
-    // Frontmatter block delimited by lines containing only `---`.
-    let mut lines = raw.lines();
+    // Frontmatter block delimited by lines containing only `---`. Use line-based
+    // splitting throughout so CRLF input doesn't desynchronize byte offsets.
+    let normalized = raw.replace("\r\n", "\n");
+    let mut lines = normalized.split('\n');
     match lines.next() {
         Some(l) if l.trim() == "---" => {}
         _ => return Err("loop.md missing opening --- frontmatter delimiter".into()),
     }
-    let mut body_start = 0usize;
-    let mut bytes = raw.find('\n').map(|n| n + 1).unwrap_or(raw.len());
+    let mut body_lines: Vec<&str> = Vec::new();
+    let mut closed = false;
+    let mut in_body = false;
     for line in lines {
-        if line.trim() == "---" {
-            body_start = bytes + line.len() + 1;
-            break;
+        if in_body {
+            body_lines.push(line);
+        } else if line.trim() == "---" {
+            in_body = true;
+            closed = true;
+        } else {
+            parse_frontmatter_line(line, &mut state);
         }
-        parse_frontmatter_line(line, &mut state);
-        bytes += line.len() + 1;
     }
-
-    if body_start < raw.len() {
-        state.body = raw[body_start..].trim_start_matches('\n').to_string();
+    if !closed {
+        return Err("loop.md missing closing --- frontmatter delimiter".into());
     }
+    state.body = body_lines.join("\n").trim_start_matches('\n').to_string();
     Ok(state)
 }
 
@@ -95,6 +100,11 @@ fn parse_frontmatter_line(line: &str, state: &mut LoopState) {
         "completion_promise" => state.completion_promise = value.to_string(),
         "session_id" => state.session_id = value.to_string(),
         "last_action" => state.last_action = Some(value.to_string()),
+        "last_updated" => {
+            state.last_updated = chrono::DateTime::parse_from_rfc3339(value)
+                .map(|t| t.with_timezone(&chrono::Utc))
+                .ok();
+        }
         _ => {}
     }
 }
@@ -115,6 +125,12 @@ pub fn serialize(state: &LoopState) -> String {
     ));
     if let Some(last) = &state.last_action {
         out.push_str(&format!("last_action: \"{}\"\n", last.replace('"', "\\\"")));
+    }
+    if let Some(ts) = &state.last_updated {
+        out.push_str(&format!(
+            "last_updated: \"{}\"\n",
+            ts.to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+        ));
     }
     out.push_str("---\n");
     out.push_str(&state.body);
@@ -157,5 +173,29 @@ mod tests {
     fn parse_rejects_missing_frontmatter() {
         let raw = "active: true\n";
         assert!(parse(raw).is_err());
+    }
+
+    #[test]
+    fn parse_handles_crlf_line_endings() {
+        let raw = "---\r\nactive: true\r\niteration: 3\r\nmax_iterations: 30\r\ncompletion_promise: \"DONE\"\r\nsession_id: \"\"\r\n---\r\nbody one\r\nbody two\r\n";
+        let state = parse(raw).unwrap();
+        assert!(state.active);
+        assert_eq!(state.iteration, 3);
+        assert_eq!(state.completion_promise, "DONE");
+        assert!(state.body.contains("body one"));
+        assert!(state.body.contains("body two"));
+    }
+
+    #[test]
+    fn parse_last_updated_round_trip() {
+        let now = chrono::Utc::now();
+        let raw = format!(
+            "---\nactive: true\niteration: 1\nmax_iterations: 10\ncompletion_promise: \"\"\nsession_id: \"\"\nlast_updated: \"{}\"\n---\n",
+            now.to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+        );
+        let state = parse(&raw).unwrap();
+        assert!(state.last_updated.is_some());
+        let again = serialize(&state);
+        assert!(again.contains("last_updated:"));
     }
 }

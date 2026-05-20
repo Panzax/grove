@@ -51,6 +51,9 @@ fn set_executable(path: &Path) -> Result<(), String> {
 fn set_executable(_path: &Path) -> Result<(), String> {
     // Windows: bash hook will run under WSL where the +x bit doesn't transit;
     // bash invokes the script via `bash $H` so the +x bit isn't load-bearing.
+    eprintln!(
+        "Warning: not on Unix; loop-hook.sh +x bit was not set. Use WSL to run grove agents."
+    );
     Ok(())
 }
 
@@ -133,8 +136,19 @@ pub fn install_stop_hook(
 
     let body = serde_json::to_string_pretty(&value)
         .map_err(|e| format!("serialize {}: {}", settings_path.display(), e))?;
-    fs::write(settings_path, body)
-        .map_err(|e| format!("write {}: {}", settings_path.display(), e))?;
+    // Atomic write: stage in a sibling tmp file then rename. Avoids torn reads if
+    // Claude Code is loading settings.json concurrently.
+    let tmp = settings_path.with_extension("grove.tmp");
+    fs::write(&tmp, body).map_err(|e| format!("write {}: {}", tmp.display(), e))?;
+    fs::rename(&tmp, settings_path).map_err(|e| {
+        let _ = fs::remove_file(&tmp);
+        format!(
+            "rename {} -> {}: {}",
+            tmp.display(),
+            settings_path.display(),
+            e
+        )
+    })?;
     Ok(report)
 }
 

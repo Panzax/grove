@@ -1,9 +1,76 @@
 # Grove `agentic-flow` — Port Report
 
 > **Branch**: `agentic-flow` on `Panzax/grove`
-> **Date**: 2026-05-20
-> **HEAD**: `1e4349c` (17 commits ahead of upstream `main`)
-> **Status**: build green, tests green, ready for human review
+> **Date**: 2026-05-20 (review-pass-2 revision)
+> **HEAD**: ahead of upstream `main` — see `git log origin/main..HEAD` for current count
+> **Status**: build warning-free, 212 tests green, ready for human review
+
+## Review-pass-2 fixes (latest)
+
+After the first push, a thorough code review surfaced one blocker, three majors,
+and a dozen minors. All resolved in this revision:
+
+**BLOCKER — Stop hook resolution from worktree sessions.**
+The Stop-hook command literal references `$CLAUDE_PROJECT_DIR/.grove/tools/loop-hook.sh`,
+but Claude Code sets `$CLAUDE_PROJECT_DIR` to the cwd it was launched in. For
+spawn'd agents that cwd is the worktree, where `.grove/` doesn't exist by default.
+**Fix:** `grove spawn` now creates a relative symlink `<worktree>/.grove -> ../../.grove`
+(or `../.grove` in bare layout) so the hook script + framework files resolve
+from worktree cwd. The symlink is added to the worktree's local
+`info/exclude` so `git status` stays clean. As a side benefit, agent PROMPT.md
+references like `.grove/PROTOCOL.md` now work from the agent's cwd.
+
+**MAJOR — Resolver stage validation in `grove integrate`.** The conflict resolver
+used to call `git commit --no-edit` unconditionally. Now we verify
+`git diff --name-only --diff-filter=U` is empty AND `git diff --cached` is
+non-empty before committing, and abort cleanly otherwise.
+
+**MAJOR — Spawn-vs-add worktree path divergence.** Previously `grove spawn` used
+`worktrees/<name>/` in both layouts, while `grove add` used the bare-sibling
+path in bare layout. Reconciled: spawn now branches on layout the same way
+add does. `worktrees/` is reserved for in-place layout only.
+
+**MAJOR — Agent-toml metadata orphan.** A failed `agent.toml` write used to leave
+PROMPT/STATE/loop.md without a metadata anchor, making the agent invisible to
+`grove agents list`. Now rolls back the whole agent dir on metadata failure.
+
+**Bug found during smoke testing — `discover_bare_clone` false-matched normal `.git/`.**
+The structural fingerprint check (HEAD + refs/ + objects/ + no nested `.git/`)
+matched a normal git checkout's `.git/` directory the same as a real bare clone.
+Fix: require `git config core.bare = true` confirmation in
+`is_bare_repo_by_structure`. This was a latent bug in upstream's discovery; the
+fix doesn't change upstream behavior on real bare clones.
+
+**MINOR fixes batched in:**
+- `seed_agent` TOCTOU window closed via `DirBuilder.recursive(false).create()`.
+- `chmod_shared_md_in_worktree` removed (it was dead code; the symlink supersedes it).
+- `loop_md` parses `last_updated` round-trip; CRLF-safe body extraction.
+- `bus::parse_message` CRLF-safe via line-based splitting.
+- `hook::install_stop_hook` writes settings.json atomically (tmp + rename).
+- Resolver branch rollback on `add_worktree` failure inside `grove integrate`.
+- `make_readonly` extends to directories (0o555) so the snapshot context is
+  truly immutable for the resolver.
+- `init.rs` "already initialized" hint when re-running in-place against a
+  grove-managed project.
+- `init.rs` resolve_target requires `is_dir()`, no longer accepting a regular file.
+- `grove spawn --branch <existing>` probes `git worktree list --porcelain`
+  for an existing checkout and emits a specific error.
+- New `--promise` and `--max-iter` flags on `grove spawn`.
+- `hook::set_executable` prints a one-line warning on non-Unix.
+- Various dead-code removals (`let _ = stack`, `_keepalive`, etc.).
+
+**New tests (7 added — 212 total):**
+- `relative_path_to_grove_one_level` / `_two_levels` / `_outside_root_is_none`
+- `seed_atomic_create_rejects_concurrent_double_spawn`
+- `parse_handles_crlf_line_endings` (loop_md + bus, two tests)
+- `parse_last_updated_round_trip`
+
+**Manual end-to-end verified:**
+- In-place: `cd repo && grove init --no-agent && grove spawn feat-a` produces
+  `worktrees/feat-a/` with `.grove -> ../../.grove` symlink; the hook script
+  resolves cleanly from the worktree's cwd.
+- Bare: `grove init <url> --no-agent && cd repo && grove spawn feat-a` produces
+  `repo/feat-a/` with `.grove -> ../.grove` symlink.
 
 ---
 

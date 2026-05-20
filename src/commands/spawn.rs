@@ -5,20 +5,28 @@
 // branch_exists), but with agent-aware seeding instead of bootstrap commands.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use chrono::Utc;
 use colored::Colorize;
 
 use crate::agent::seed;
-use crate::git::worktree_manager::{add_worktree, branch_exists, discover_repo, project_root};
-use crate::models::AgentMetadata;
+use crate::git::worktree_manager::{
+    add_worktree, branch_exists, discover_repo, layout, project_root,
+};
+use crate::models::{AgentMetadata, ProjectLayout};
 use crate::session::tmux::{launch_detached, SessionSpec};
 
 const DEFAULT_MAX_ITERATIONS: u32 = 30;
 const DEFAULT_PROMISE: &str = "All workitems in STATE.md are [x]";
 
-pub fn run(name: &str, branch: Option<&str>, task: Option<&str>) {
+pub fn run(
+    name: &str,
+    branch: Option<&str>,
+    task: Option<&str>,
+    promise: Option<&str>,
+    max_iter: Option<u32>,
+) {
     let ctx = match discover_repo() {
         Ok(c) => c,
         Err(e) => {
@@ -41,16 +49,27 @@ pub fn run(name: &str, branch: Option<&str>, task: Option<&str>) {
     }
 
     let project_root_path = project_root(&ctx).to_path_buf();
-    let worktrees_dir = project_root_path.join("worktrees");
-    if let Err(e) = std::fs::create_dir_all(&worktrees_dir) {
-        eprintln!("{} create worktrees/: {}", "Error:".red(), e);
-        std::process::exit(1);
-    }
-    let worktree_path = worktrees_dir.join(name);
+
+    // Layout-aware worktree placement:
+    //   Bare layout    -> sibling to the bare clone (<root>/<name>/), same as `grove add`.
+    //   In-place layout -> <root>/worktrees/<name>/, so we don't scatter dirs across
+    //                      the user's project root.
+    let worktree_path: PathBuf = match layout(&ctx) {
+        ProjectLayout::Bare => project_root_path.join(name),
+        ProjectLayout::InPlace => {
+            let nested = project_root_path.join("worktrees");
+            if let Err(e) = std::fs::create_dir_all(&nested) {
+                eprintln!("{} create worktrees/: {}", "Error:".red(), e);
+                std::process::exit(1);
+            }
+            nested.join(name)
+        }
+    };
     let worktree_path_str = worktree_path.to_string_lossy().to_string();
 
     // Resolve target branch:
-    //   - --branch X uses an existing branch (errors if it doesn't exist)
+    //   - --branch X uses an existing branch (errors if it doesn't exist, OR if the
+    //     branch is already checked out in another worktree).
     //   - default: agent/<name>, creating it if it doesn't already exist
     let (target_branch, create_new) = match branch {
         Some(b) => {
@@ -60,6 +79,15 @@ pub fn run(name: &str, branch: Option<&str>, task: Option<&str>) {
                     "Error:".red(),
                     b,
                     name
+                );
+                std::process::exit(1);
+            }
+            if let Some(other_wt) = branch_already_checked_out(&project_root_path, b) {
+                eprintln!(
+                    "{} --branch {} is already checked out at {} (git allows only one worktree per branch).",
+                    "Error:".red(),
+                    b,
+                    other_wt
                 );
                 std::process::exit(1);
             }
@@ -83,25 +111,39 @@ pub fn run(name: &str, branch: Option<&str>, task: Option<&str>) {
         target_branch.bold()
     );
 
-    // Seed the per-agent state. Don't fail spawn if seeding fails — the worktree
-    // is already in place; the user can fix by hand.
-    match seed::seed_agent(
-        &project_root_path,
-        name,
-        task,
-        DEFAULT_PROMISE,
-        DEFAULT_MAX_ITERATIONS,
-    ) {
-        Ok(p) => println!("{} seeded {}", "✓".green(), p.display()),
-        Err(e) => eprintln!("  {} seed agent state: {}", "Warning:".yellow(), e),
+    // Symlink the project's .grove/ into the worktree so the Stop hook + agent
+    // PROMPT.md references resolve from the worktree's cwd.
+    if let Err(e) = seed::link_grove_into_worktree(&worktree_path, &project_root_path) {
+        eprintln!("  {} link .grove into worktree: {}", "Warning:".yellow(), e);
+    } else {
+        println!(
+            "  {} linked .grove -> {}/.grove (so Stop hook + agent docs resolve from worktree cwd)",
+            "·".dimmed(),
+            project_root_path.display()
+        );
     }
 
-    // chmod SHARED.md to 0444 inside the worktree (per-worktree speedbump).
-    if let Err(e) = seed::chmod_shared_md_in_worktree(&worktree_path) {
-        eprintln!("  {} chmod SHARED.md: {}", "Warning:".yellow(), e);
-    }
+    // Seed the per-agent state + register metadata. Treated as a single
+    // transaction: if either fails, roll back the agent dir so `grove agents`
+    // doesn't observe a half-seeded entry.
+    let promise_val = promise.unwrap_or(DEFAULT_PROMISE);
+    let max_iter_val = max_iter.unwrap_or(DEFAULT_MAX_ITERATIONS);
+    let agent_dir =
+        match seed::seed_agent(&project_root_path, name, task, promise_val, max_iter_val) {
+            Ok(p) => {
+                println!("{} seeded {}", "✓".green(), p.display());
+                p
+            }
+            Err(e) => {
+                eprintln!(
+                "{} seed agent state: {} (worktree still in place; remove with `grove remove`).",
+                "Error:".red(),
+                e
+            );
+                std::process::exit(1);
+            }
+        };
 
-    // Write agent.toml metadata so `grove agents list` can find this agent.
     let metadata = AgentMetadata {
         id: uuid::Uuid::new_v4().to_string(),
         name: name.to_string(),
@@ -112,18 +154,27 @@ pub fn run(name: &str, branch: Option<&str>, task: Option<&str>) {
         spawned_at: Utc::now(),
         provider: "claude-code".to_string(),
     };
-    let agent_toml = project_root_path
-        .join(".grove")
-        .join("agents")
-        .join(name)
-        .join("agent.toml");
-    let body = toml::to_string_pretty(&metadata).unwrap_or_else(|_| String::new());
+    let agent_toml = agent_dir.join("agent.toml");
+    let body = match toml::to_string_pretty(&metadata) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("{} serialize agent.toml: {}", "Error:".red(), e);
+            let _ = std::fs::remove_dir_all(&agent_dir);
+            std::process::exit(1);
+        }
+    };
     if let Err(e) = std::fs::write(&agent_toml, body) {
-        eprintln!("  {} write agent.toml: {}", "Warning:".yellow(), e);
+        eprintln!(
+            "{} write agent.toml: {} — rolling back seeded agent dir.",
+            "Error:".red(),
+            e
+        );
+        let _ = std::fs::remove_dir_all(&agent_dir);
+        std::process::exit(1);
     }
 
     // Launch tmux session running `claude` (or the configured command).
-    let agent_dir_abs = project_root_path.join(".grove").join("agents").join(name);
+    let agent_dir_abs = agent_dir.clone();
 
     let mut env: HashMap<String, String> = HashMap::new();
     env.insert(
@@ -176,7 +227,33 @@ pub fn run(name: &str, branch: Option<&str>, task: Option<&str>) {
         "Next: edit PROMPT.md / STATE.md, then flip loop.md `active: true` to start the loop."
             .dimmed()
     );
-    let _ = PathBuf::from(&agent_toml);
+}
+
+/// Returns the path of the worktree that already has `branch` checked out, if any.
+/// Walks `git worktree list --porcelain` against the project root (works for both
+/// bare and in-place layouts via cwd handling).
+fn branch_already_checked_out(project_root: &Path, branch: &str) -> Option<String> {
+    let out = std::process::Command::new("git")
+        .args(["worktree", "list", "--porcelain"])
+        .current_dir(project_root)
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let raw = String::from_utf8_lossy(&out.stdout);
+    let mut current_path: Option<String> = None;
+    for line in raw.lines() {
+        if let Some(rest) = line.strip_prefix("worktree ") {
+            current_path = Some(rest.to_string());
+        } else if let Some(rest) = line.strip_prefix("branch ") {
+            let trimmed = rest.trim_start_matches("refs/heads/");
+            if trimmed == branch {
+                return current_path.clone();
+            }
+        }
+    }
+    None
 }
 
 /// Command vec passed to tmux. Honors `GROVE_AGENT_COMMAND` env override so tests

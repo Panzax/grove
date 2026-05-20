@@ -1,5 +1,7 @@
 use colored::Colorize;
 
+#[allow(unused_imports)]
+// upstream's unit tests live in utils.rs; keep the import path stable.
 use crate::utils::get_self_update_command;
 
 pub fn run(version: Option<&str>, pr: Option<u64>) {
@@ -31,8 +33,4 @@ pub fn run(version: Option<&str>, pr: Option<u64>) {
         "https://github.com/Panzax/grove"
     );
     eprintln!("       Target URL was: {}", install_url);
-
-    // Keep helper referenced to avoid an unused-import warning; behavior gated off.
-    let _keepalive: fn(&str) -> (String, Vec<String>) = get_self_update_command;
-    let _ = _keepalive;
 }

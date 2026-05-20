@@ -180,20 +180,27 @@ pub fn parse_message(raw: &str, fallback_kind: MessageKind) -> Result<BusMessage
     let mut ts_str = String::new();
     let mut kind_str = fallback_kind.as_str().to_string();
     let mut contract: Option<String> = None;
-    let mut body = String::new();
+    let body;
 
-    let mut iter = raw.lines();
+    // Normalize line endings so CRLF-encoded files don't desync our offsets.
+    let normalized = raw.replace("\r\n", "\n");
+    let mut iter = normalized.split('\n');
     let first = iter.next().unwrap_or("");
     if first.trim() != "---" {
         return Err("bus message missing opening --- frontmatter delimiter".into());
     }
     let mut closed = false;
-    let mut consumed = first.len() + 1;
-    for line in iter.by_ref() {
+    let mut body_lines: Vec<&str> = Vec::new();
+    let mut in_body = false;
+    for line in iter {
+        if in_body {
+            body_lines.push(line);
+            continue;
+        }
         if line.trim() == "---" {
             closed = true;
-            consumed += line.len() + 1;
-            break;
+            in_body = true;
+            continue;
         }
         if let Some((k, v)) = line.split_once(':') {
             let v = v.trim().trim_matches('"').to_string();
@@ -207,14 +214,11 @@ pub fn parse_message(raw: &str, fallback_kind: MessageKind) -> Result<BusMessage
                 _ => {}
             }
         }
-        consumed += line.len() + 1;
     }
     if !closed {
         return Err("bus message missing closing --- frontmatter delimiter".into());
     }
-    if consumed < raw.len() {
-        body = raw[consumed..].trim_start_matches('\n').to_string();
-    }
+    body = body_lines.join("\n").trim_start_matches('\n').to_string();
 
     let ts = chrono::DateTime::parse_from_rfc3339(&ts_str)
         .map(|t| t.with_timezone(&chrono::Utc))
@@ -380,6 +384,16 @@ mod tests {
         assert!(path.starts_with(dir.join("contracts")));
         assert!(path.ends_with("feat-a-feat-b.md"));
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn parse_handles_crlf_line_endings() {
+        let raw = "---\r\nid: \"abc\"\r\nfrom: \"a\"\r\nto: \"b\"\r\nts: \"2026-05-20T00:00:00.000Z\"\r\nkind: \"direct\"\r\n---\r\nbody one\r\nbody two\r\n";
+        let msg = parse_message(raw, MessageKind::Direct).unwrap();
+        assert_eq!(msg.from, "a");
+        assert_eq!(msg.to, "b");
+        assert!(msg.body.contains("body one"));
+        assert!(msg.body.contains("body two"));
     }
 
     #[test]

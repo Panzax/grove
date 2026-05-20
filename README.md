@@ -125,18 +125,22 @@ upstream `captainsafia/grove` v2.1.0.
 #### Spawn an agent in an isolated worktree
 
 ```bash
-grove spawn feat-auth --task "implement OAuth login flow"
+grove spawn feat-auth --task "implement OAuth login flow" \
+                     --promise "All workitems in STATE.md are [x]" \
+                     --max-iter 30
 ```
 
-Equivalent of the freqtrade harness `agent.sh new feat-auth -w`. Creates a worktree on
-`agent/feat-auth`, seeds `.grove/agents/feat-auth/{PROMPT,STATE,loop}.md`, launches a
-tmux session with `claude` and `GROVE_AGENT_DIR` exported so the Stop hook engages.
+Creates a worktree (sibling-to-bare in bare layout, under `worktrees/` in in-place
+layout), seeds `.grove/agents/feat-auth/{PROMPT,STATE,loop,agent}.md`, symlinks
+the project's `.grove/` into the worktree so the Stop hook + agent docs resolve
+from the worktree's cwd, and launches a tmux session with `claude` and
+`GROVE_AGENT_DIR` exported. Per-spawn flags:
 
-Resume an in-flight branch instead of creating a new one:
-
-```bash
-grove spawn feat-auth --branch feature/oauth-existing
-```
+- `--task "<text>"` seeds STATE.md with one initial workitem.
+- `--promise "<text>"` sets the `<promise>X</promise>` completion contract.
+- `--max-iter N` caps the loop (default 30; 0 = unlimited).
+- `--branch <existing>` attaches the worktree to an existing branch instead of
+  creating `agent/<name>`. Refuses if the branch is already checked out elsewhere.
 
 #### Inspect loop state
 

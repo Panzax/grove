@@ -1,13 +1,16 @@
 // Phase 2 of `grove init` — interactive setup wizard.
 //
-// Five interactive prompts (driven by `dialoguer`) plus two agent-inferred
-// scans that ask `claude -p` to enrich the choices:
+// Five interactive prompts (driven by `dialoguer`):
 //
 //   1. Project secrets mount        (path, RO/RW, env var name)
 //   2. .claude scope + auth         (scoped/full/none + creds strategy)
 //   3. GitHub auth                  (RO PAT recommended; replaces full mount)
-//   4. Agent-inferred extra mounts  (data dirs, env-var-referenced paths)
+//   4. Inferred extra mounts        (heuristic scan over root manifests + README
+//                                    for env-var refs like MARKET_DATA_DIR, etc.)
 //   5. Extensions + container pkgs  (fixed defaults + per-stack inferred)
+//
+// Steps 4 and 5 are pure heuristics today (no LLM call). Wiring `claude -p` for
+// richer inference is documented as a P1 follow-up in AGENTIC-FLOW-REPORT.md.
 //
 // All decisions are persisted to `.grove/config.toml` AND applied to
 // `.devcontainer/devcontainer.json` (mutate-in-place). The wizard is
@@ -427,7 +430,6 @@ fn set_extensions(devcontainer: &mut Value, exts: &[String]) {
 }
 
 fn apply_post_create(project: &ProjectContext, devcontainer: &mut Value) {
-    let stack = project.stack.unwrap_or(ProjectStack::Unknown);
     let pm = project.package_manager.as_deref();
     let install = stack::package_manager_install(pm);
     let mut parts: Vec<String> = Vec::new();
@@ -449,7 +451,6 @@ fn apply_post_create(project: &ProjectContext, devcontainer: &mut Value) {
             o.insert("postCreateCommand".to_string(), Value::String(cmd));
         }
     }
-    let _ = stack; // silence unused if neither package_manager_install nor stack used elsewhere
 }
 
 // ---------- inferred-mount scan ----------

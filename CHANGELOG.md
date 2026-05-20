@@ -35,6 +35,22 @@ Fork point: upstream `v2.1.0`. Worktree primitives unchanged.
 - `grove self-update` is currently a notice-only stub on this fork (no hosted install
   endpoint yet).
 
+### Review-pass-2 (review feedback)
+- `grove init <path>` (in-place adoption mode) — adopt an existing checkout
+  without re-cloning; default target is "."; existing `.devcontainer/` or
+  `.grove/` triggers a merge/overwrite/skip prompt (`--yes` to default Overwrite).
+- `grove spawn` creates `<worktree>/.grove -> ../../.grove` symlink so the Stop
+  hook + framework docs resolve from the worktree's cwd. Fixes the BLOCKER from
+  the first review pass.
+- `grove spawn` worktree path now matches `grove add` per layout (bare → sibling,
+  in-place → `worktrees/<name>/`).
+- `grove spawn --promise "..." --max-iter N` for one-shot loop config.
+- `grove integrate` validates resolver staged the conflicts before committing.
+- Fixed: `discover_bare_clone` no longer false-matches a normal `.git/`
+  directory as a bare clone (now requires `core.bare = true`).
+- Hardening: atomic settings.json write, agent-dir rollback on metadata-write
+  failure, TOCTOU-free agent dir creation, CRLF-safe frontmatter parsing.
+
 <a name="v2.1.0"></a>
 ## [v2.1.0] - 2026-03-28 (upstream — captainsafia/grove)
 

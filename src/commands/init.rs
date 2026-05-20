@@ -72,7 +72,10 @@ fn resolve_target(target: Option<&str>) -> Target {
         return Target::Clone(value.to_string());
     }
     let path = PathBuf::from(value);
-    if path.exists() {
+    // Must be an existing *directory* to qualify as in-place. A file or missing
+    // path is treated as ambiguous so we don't silently misinterpret e.g.
+    // `grove init Cargo.toml`.
+    if path.is_dir() {
         return Target::InPlace(path);
     }
     Target::AmbiguousNonExistent(value.to_string())
@@ -219,6 +222,17 @@ fn run_in_place(path: &Path, no_agent: bool, no_devcontainer: bool, assume_yes: 
         .and_then(|n| n.to_str())
         .unwrap_or("project")
         .to_string();
+    if project_root_path
+        .join(".grove")
+        .join("config.toml")
+        .exists()
+    {
+        println!(
+            "{} {} is already grove-initialized; re-running scaffold (existing files will prompt for merge/overwrite/skip).",
+            "Note:".yellow(),
+            project_root_path.display()
+        );
+    }
     println!(
         "{} {} (layout=in-place)",
         "▶ Adopting".cyan(),

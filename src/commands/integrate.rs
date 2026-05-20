@@ -65,6 +65,8 @@ pub fn run(into: Option<&str>, no_test: bool) {
         std::process::exit(1);
     }
     if let Err(e) = add_worktree(&ctx, &integration_str, &integration_branch, false, None) {
+        // Roll back the freshly-created branch so we don't strand a dangling ref.
+        let _ = git_in(&project, &["branch", "-D", &integration_branch]);
         eprintln!(
             "{} create integration worktree on branch {}: {}",
             "Error:".red(),
@@ -220,6 +222,8 @@ fn copy_dir(src: &Path, dst: &Path) -> Result<(), String> {
 fn make_readonly(path: &Path) -> Result<(), String> {
     use std::os::unix::fs::PermissionsExt;
     fn walk(p: &Path) -> Result<(), String> {
+        // Files first (so the dir is still writable while we touch its children),
+        // then strip write on the dir itself.
         for entry in std::fs::read_dir(p).map_err(|e| e.to_string())? {
             let entry = entry.map_err(|e| e.to_string())?;
             let pth = entry.path();
@@ -233,6 +237,13 @@ fn make_readonly(path: &Path) -> Result<(), String> {
                 std::fs::set_permissions(&pth, perms).map_err(|e| e.to_string())?;
             }
         }
+        // Dir: r-x for owner/group/other so descent works but new entries can't be
+        // created. The resolver gets a truly immutable context snapshot.
+        let mut perms = std::fs::metadata(p)
+            .map_err(|e| e.to_string())?
+            .permissions();
+        perms.set_mode(0o555);
+        std::fs::set_permissions(p, perms).map_err(|e| e.to_string())?;
         Ok(())
     }
     walk(path)
@@ -346,6 +357,22 @@ verification. Conflicted files:\n{}",
         .map_err(|e| format!("invoke {}: {}", program, e))?;
     if !status.success() {
         return Err(format!("resolver exited {}", status.code().unwrap_or(-1)));
+    }
+    // Verify the resolver actually staged the previously-conflicted files. If any
+    // path is still in the unmerged-paths set (`--diff-filter=U`), the resolver
+    // bailed without running `git add` — refuse to commit a half-resolved merge.
+    let still_unmerged =
+        git_in(integration, &["diff", "--name-only", "--diff-filter=U"]).unwrap_or_default();
+    if !still_unmerged.trim().is_empty() {
+        return Err(format!(
+            "resolver returned 0 but left unmerged paths:\n{}",
+            still_unmerged.trim()
+        ));
+    }
+    // Also ensure something is actually staged so we don't create an empty commit.
+    let staged = git_in(integration, &["diff", "--name-only", "--cached"]).unwrap_or_default();
+    if staged.trim().is_empty() {
+        return Err("resolver returned 0 with no staged changes; nothing to commit".to_string());
     }
     // Commit the resolved state to close out the merge.
     git_in(integration, &["commit", "--no-edit"])?;
