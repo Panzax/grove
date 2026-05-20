@@ -12,6 +12,7 @@ use colored::Colorize;
 
 use crate::git::worktree_manager::{add_worktree, discover_repo, get_default_branch, project_root};
 use crate::models::GroveConfig;
+use crate::session::container::{self, ContainerInfo};
 
 pub fn run(into: Option<&str>, no_test: bool) {
     let ctx = match discover_repo() {
@@ -109,6 +110,20 @@ pub fn run(into: Option<&str>, no_test: bool) {
         first_verify_command(&config)
     };
 
+    // Adopt the project's devcontainer if it's already up. Resolver + verify
+    // route through `devcontainer exec` so the agent that resolves conflicts
+    // sees the same toolchain + environment as the spawning agents did.
+    // Note: we don't auto-`up` here — integrate operates on existing work;
+    // operator should have a container up already from prior `grove spawn`.
+    let container = resolve_container_for_integrate(&project);
+    if let Some(info) = &container {
+        println!(
+            "  {} routing resolver + verify through devcontainer ({})",
+            "·".dimmed(),
+            info.workspace_target.display()
+        );
+    }
+
     let mut merged = Vec::new();
     let mut failed = Vec::new();
     for branch in &agent_branches {
@@ -121,7 +136,7 @@ pub fn run(into: Option<&str>, no_test: bool) {
             Ok(_) => {
                 println!("  {} merge clean", "✓".green());
                 if let Some(cmd) = &verify_cmd {
-                    if !run_verify(&integration_path, cmd) {
+                    if !run_verify(&integration_path, cmd, container.as_ref()) {
                         failed.push((branch.clone(), "verify failed".to_string()));
                         continue;
                     }
@@ -130,11 +145,11 @@ pub fn run(into: Option<&str>, no_test: bool) {
             }
             Err(e) => {
                 eprintln!("  {} merge produced conflicts: {}", "!".yellow(), e);
-                match resolve_conflicts(&integration_path) {
+                match resolve_conflicts(&integration_path, container.as_ref()) {
                     Ok(()) => {
                         println!("  {} conflicts resolved", "✓".green());
                         if let Some(cmd) = &verify_cmd {
-                            if !run_verify(&integration_path, cmd) {
+                            if !run_verify(&integration_path, cmd, container.as_ref()) {
                                 failed.push((branch.clone(), "verify failed".to_string()));
                                 continue;
                             }
@@ -289,18 +304,45 @@ fn first_verify_command(config: &GroveConfig) -> Option<Vec<String>> {
     }
 }
 
-fn run_verify(integration: &Path, cmd: &[String]) -> bool {
+fn run_verify(integration: &Path, cmd: &[String], container: Option<&ContainerInfo>) -> bool {
     if cmd.is_empty() {
         return true;
     }
     println!("  {} verify: {}", "·".dimmed(), cmd.join(" ").bold());
-    let mut iter = cmd.iter();
-    let program = iter.next().unwrap();
-    let args: Vec<&String> = iter.collect();
-    let status = Command::new(program)
-        .args(args.iter().map(|s| s.as_str()))
-        .current_dir(integration)
-        .status();
+    let status = match container {
+        None => {
+            let mut iter = cmd.iter();
+            let program = iter.next().unwrap();
+            let args: Vec<&String> = iter.collect();
+            Command::new(program)
+                .args(args.iter().map(|s| s.as_str()))
+                .current_dir(integration)
+                .status()
+                .map_err(|e| e.to_string())
+        }
+        Some(info) => {
+            // Translate the integration worktree path into the container, then
+            // cd into it before running the verify command.
+            let target = match container::host_to_container_path(info, integration) {
+                Ok(p) => p,
+                Err(e) => {
+                    eprintln!("  {} verify path translation: {}", "!".yellow(), e);
+                    return false;
+                }
+            };
+            let mut argv: Vec<&str> = vec!["sh", "-c"];
+            let joined = format!(
+                "cd {} && {}",
+                target.display(),
+                cmd.iter()
+                    .map(|s| shell_escape(s))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            );
+            argv.push(&joined);
+            container::exec_streaming(info, &argv).map_err(|e| e.to_string())
+        }
+    };
     match status {
         Ok(s) if s.success() => {
             println!("  {} verify passed", "✓".green());
@@ -321,11 +363,23 @@ fn run_verify(integration: &Path, cmd: &[String]) -> bool {
     }
 }
 
+/// Minimal POSIX shell escaping for command tokens passed via `sh -c`.
+fn shell_escape(s: &str) -> String {
+    if s.chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '/' | '.' | '-' | '_' | '='))
+    {
+        s.to_string()
+    } else {
+        format!("'{}'", s.replace('\'', "'\\''"))
+    }
+}
+
 /// Try to resolve conflicts with the headless Claude resolver. Honors
 /// GROVE_RESOLVE_COMMAND for tests / alternative providers; defaults to
-/// `claude -p` with a context-aware prompt. Falls back to leaving the
-/// conflicts in place if no resolver is available.
-fn resolve_conflicts(integration: &Path) -> Result<(), String> {
+/// `claude -p` with a context-aware prompt. When the project has a running
+/// devcontainer, the resolver runs INSIDE it via `devcontainer exec` so the
+/// agent sees the same env + tools the spawning agents had.
+fn resolve_conflicts(integration: &Path, container: Option<&ContainerInfo>) -> Result<(), String> {
     let conflicted =
         git_in(integration, &["diff", "--name-only", "--diff-filter=U"]).unwrap_or_default();
     if conflicted.trim().is_empty() {
@@ -342,19 +396,46 @@ verification. Conflicted files:\n{}",
 
     let cmd_tokens = resolver_command_tokens();
     println!(
-        "  {} resolving conflicts via {}",
+        "  {} resolving conflicts via {} {}",
         "·".dimmed(),
-        cmd_tokens.join(" ")
+        cmd_tokens.join(" "),
+        if container.is_some() {
+            "[in container]".dimmed().to_string()
+        } else {
+            "[host]".dimmed().to_string()
+        }
     );
-    let mut iter = cmd_tokens.iter();
-    let program = iter.next().ok_or("resolver command empty")?;
-    let args: Vec<&String> = iter.collect();
-    let status = Command::new(program)
-        .args(args.iter().map(|s| s.as_str()))
-        .arg(&prompt)
-        .current_dir(integration)
-        .status()
-        .map_err(|e| format!("invoke {}: {}", program, e))?;
+
+    let status = match container {
+        None => {
+            let mut iter = cmd_tokens.iter();
+            let program = iter.next().ok_or("resolver command empty")?;
+            let args: Vec<&String> = iter.collect();
+            Command::new(program)
+                .args(args.iter().map(|s| s.as_str()))
+                .arg(&prompt)
+                .current_dir(integration)
+                .status()
+                .map_err(|e| format!("invoke {}: {}", program, e))?
+        }
+        Some(info) => {
+            let target = container::host_to_container_path(info, integration)
+                .map_err(|e| format!("path translation: {}", e))?;
+            let joined = format!(
+                "cd {} && {} {}",
+                target.display(),
+                cmd_tokens
+                    .iter()
+                    .map(|s| shell_escape(s))
+                    .collect::<Vec<_>>()
+                    .join(" "),
+                shell_escape(&prompt)
+            );
+            let argv: Vec<&str> = vec!["sh", "-c", &joined];
+            container::exec_streaming(info, &argv)
+                .map_err(|e| format!("devcontainer exec resolver: {}", e))?
+        }
+    };
     if !status.success() {
         return Err(format!("resolver exited {}", status.code().unwrap_or(-1)));
     }
@@ -377,6 +458,35 @@ verification. Conflicted files:\n{}",
     // Commit the resolved state to close out the merge.
     git_in(integration, &["commit", "--no-edit"])?;
     Ok(())
+}
+
+/// Resolve a ContainerInfo if the project's devcontainer is enabled AND
+/// currently up. Does NOT bring the container up — integrate expects the
+/// operator to have spawned at least one agent already.
+fn resolve_container_for_integrate(project_root: &Path) -> Option<ContainerInfo> {
+    let cfg_path = project_root.join(".grove").join("config.toml");
+    let raw = std::fs::read_to_string(&cfg_path).ok()?;
+    let cfg: GroveConfig = toml::from_str(&raw).ok()?;
+    if !cfg.devcontainer.enabled {
+        return None;
+    }
+    if !container::is_up(project_root) {
+        return None;
+    }
+    let workspace_target = cfg.devcontainer.workspace_target.unwrap_or_else(|| {
+        format!(
+            "/workspaces/{}",
+            project_root
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("workspace")
+        )
+    });
+    Some(ContainerInfo::new(
+        project_root.to_path_buf(),
+        std::path::PathBuf::from(workspace_target),
+        cfg.devcontainer.remote_user,
+    ))
 }
 
 fn resolver_command_tokens() -> Vec<String> {
