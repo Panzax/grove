@@ -34,69 +34,69 @@ ASSERT stdout contains "reconfigure"
 
 TEST "grove agents list outside a grove repo errors cleanly"
 
-ENV TEST_DIR=/tmp/grove-agents-no-repo
+ENV TEST_DIR=/tmp/grove-agentic-agents-no-repo
 RUN setup: rm -rf $TEST_DIR && mkdir -p $TEST_DIR
-RUN cd: $TEST_DIR
-RUN grove agents list
-ASSERT exit_code == 1
-ASSERT stderr contains "Error"
+RUN agents-test: cd $TEST_DIR && grove agents list
+ASSERT agents-test.exit_code != 0
+ASSERT agents-test.stderr contains "Error"
+RUN cleanup: rm -rf $TEST_DIR
 
 TEST "grove loop outside a grove repo errors cleanly"
 
-ENV TEST_DIR=/tmp/grove-loop-no-repo
+ENV TEST_DIR=/tmp/grove-agentic-loop-no-repo
 RUN setup: rm -rf $TEST_DIR && mkdir -p $TEST_DIR
-RUN cd: $TEST_DIR
-RUN grove loop
-ASSERT exit_code == 1
-ASSERT stderr contains "Error"
+RUN loop-test: cd $TEST_DIR && grove loop
+ASSERT loop-test.exit_code != 0
+ASSERT loop-test.stderr contains "Error"
+RUN cleanup: rm -rf $TEST_DIR
 
 TEST "grove msg outside a grove repo errors cleanly"
 
-ENV TEST_DIR=/tmp/grove-msg-no-repo
+ENV TEST_DIR=/tmp/grove-agentic-msg-no-repo
 RUN setup: rm -rf $TEST_DIR && mkdir -p $TEST_DIR
-RUN cd: $TEST_DIR
-RUN grove msg broadcast "hello"
-ASSERT exit_code == 1
-ASSERT stderr contains "Error"
+RUN msg-test: cd $TEST_DIR && grove msg broadcast "hello"
+ASSERT msg-test.exit_code != 0
+ASSERT msg-test.stderr contains "Error"
+RUN cleanup: rm -rf $TEST_DIR
 
 TEST "grove integrate outside a grove repo errors cleanly"
 
-ENV TEST_DIR=/tmp/grove-integrate-no-repo
+ENV TEST_DIR=/tmp/grove-agentic-integrate-no-repo
 RUN setup: rm -rf $TEST_DIR && mkdir -p $TEST_DIR
-RUN cd: $TEST_DIR
-RUN grove integrate
-ASSERT exit_code == 1
-ASSERT stderr contains "Error"
+RUN integrate-test: cd $TEST_DIR && grove integrate
+ASSERT integrate-test.exit_code != 0
+ASSERT integrate-test.stderr contains "Error"
+RUN cleanup: rm -rf $TEST_DIR
 
 TEST "grove init with no args adopts a fresh git repo in cwd"
 
-ENV TEST_DIR=/tmp/grove-init-in-place
+ENV TEST_DIR=/tmp/grove-agentic-init-in-place
 RUN setup: rm -rf $TEST_DIR && mkdir -p $TEST_DIR && cd $TEST_DIR && git init -q && git -c user.email=t@t -c user.name=t commit --allow-empty -q -m init
-RUN cd: $TEST_DIR
-RUN grove init --no-agent
-ASSERT exit_code == 0
-ASSERT stdout contains "Adopting"
-ASSERT stdout contains "in-place"
-RUN ls -la $TEST_DIR/.grove
-ASSERT stdout contains "config.toml"
-ASSERT stdout contains "PROMPT.template.md"
+RUN init-test: cd $TEST_DIR && grove init --no-agent
+ASSERT init-test.exit_code == 0
+ASSERT init-test.stdout contains "Adopting"
+ASSERT init-test.stdout contains "in-place"
+RUN check-config: ls $TEST_DIR/.grove
+ASSERT check-config.stdout contains "config.toml"
+ASSERT check-config.stdout contains "PROMPT.template.md"
+RUN cleanup: rm -rf $TEST_DIR
 
 TEST "grove init <path> adopts the supplied directory"
 
-ENV TEST_DIR=/tmp/grove-init-explicit-path
+ENV TEST_DIR=/tmp/grove-agentic-init-explicit-path
 RUN setup: rm -rf $TEST_DIR && mkdir -p $TEST_DIR && cd $TEST_DIR && git init -q && git -c user.email=t@t -c user.name=t commit --allow-empty -q -m init
-RUN cd: /tmp
-RUN grove init /tmp/grove-init-explicit-path --no-agent
-ASSERT exit_code == 0
-ASSERT stdout contains "Adopting"
-RUN test -f $TEST_DIR/.grove/config.toml
-ASSERT exit_code == 0
+RUN init-test: grove init $TEST_DIR --no-agent
+ASSERT init-test.exit_code == 0
+ASSERT init-test.stdout contains "Adopting"
+RUN config-check: test -f $TEST_DIR/.grove/config.toml
+ASSERT config-check.exit_code == 0
+RUN cleanup: rm -rf $TEST_DIR
 
 TEST "grove init refuses path that isn't a git repo"
 
-ENV TEST_DIR=/tmp/grove-init-non-git
+ENV TEST_DIR=/tmp/grove-agentic-init-non-git
 RUN setup: rm -rf $TEST_DIR && mkdir -p $TEST_DIR
-RUN cd: $TEST_DIR
-RUN grove init --no-agent
-ASSERT exit_code == 1
-ASSERT stderr contains "not a git repository"
+RUN init-test: cd $TEST_DIR && grove init --no-agent
+ASSERT init-test.exit_code != 0
+ASSERT init-test.stderr contains "not a git repository"
+RUN cleanup: rm -rf $TEST_DIR

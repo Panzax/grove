@@ -35,7 +35,18 @@ pub fn discover_repo() -> Result<RepoContext, String> {
             layout: ProjectLayout::Bare,
         });
     }
-    discover_in_place(None)
+    // Preserve upstream wording so the existing integration tests' assertion
+    // (`stderr contains "Not in a grove repository"`) still matches when both
+    // discovery paths fail.
+    discover_in_place(None).map_err(|in_place_err| {
+        format!(
+            "Not in a grove repository.\n\
+             Run `grove init <git-url>` to clone a fresh bare-layout project, OR\n\
+             `grove init [<path>]` to adopt an existing git checkout in-place.\n\
+             (in-place probe: {})",
+            in_place_err
+        )
+    })
 }
 
 /// Adopt the supplied path (or cwd) as an in-place grove project. Verifies that the

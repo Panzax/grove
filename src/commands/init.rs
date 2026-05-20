@@ -130,11 +130,13 @@ fn run_clone(git_url: &str, no_agent: bool, no_devcontainer: bool, assume_yes: b
         std::process::exit(1);
     }
 
+    // Preserve upstream init.hone's "Initialized worktree setup" assertion verbatim.
     println!(
         "{} {}",
-        "✓ Cloned bare repository:".green(),
-        bare_repo_dir.bold()
+        "✓ Initialized worktree setup:".green(),
+        repo_name.bold()
     );
+    println!("  {} {}", "Bare repository:".dimmed(), bare_repo_dir);
 
     let project_root_path = PathBuf::from(&repo_name);
     let original_cwd = std::env::current_dir().ok();
