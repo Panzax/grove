@@ -159,17 +159,34 @@ fn prompt_secrets_mount(
     Ok(())
 }
 
+/// Phase-2 refinement of the `.claude/*` mounts.
+///
+/// Phase 1 already added the three `scoped` mounts as baseline:
+///   ~/.claude/plugins              (RO)
+///   ~/.claude/.credentials.json    (RO)
+///   ~/.claude/settings.json        (RO)
+///
+/// This prompt offers three choices:
+///   - **Scoped (default)** — keep the baseline as-is.
+///   - **Full (override)**  — REMOVE the three RO mounts, add `~/.claude` RW.
+///                            Exposes more (session history, write access);
+///                            recommended only for advanced users.
+///   - **None (remove)**    — REMOVE the three RO mounts entirely. User
+///                            authenticates inside the container per rebuild
+///                            (interactive `claude login` won't work in a
+///                            detached tmux; mostly useful for custom
+///                            container images that bake in auth + hooks).
 fn prompt_claude_scope(config: &mut GroveConfig, devcontainer: &mut Value) -> Result<(), String> {
     let theme = ColorfulTheme::default();
     println!();
     println!(
         "{}",
-        "Spawned agents need access to your Claude Code plugins/skills. Choose how:".dimmed()
+        "grove init already added the recommended `scoped` mounts (~/.claude/{plugins, .credentials.json, settings.json} RO). Adjust if needed:".dimmed()
     );
     let options = vec![
-        "Scoped: mount ~/.claude/plugins (RO) + ~/.claude/.credentials.json (RO) — recommended",
-        "Full:   mount ~/.claude (RW) — matches the freqtrade default, NOT recommended (exposes session history + lets the container write user settings)",
-        "None:   no Claude inheritance (you'll authenticate inside the container per rebuild)",
+        "Keep scoped (recommended) — the three RO mounts grove init added",
+        "Switch to full (RW)       — exposes session history + container can write settings; advanced only",
+        "Remove all .claude mounts — bring your own auth + hooks inside the container",
     ];
     let default_idx = match config.mounts.claude_inherit.as_deref() {
         Some("full") => 1,
@@ -191,30 +208,55 @@ fn prompt_claude_scope(config: &mut GroveConfig, devcontainer: &mut Value) -> Re
 
     match key {
         "scoped" => {
-            add_mount(
-                devcontainer,
-                "${localEnv:HOME}/.claude/plugins",
-                "/home/vscode/.claude/plugins",
-                "ro",
-            );
-            add_mount(
-                devcontainer,
-                "${localEnv:HOME}/.claude/.credentials.json",
-                "/home/vscode/.claude/.credentials.json",
-                "ro",
+            // Baseline mounts are already in place from Phase 1. No-op.
+            println!(
+                "  {} keeping Phase 1 baseline mounts (scoped).",
+                "·".dimmed()
             );
         }
         "full" => {
+            // Remove the three RO mounts, add one RW. Adjusts Phase 1's choice.
+            remove_claude_mounts(devcontainer);
             add_mount(
                 devcontainer,
                 "${localEnv:HOME}/.claude",
                 "/home/vscode/.claude",
                 "rw",
             );
+            println!(
+                "  {} swapped baseline → full ~/.claude RW. WARNING: session history readable + container writes propagate to host.",
+                "Note:".cyan()
+            );
+        }
+        "none" => {
+            remove_claude_mounts(devcontainer);
+            println!(
+                "  {} removed all .claude mounts. You'll need to provision claude + Stop hook inside the container (custom image or postCreateCommand).",
+                "Note:".cyan()
+            );
         }
         _ => {}
     }
     Ok(())
+}
+
+/// Strip every `source=...claude...,target=...claude...` mount entry from
+/// `devcontainer.json mounts`. Used when switching from scoped → full / none.
+fn remove_claude_mounts(devcontainer: &mut Value) {
+    let Some(mounts) = devcontainer
+        .as_object_mut()
+        .and_then(|o| o.get_mut("mounts"))
+        .and_then(|m| m.as_array_mut())
+    else {
+        return;
+    };
+    mounts.retain(|v| {
+        let s = match v.as_str() {
+            Some(s) => s,
+            None => return true,
+        };
+        !(s.contains(".claude"))
+    });
 }
 
 fn prompt_github_auth(config: &mut GroveConfig, devcontainer: &mut Value) -> Result<(), String> {
@@ -429,6 +471,10 @@ fn set_extensions(devcontainer: &mut Value, exts: &[String]) {
     }
 }
 
+/// Append project-stack installs to the existing postCreateCommand. The
+/// existing command is grove's container prereqs (set by Phase 1's
+/// `build_devcontainer_skeleton`); we preserve it so even `--no-agent` users
+/// get tmux + jq + perl + claude in the container.
 fn apply_post_create(project: &ProjectContext, devcontainer: &mut Value) {
     let pm = project.package_manager.as_deref();
     let install = stack::package_manager_install(pm);
@@ -444,13 +490,28 @@ fn apply_post_create(project: &ProjectContext, devcontainer: &mut Value) {
     }
     // husky usually installs via package.json "prepare" so we trust npm/yarn/pnpm
     // install above to fire it.
-    let cmd = parts.join(" && ");
-    let obj = devcontainer.as_object_mut();
-    if let Some(o) = obj {
-        if !cmd.is_empty() {
-            o.insert("postCreateCommand".to_string(), Value::String(cmd));
-        }
+    let appended = parts.join(" && ");
+    if appended.is_empty() {
+        return; // nothing to add; keep Phase 1's grove-prereqs line as-is
     }
+    let obj = match devcontainer.as_object_mut() {
+        Some(o) => o,
+        None => return,
+    };
+    // Concatenate Phase 1's existing postCreate with project-stack steps.
+    // If Phase 1 didn't run (somehow) and the field is empty/missing, the
+    // grove prereqs are missing — log so the user can fix manually.
+    let existing = obj
+        .get("postCreateCommand")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let combined = if existing.trim().is_empty() {
+        appended
+    } else {
+        format!("{} && {}", existing, appended)
+    };
+    obj.insert("postCreateCommand".to_string(), Value::String(combined));
 }
 
 // ---------- inferred-mount scan ----------
@@ -593,6 +654,8 @@ mod tests {
 
     #[test]
     fn apply_post_create_includes_install_line() {
+        // When postCreateCommand is empty (no Phase 1 baseline), apply
+        // populates it with just the project-stack install.
         let mut v = json!({});
         let project = ProjectContext {
             stack: Some(ProjectStack::Python),
@@ -618,5 +681,49 @@ mod tests {
         assert!(cmd.contains("uv sync"));
         assert!(cmd.contains("pre-commit install"));
         assert!(cmd.contains("&&"));
+    }
+
+    #[test]
+    fn apply_post_create_appends_to_phase1_grove_prereqs() {
+        // Simulate Phase 1 having written the grove prereqs into postCreate.
+        let mut v = json!({
+            "postCreateCommand": "(command -v tmux >/dev/null || sudo apt-get install -y tmux)"
+        });
+        let project = ProjectContext {
+            stack: Some(ProjectStack::Python),
+            package_manager: Some("uv".into()),
+            has_pre_commit: true,
+            ..Default::default()
+        };
+        apply_post_create(&project, &mut v);
+        let cmd = v["postCreateCommand"].as_str().unwrap();
+        // Grove prereqs are PRESERVED — Phase 2's project-stack steps
+        // append, not overwrite.
+        assert!(cmd.contains("command -v tmux"));
+        // Project-stack steps came in after.
+        assert!(cmd.contains("uv sync"));
+        assert!(cmd.contains("pre-commit install"));
+        // Order: prereqs first, project install second.
+        let prereqs_idx = cmd.find("command -v tmux").unwrap();
+        let install_idx = cmd.find("uv sync").unwrap();
+        assert!(prereqs_idx < install_idx);
+    }
+
+    #[test]
+    fn apply_post_create_with_no_project_steps_preserves_phase1() {
+        // Bare Unknown-stack project with no PM, no hooks. apply_post_create
+        // should be a no-op so Phase 1's grove prereqs stay.
+        let mut v = json!({
+            "postCreateCommand": "GROVE_PREREQS_LINE_HERE"
+        });
+        let project = ProjectContext {
+            stack: Some(ProjectStack::Unknown),
+            package_manager: None,
+            has_pre_commit: false,
+            has_lefthook: false,
+            ..Default::default()
+        };
+        apply_post_create(&project, &mut v);
+        assert_eq!(v["postCreateCommand"], "GROVE_PREREQS_LINE_HERE");
     }
 }

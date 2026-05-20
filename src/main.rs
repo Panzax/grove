@@ -104,15 +104,16 @@ enum Commands {
     },
     /// Initialize a new worktree setup. Pass a git URL to clone fresh, or pass a path
     /// (default ".") to adopt an existing checkout in-place.
+    ///
+    /// grove is built for agentic workflows; the devcontainer is always scaffolded.
     Init {
         /// Git URL to clone, OR path to an existing git checkout (default ".")
         target: Option<String>,
-        /// Skip the Phase 2 setup wizard (no Claude Code invocation)
+        /// Skip the Phase 2 setup wizard (Phase 1 alone produces a working agentic setup —
+        /// container with grove prereqs + .claude/* mounts; wizard only refines secrets,
+        /// extra mounts, and VS Code extensions).
         #[arg(long = "no-agent")]
         no_agent: bool,
-        /// Skip devcontainer scaffolding entirely
-        #[arg(long = "no-devcontainer")]
-        no_devcontainer: bool,
         /// Re-run the Phase 2 wizard against an already-initialized project (no clone)
         #[arg(long = "reconfigure", conflicts_with = "target")]
         reconfigure: bool,
@@ -244,6 +245,33 @@ enum Commands {
         #[arg(long = "no-test")]
         no_test: bool,
     },
+    /// Manage the project's devcontainer (up/down/status/exec/rebuild/logs)
+    Devcontainer {
+        #[command(subcommand)]
+        command: DevcontainerCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum DevcontainerCommand {
+    /// Ensure the devcontainer is up (idempotent)
+    Up,
+    /// Stop the devcontainer
+    Down,
+    /// Report whether the container is up + list in-container grove tmux sessions
+    Status,
+    /// Run a command inside the container (e.g. `grove devcontainer exec bash`)
+    Exec {
+        /// Command + args
+        #[arg(required = true, trailing_var_arg = true, num_args = 1..)]
+        argv: Vec<String>,
+    },
+    /// Force a rebuild (`devcontainer up --remove-existing-container`)
+    Rebuild,
+    /// Tail container logs (`devcontainer logs`)
+    Logs,
+    /// Audit container for grove's prereqs (tmux, jq, perl, claude)
+    Doctor,
 }
 
 #[derive(Subcommand)]
@@ -257,6 +285,13 @@ enum AgentsCommand {
     },
     /// Send SIGTERM to the agent's tmux session and mark the loop failed
     Kill {
+        /// Agent name
+        name: String,
+    },
+    /// Fully delete an agent's state (loop.md, STATE.md, agent.toml). Worktree
+    /// is NOT removed (use `grove remove <name>`). Refuses if the agent is
+    /// still running.
+    Purge {
         /// Agent name
         name: String,
     },
@@ -295,17 +330,10 @@ fn main() {
         Some(Commands::Init {
             target,
             no_agent,
-            no_devcontainer,
             reconfigure,
             assume_yes,
         }) => {
-            commands::init::run(
-                target.as_deref(),
-                no_agent,
-                no_devcontainer,
-                reconfigure,
-                assume_yes,
-            );
+            commands::init::run(target.as_deref(), no_agent, reconfigure, assume_yes);
         }
         Some(Commands::List {
             details,
@@ -357,6 +385,7 @@ fn main() {
             AgentsCommand::List => commands::agents::list(),
             AgentsCommand::Status { name } => commands::agents::status(&name),
             AgentsCommand::Kill { name } => commands::agents::kill(&name),
+            AgentsCommand::Purge { name } => commands::agents::purge(&name),
         },
         Some(Commands::Loop { agent, watch }) => {
             commands::loop_::run(agent.as_deref(), watch);
@@ -372,6 +401,15 @@ fn main() {
         Some(Commands::Integrate { into, no_test }) => {
             commands::integrate::run(into.as_deref(), no_test);
         }
+        Some(Commands::Devcontainer { command }) => match command {
+            DevcontainerCommand::Up => commands::devcontainer::up(),
+            DevcontainerCommand::Down => commands::devcontainer::down(),
+            DevcontainerCommand::Status => commands::devcontainer::status(),
+            DevcontainerCommand::Exec { argv } => commands::devcontainer::exec(&argv),
+            DevcontainerCommand::Rebuild => commands::devcontainer::rebuild(),
+            DevcontainerCommand::Logs => commands::devcontainer::logs(),
+            DevcontainerCommand::Doctor => commands::devcontainer::doctor(),
+        },
         None => {
             // No command provided - show help
             eprintln!(

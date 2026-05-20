@@ -12,7 +12,8 @@ use colored::Colorize;
 
 use crate::agent::loop_md;
 use crate::git::worktree_manager::{discover_repo, project_root};
-use crate::models::AgentMetadata;
+use crate::models::{AgentMetadata, GroveConfig};
+use crate::session::container::{self, ContainerInfo};
 use crate::session::tmux;
 
 pub fn list() {
@@ -36,11 +37,15 @@ pub fn list() {
         return;
     }
     // Cross-reference with live tmux sessions so we can mark each agent
-    // attached or detached.
-    let live_sessions: std::collections::HashSet<String> = tmux::list_grove_sessions()
-        .unwrap_or_default()
-        .into_iter()
-        .collect();
+    // attached or detached. When [devcontainer] enabled, query in-container
+    // tmux; when disabled or unreachable, fall back to host tmux.
+    let project_root_path = project_root(&ctx).to_path_buf();
+    let container = resolve_container_for_query(&project_root_path);
+    let live_sessions: std::collections::HashSet<String> =
+        tmux::list_grove_sessions(container.as_ref())
+            .unwrap_or_default()
+            .into_iter()
+            .collect();
 
     println!(
         "{:<24} {:<10} {:<5} {:<8} {:<12} TASK",
@@ -99,7 +104,9 @@ pub fn status(name: &str) {
         }
     };
     let session_name = tmux::session_name(name);
-    let attached = tmux::has_session(&session_name).unwrap_or(false);
+    let project_root_path = project_root(&ctx).to_path_buf();
+    let container = resolve_container_for_query(&project_root_path);
+    let attached = tmux::has_session(&session_name, container.as_ref()).unwrap_or(false);
     println!(
         "{} ({})",
         row.metadata.name.bold(),
@@ -134,12 +141,19 @@ pub fn status(name: &str) {
             "detached".dimmed().to_string()
         }
     );
-    println!("  attach        : {}", tmux::attach_instructions(name));
+    println!(
+        "  attach        : {}",
+        tmux::attach_instructions(name, container.as_ref())
+    );
 }
 
 pub fn kill(name: &str) {
     let session_name = tmux::session_name(name);
-    match tmux::kill_session(&session_name) {
+    let project_root_path = discover_repo().ok().map(|c| project_root(&c).to_path_buf());
+    let container = project_root_path
+        .as_deref()
+        .and_then(resolve_container_for_query);
+    match tmux::kill_session(&session_name, container.as_ref()) {
         Ok(()) => println!("{} killed {}", "✓".green(), session_name),
         Err(e) => {
             eprintln!("{} {}", "Error:".red(), e);
@@ -166,6 +180,56 @@ pub fn kill(name: &str) {
             state.active = false;
             let _ = loop_md::write_loop_md(&loop_path, &state);
             println!("  {} flipped loop.md active -> false", "·".dimmed());
+        }
+    }
+}
+
+/// `grove agents purge <name>` — fully delete an agent's state.
+///
+/// `grove remove <name>` removes the worktree but keeps `.grove/agents/<n>/`
+/// (intentional — survives crashes so resume works). `purge` deletes the
+/// agent dir + agent.toml so a subsequent `grove spawn <n>` starts FRESH
+/// instead of resuming. Refuses if the tmux session is still alive.
+pub fn purge(name: &str) {
+    let ctx = match discover_repo() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("{} {}", "Error:".red(), e);
+            std::process::exit(1);
+        }
+    };
+    let project_root_path = project_root(&ctx).to_path_buf();
+    let session_name = tmux::session_name(name);
+    let container = resolve_container_for_query(&project_root_path);
+    if tmux::has_session(&session_name, container.as_ref()).unwrap_or(false) {
+        eprintln!(
+            "{} agent '{}' is still running (tmux session {}). Run `grove agents kill {}` first.",
+            "Error:".red(),
+            name,
+            session_name,
+            name
+        );
+        std::process::exit(1);
+    }
+    let agent_dir = project_root_path.join(".grove").join("agents").join(name);
+    if !agent_dir.exists() {
+        println!(
+            "{} no agent state at {} — nothing to purge.",
+            "Note:".yellow(),
+            agent_dir.display()
+        );
+        return;
+    }
+    match fs::remove_dir_all(&agent_dir) {
+        Ok(()) => println!(
+            "{} purged {} (worktree, if any, was NOT removed — use `grove remove {}`)",
+            "✓".green(),
+            agent_dir.display(),
+            name
+        ),
+        Err(e) => {
+            eprintln!("{} remove {}: {}", "Error:".red(), agent_dir.display(), e);
+            std::process::exit(1);
         }
     }
 }
@@ -246,6 +310,35 @@ fn load_agent(agent_dir: &Path) -> Result<AgentRow, String> {
         completion_promise,
         active,
     })
+}
+
+/// Resolve a ContainerInfo for read queries (list/status/kill) WITHOUT
+/// bringing the container up. If the container is already running, return
+/// Some; otherwise None (read commands report "not running" rather than
+/// triggering a 30-60s container boot).
+fn resolve_container_for_query(project_root: &Path) -> Option<ContainerInfo> {
+    if !container::is_up(project_root) {
+        return None;
+    }
+    let cfg_path = project_root.join(".grove").join("config.toml");
+    let raw = std::fs::read_to_string(&cfg_path).ok()?;
+    let cfg: GroveConfig = toml::from_str(&raw).ok()?;
+    let workspace_target = cfg
+        .devcontainer
+        .workspace_target
+        .unwrap_or_else(|| format!("/workspaces/{}", project_root_basename(project_root)));
+    Some(ContainerInfo::new(
+        project_root.to_path_buf(),
+        std::path::PathBuf::from(workspace_target),
+        cfg.devcontainer.remote_user,
+    ))
+}
+
+fn project_root_basename(p: &Path) -> String {
+    p.file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("workspace")
+        .to_string()
 }
 
 fn short_branch(branch: &str) -> String {

@@ -27,21 +27,15 @@ enum ConflictAction {
 /// 2. `grove init [<path>]`      — in-place: adopt an existing checkout (defaults to ".").
 /// 3. `grove init --reconfigure` — Phase 2 wizard only, against an already-initialized
 ///                                 project; no clone, no scaffold.
-pub fn run(
-    target: Option<&str>,
-    no_agent: bool,
-    no_devcontainer: bool,
-    reconfigure: bool,
-    assume_yes: bool,
-) {
+pub fn run(target: Option<&str>, no_agent: bool, reconfigure: bool, assume_yes: bool) {
     if reconfigure {
         run_reconfigure();
         return;
     }
 
     match resolve_target(target) {
-        Target::Clone(url) => run_clone(&url, no_agent, no_devcontainer, assume_yes),
-        Target::InPlace(path) => run_in_place(&path, no_agent, no_devcontainer, assume_yes),
+        Target::Clone(url) => run_clone(&url, no_agent, assume_yes),
+        Target::InPlace(path) => run_in_place(&path, no_agent, assume_yes),
         Target::InvalidUrl(s) => {
             eprintln!(
                 "{} Invalid git URL format. Supported formats:\n  - HTTPS: https://github.com/user/repo.git\n  - SSH: git@github.com:user/repo.git\n  - SSH: ssh://git@github.com/user/repo.git\n  Got: {}",
@@ -119,7 +113,7 @@ fn looks_like_path(value: &str) -> bool {
 // Mode 1 — clone-mode (upstream behavior, preserved)
 // =============================================================================
 
-fn run_clone(git_url: &str, no_agent: bool, no_devcontainer: bool, assume_yes: bool) {
+fn run_clone(git_url: &str, no_agent: bool, assume_yes: bool) {
     if let Some(existing) = find_grove_repo(None) {
         eprintln!(
             "{} Cannot initialize grove inside an existing grove repository.\nDetected grove repository at: {}\n",
@@ -198,7 +192,7 @@ fn run_clone(git_url: &str, no_agent: bool, no_devcontainer: bool, assume_yes: b
         }
     };
     let project = devcontainer::detect_project_context(&context, &repo_name);
-    run_phase1_and_phase2(&context, &project, no_agent, no_devcontainer, assume_yes);
+    run_phase1_and_phase2(&context, &project, no_agent, assume_yes);
 
     println!();
     println!("{}", "Next steps:".bold());
@@ -221,7 +215,7 @@ fn run_clone(git_url: &str, no_agent: bool, no_devcontainer: bool, assume_yes: b
 // Mode 2 — in-place adoption (fork addition)
 // =============================================================================
 
-fn run_in_place(path: &Path, no_agent: bool, no_devcontainer: bool, assume_yes: bool) {
+fn run_in_place(path: &Path, no_agent: bool, assume_yes: bool) {
     let canonical = match path.canonicalize() {
         Ok(p) => p,
         Err(e) => {
@@ -277,7 +271,7 @@ fn run_in_place(path: &Path, no_agent: bool, no_devcontainer: bool, assume_yes: 
     let project = devcontainer::detect_project_context(&context, &repo_name);
     print_detection_summary(&project);
 
-    run_phase1_and_phase2(&context, &project, no_agent, no_devcontainer, assume_yes);
+    run_phase1_and_phase2(&context, &project, no_agent, assume_yes);
 
     println!();
     println!("{}", "Next steps:".bold());
@@ -299,40 +293,46 @@ fn run_phase1_and_phase2(
     context: &worktree_manager::RepoContext,
     project: &ProjectContext,
     no_agent: bool,
-    no_devcontainer: bool,
     assume_yes: bool,
 ) {
     let project_root = worktree_manager::project_root(context);
 
-    // ---- Phase 1 ----
-    if no_devcontainer {
-        println!(
-            "  {} --no-devcontainer set; skipping .devcontainer/ scaffold.",
-            "·".dimmed()
-        );
-    } else {
-        handle_devcontainer(context, project, assume_yes);
-    }
-
+    // ---- Phase 1 (deterministic; always runs, even with --no-agent) ----
+    handle_devcontainer(context, project, assume_yes);
     handle_grove_config(context, project, assume_yes);
     handle_groverc(project_root);
     handle_gitignore(project_root);
     if project.has_dockerfile {
         handle_dockerignore(project_root);
     }
-    if !no_devcontainer {
-        if let Err(e) = apply_cache_volumes_to_devcontainer(project_root, project) {
-            eprintln!(
-                "  {} failed to add cache volumes to devcontainer.json: {}",
-                "Warning:".yellow(),
-                e
-            );
-        } else {
-            println!(
-                "  {} applied named cache volumes to devcontainer.json",
-                "·".dimmed()
-            );
-        }
+    if let Err(e) = apply_cache_volumes_to_devcontainer(project_root, project) {
+        eprintln!(
+            "  {} failed to add cache volumes to devcontainer.json: {}",
+            "Warning:".yellow(),
+            e
+        );
+    } else {
+        println!(
+            "  {} applied named cache volumes to devcontainer.json",
+            "·".dimmed()
+        );
+    }
+    // Baseline .claude/* mounts so the in-container claude can authenticate
+    // and see the Stop hook even when the Phase 2 wizard is skipped (e.g.
+    // `grove init --no-agent`). Phase 2's prompt_claude_scope can later
+    // swap these for "full" or "none" — but the default is "scoped" so
+    // agent-spawning works out of the box.
+    if let Err(e) = apply_baseline_claude_mounts(project_root) {
+        eprintln!(
+            "  {} failed to add baseline .claude/* mounts: {}",
+            "Warning:".yellow(),
+            e
+        );
+    } else {
+        println!(
+            "  {} added baseline .claude/{{settings.json, .credentials.json, plugins}} RO mounts (scoped default)",
+            "·".dimmed()
+        );
     }
 
     match crate::agent::hook::install_engine(context) {
@@ -738,8 +738,23 @@ fn write_grove_config(
     let scraped = crate::devcontainer::ci_scrape::scrape(ctx);
     let layout = worktree_manager::layout(ctx);
     let mut config = build_grove_config(project, scraped, layout);
-    config.devcontainer.enabled = true;
-    config.devcontainer.auto_up = true;
+    // Capture workspaceFolder + remoteUser from devcontainer.json if present so
+    // src/session/container.rs::ensure_up has the host→container path map
+    // without re-parsing JSON each call. Falls back to /workspaces/<repo> +
+    // "vscode" when devcontainer.json is absent (e.g., --no-devcontainer).
+    if let Ok(value) = crate::devcontainer::read_devcontainer_json(project_root) {
+        let (workspace_target, remote_user) =
+            crate::devcontainer::extract_workspace_metadata(&value);
+        if let Some(t) = workspace_target {
+            config.devcontainer.workspace_target = Some(t);
+        }
+        if let Some(u) = remote_user {
+            config.devcontainer.remote_user = u;
+        }
+    }
+    if config.devcontainer.workspace_target.is_none() {
+        config.devcontainer.workspace_target = Some(format!("/workspaces/{}", project.repo_name));
+    }
     config.meta.initialized_at = Some(chrono::Utc::now());
     config.meta.schema_version = 1;
 
@@ -811,6 +826,21 @@ fn merge_configs(mut existing: GroveConfig, defaults: GroveConfig) -> GroveConfi
     if existing.project.root.is_none() {
         existing.project.root = defaults.project.root;
     }
+    // Devcontainer workspace metadata: prefer existing user-set values; fall
+    // back to defaults derived from devcontainer.json on this run. The
+    // workspace_target Option semantics differ from remote_user (which has
+    // a non-Option default), so handle each.
+    if existing.devcontainer.workspace_target.is_none() {
+        existing.devcontainer.workspace_target = defaults.devcontainer.workspace_target;
+    }
+    // remote_user always has a default; only swap if the existing config
+    // still has the literal default and the new detection produced something
+    // different.
+    if existing.devcontainer.remote_user == "vscode"
+        && defaults.devcontainer.remote_user != "vscode"
+    {
+        existing.devcontainer.remote_user = defaults.devcontainer.remote_user;
+    }
     existing
 }
 
@@ -876,9 +906,23 @@ fn merge_devcontainer_into_existing(
     Ok(())
 }
 
+/// Ensure `.groverc` exists with a valid (possibly empty) bootstrap section.
+///
+/// Earlier revisions of this fork inserted a `devcontainer up
+/// --workspace-folder .` entry here so `grove add` would bring the container
+/// up. That's been **removed**: `grove spawn` is now the single entry point
+/// that brings the container up via `container::ensure_up` (operates on the
+/// project root, not the new worktree). `grove add` stays a generic worktree
+/// CLI with no container responsibility.
+///
+/// To preserve idempotency on projects that previously had the entry, this
+/// function also REMOVES any pre-existing `devcontainer up ...` bootstrap
+/// command. User-added entries (`npm install`, `cargo check`, etc.) are
+/// preserved.
 fn ensure_groverc_bootstrap(project_root: &Path) -> Result<(), String> {
     let path = project_root.join(".groverc");
-    let mut value: serde_json::Value = if path.exists() {
+    let existed = path.exists();
+    let mut value: serde_json::Value = if existed {
         let raw = fs::read_to_string(&path).map_err(|e| format!("read .groverc: {}", e))?;
         if raw.trim().is_empty() {
             serde_json::json!({})
@@ -892,31 +936,29 @@ fn ensure_groverc_bootstrap(project_root: &Path) -> Result<(), String> {
     let obj = value
         .as_object_mut()
         .ok_or_else(|| ".groverc is not a JSON object".to_string())?;
-    let bootstrap = obj
-        .entry("bootstrap")
-        .or_insert_with(|| serde_json::json!({ "commands": [] }));
-    let commands = bootstrap
-        .as_object_mut()
-        .and_then(|b| {
-            b.entry("commands")
-                .or_insert_with(|| serde_json::json!([]))
-                .as_array_mut()
-        })
-        .ok_or_else(|| ".groverc bootstrap.commands is not an array".to_string())?;
+    if let Some(bootstrap) = obj.get_mut("bootstrap") {
+        if let Some(bootstrap_obj) = bootstrap.as_object_mut() {
+            if let Some(commands) = bootstrap_obj
+                .get_mut("commands")
+                .and_then(|c| c.as_array_mut())
+            {
+                commands.retain(|c| {
+                    !(c.get("program").and_then(|p| p.as_str()) == Some("devcontainer")
+                        && c.get("args")
+                            .and_then(|a| a.as_array())
+                            .map(|a| a.iter().any(|v| v == "up"))
+                            .unwrap_or(false))
+                });
+            }
+        }
+    }
 
-    let devcontainer_cmd = serde_json::json!({
-        "program": "devcontainer",
-        "args": ["up", "--workspace-folder", "."]
-    });
-    let already_present = commands.iter().any(|c| {
-        c.get("program").and_then(|p| p.as_str()) == Some("devcontainer")
-            && c.get("args")
-                .and_then(|a| a.as_array())
-                .map(|a| a.iter().any(|v| v == "up"))
-                .unwrap_or(false)
-    });
-    if !already_present {
-        commands.insert(0, devcontainer_cmd);
+    // If we created the file from scratch (no prior `.groverc`), make sure
+    // there's at least an empty bootstrap.commands block so future user edits
+    // have something to extend.
+    if !existed {
+        obj.entry("bootstrap")
+            .or_insert_with(|| serde_json::json!({ "commands": [] }));
     }
 
     let body =
@@ -945,6 +987,64 @@ fn patch_dockerignore(project_root: &Path) -> Result<(), String> {
         }
     }
     fs::write(&path, out).map_err(|e| format!("write .dockerignore: {}", e))?;
+    Ok(())
+}
+
+/// Phase-1 baseline: mount `~/.claude/{settings.json, .credentials.json,
+/// plugins}` RO into the container. These are load-bearing for grove's
+/// agentic workflow:
+///   - `.credentials.json` → in-container claude can authenticate
+///   - `settings.json`     → Stop hook + enabledPlugins flow into the container
+///   - `plugins/`          → claude plugins (skills, hooks) available
+///
+/// The mounts use `${localEnv:HOME}` so they resolve to the host user's home
+/// at devcontainer-up time. The Phase 2 wizard's `prompt_claude_scope` can
+/// later REMOVE these mounts and replace them with the "full" or "none"
+/// alternative if the user wants different isolation.
+fn apply_baseline_claude_mounts(project_root: &Path) -> Result<(), String> {
+    let dev_path = project_root.join(".devcontainer").join("devcontainer.json");
+    if !dev_path.exists() {
+        return Ok(());
+    }
+    let raw =
+        fs::read_to_string(&dev_path).map_err(|e| format!("read {}: {}", dev_path.display(), e))?;
+    let mut value: serde_json::Value =
+        serde_json::from_str(&raw).map_err(|e| format!("parse {}: {}", dev_path.display(), e))?;
+    let obj = value
+        .as_object_mut()
+        .ok_or_else(|| "devcontainer.json top-level is not a JSON object".to_string())?;
+    let mounts = obj
+        .entry("mounts")
+        .or_insert_with(|| serde_json::json!([]))
+        .as_array_mut()
+        .ok_or_else(|| "devcontainer.json `mounts` is not an array".to_string())?;
+
+    let baseline = [
+        (
+            "${localEnv:HOME}/.claude/plugins",
+            "/home/vscode/.claude/plugins",
+        ),
+        (
+            "${localEnv:HOME}/.claude/.credentials.json",
+            "/home/vscode/.claude/.credentials.json",
+        ),
+        (
+            "${localEnv:HOME}/.claude/settings.json",
+            "/home/vscode/.claude/settings.json",
+        ),
+    ];
+    for (source, target) in baseline {
+        let entry = format!("source={},target={},type=bind,readonly", source, target);
+        if !mounts
+            .iter()
+            .any(|v| v == &serde_json::Value::String(entry.clone()))
+        {
+            mounts.push(serde_json::Value::String(entry));
+        }
+    }
+    let body = serde_json::to_string_pretty(&value)
+        .map_err(|e| format!("serialize {}: {}", dev_path.display(), e))?;
+    fs::write(&dev_path, body).map_err(|e| format!("write {}: {}", dev_path.display(), e))?;
     Ok(())
 }
 
@@ -1215,13 +1315,17 @@ mod tests {
         let dir = tmp("groverc-fresh");
         ensure_groverc_bootstrap(&dir).unwrap();
         let body = fs::read_to_string(dir.join(".groverc")).unwrap();
-        assert!(body.contains("devcontainer"));
-        assert!(body.contains("\"up\""));
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        // Fresh file gets an empty bootstrap.commands block so user can
+        // extend later. No devcontainer entry — `grove spawn` handles that.
+        assert!(v["bootstrap"]["commands"].is_array());
+        assert_eq!(v["bootstrap"]["commands"].as_array().unwrap().len(), 0);
+        assert!(!body.contains("devcontainer"));
         let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn ensure_groverc_bootstrap_extends_existing_config() {
+    fn ensure_groverc_bootstrap_preserves_user_entries() {
         let dir = tmp("groverc-extend");
         fs::write(
             dir.join(".groverc"),
@@ -1233,9 +1337,36 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&body).unwrap();
         let cmds = v["bootstrap"]["commands"].as_array().unwrap();
         assert_eq!(v["branchPrefix"], "panzax");
-        assert_eq!(cmds.len(), 2);
-        assert_eq!(cmds[0]["program"], "devcontainer");
-        assert_eq!(cmds[1]["program"], "npm");
+        assert_eq!(cmds.len(), 1);
+        assert_eq!(cmds[0]["program"], "npm");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ensure_groverc_bootstrap_strips_legacy_devcontainer_entry() {
+        // Older grove versions wrote a devcontainer-up bootstrap entry. Make
+        // sure re-running init removes it (it ran from worktree cwd, which
+        // is wrong for the shared-container model — grove spawn handles
+        // container lifecycle now).
+        let dir = tmp("groverc-strip-legacy");
+        fs::write(
+            dir.join(".groverc"),
+            r#"{
+              "bootstrap": {
+                "commands": [
+                  {"program":"devcontainer","args":["up","--workspace-folder","."]},
+                  {"program":"npm","args":["install"]}
+                ]
+              }
+            }"#,
+        )
+        .unwrap();
+        ensure_groverc_bootstrap(&dir).unwrap();
+        let body = fs::read_to_string(dir.join(".groverc")).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let cmds = v["bootstrap"]["commands"].as_array().unwrap();
+        assert_eq!(cmds.len(), 1);
+        assert_eq!(cmds[0]["program"], "npm");
         let _ = fs::remove_dir_all(&dir);
     }
 
