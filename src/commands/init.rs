@@ -112,10 +112,7 @@ fn looks_like_git_url(value: &str) -> bool {
 /// Heuristic: looks like a filesystem path? Either contains a path separator
 /// or starts with a directory-prefix marker.
 fn looks_like_path(value: &str) -> bool {
-    value.contains('/')
-        || value.contains('\\')
-        || value.starts_with('.')
-        || value.starts_with('~')
+    value.contains('/') || value.contains('\\') || value.starts_with('.') || value.starts_with('~')
 }
 
 // =============================================================================
