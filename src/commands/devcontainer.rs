@@ -118,30 +118,74 @@ pub fn exec(argv: &[String]) {
 
 pub fn rebuild() {
     let (_ctx, root) = discover_or_exit();
-    // The devcontainer CLI has `--remove-existing-container` for `up` to
-    // force a rebuild. Wrap that.
-    let output = Command::new("devcontainer")
-        .arg("up")
-        .arg("--workspace-folder")
-        .arg(&root)
-        .arg("--remove-existing-container")
-        .output();
-    match output {
-        Ok(out) if out.status.success() => {
-            println!("{} container rebuilt", "✓".green());
-        }
-        Ok(out) => {
-            eprintln!(
-                "{} rebuild failed: {}",
-                "Error:".red(),
-                String::from_utf8_lossy(&out.stderr).trim()
+    // Log file: .grove/logs/devcontainer-rebuild-<UTC-stamp>.log under the
+    // project root. Tee'd output makes the multi-minute rebuild visible AND
+    // archived so agents (or post-hoc human review) can grep apt/npm errors
+    // without re-running.
+    let log_dir = root.join(".grove").join("logs");
+    if let Err(e) = std::fs::create_dir_all(&log_dir) {
+        eprintln!(
+            "{} create {}: {} (continuing; output will only print)",
+            "Warning:".yellow(),
+            log_dir.display(),
+            e
+        );
+    }
+    let stamp = chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
+    let log_path = log_dir.join(format!("devcontainer-rebuild-{}.log", stamp));
+    println!(
+        "  {} logging to {}",
+        "·".dimmed(),
+        log_path.display().to_string().bold()
+    );
+
+    // Use bash + tee + pipefail so the operator sees the devcontainer CLI's
+    // live output AND a complete copy lands in the log file. `pipefail` makes
+    // devcontainer's exit code win over tee's. The devcontainer binary path
+    // is hardcoded (same as the other lifecycle subcommands); ditto the bash
+    // dep — grove targets Linux + macOS where both are present.
+    let workspace_arg = format!("{}", root.display());
+    let log_arg = format!("{}", log_path.display());
+    let script = format!(
+        "set -o pipefail; devcontainer up --workspace-folder {} --remove-existing-container 2>&1 | tee {}",
+        shell_escape(&workspace_arg),
+        shell_escape(&log_arg)
+    );
+    let status = Command::new("bash").args(["-c", &script]).status();
+    match status {
+        Ok(s) if s.success() => {
+            println!(
+                "{} container rebuilt (log: {})",
+                "✓".green(),
+                log_path.display()
             );
-            std::process::exit(1);
+        }
+        Ok(s) => {
+            eprintln!(
+                "{} rebuild failed (exit {}; full log: {})",
+                "Error:".red(),
+                s.code().unwrap_or(-1),
+                log_path.display()
+            );
+            std::process::exit(s.code().unwrap_or(1));
         }
         Err(e) => {
-            eprintln!("{} invoke devcontainer: {}", "Error:".red(), e);
+            eprintln!("{} invoke bash: {}", "Error:".red(), e);
             std::process::exit(1);
         }
+    }
+}
+
+/// Minimal POSIX shell-arg escaping for a single argument. Same shape as
+/// the helper in `commands::integrate` — kept private here to avoid a
+/// cross-module dep for a one-off use.
+fn shell_escape(s: &str) -> String {
+    if s.chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '/' | '.' | '-' | '_' | '='))
+    {
+        s.to_string()
+    } else {
+        format!("'{}'", s.replace('\'', "'\\''"))
     }
 }
 

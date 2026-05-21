@@ -1112,6 +1112,7 @@ fn patch_gitignore(project_root: &Path) -> Result<(), String> {
         "# grove",
         ".grove/agents/",
         ".grove/bus/",
+        ".grove/logs/",
         "worktrees/",
         ".devcontainer/.local/",
     ];
