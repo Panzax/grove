@@ -535,7 +535,13 @@ fn summarize_command(cmd_tokens: &[String]) -> String {
 /// Command vec passed to tmux. Honors `GROVE_AGENT_COMMAND` env override so tests
 /// can substitute `bash` or `echo` for `claude`.
 fn launch_command_tokens() -> Vec<String> {
-    if let Ok(raw) = std::env::var("GROVE_AGENT_COMMAND") {
+    launch_command_tokens_with(std::env::var("GROVE_AGENT_COMMAND").ok().as_deref())
+}
+
+/// Inner helper that accepts the override directly. Tests call this so they
+/// never mutate the global `GROVE_AGENT_COMMAND` env var (parallel-test race).
+fn launch_command_tokens_with(override_value: Option<&str>) -> Vec<String> {
+    if let Some(raw) = override_value {
         let tokens: Vec<String> = raw.split_whitespace().map(|s| s.to_string()).collect();
         if !tokens.is_empty() {
             return tokens;
@@ -550,17 +556,21 @@ mod tests {
 
     #[test]
     fn default_command_uses_claude() {
-        std::env::remove_var("GROVE_AGENT_COMMAND");
-        let tokens = launch_command_tokens();
+        let tokens = launch_command_tokens_with(None);
         assert_eq!(tokens[0], "claude");
+        assert_eq!(tokens[1], "--dangerously-skip-permissions");
     }
 
     #[test]
     fn env_override_picks_up_tokens() {
-        std::env::set_var("GROVE_AGENT_COMMAND", "bash -c 'sleep 30'");
-        let tokens = launch_command_tokens();
-        std::env::remove_var("GROVE_AGENT_COMMAND");
+        let tokens = launch_command_tokens_with(Some("bash -c 'sleep 30'"));
         assert_eq!(tokens[0], "bash");
         assert!(tokens.iter().any(|t| t.contains("sleep")));
+    }
+
+    #[test]
+    fn empty_override_falls_back_to_default() {
+        let tokens = launch_command_tokens_with(Some("   "));
+        assert_eq!(tokens[0], "claude");
     }
 }

@@ -130,7 +130,16 @@ pub fn down(project_root: &Path) -> Result<(), String> {
 /// any error (including "devcontainer CLI not installed") so callers can
 /// gracefully degrade.
 pub fn is_up(project_root: &Path) -> bool {
-    let argv = base_argv();
+    is_up_with(
+        project_root,
+        std::env::var("GROVE_DEVCONTAINER_COMMAND").ok().as_deref(),
+    )
+}
+
+/// Inner helper that accepts the override directly. Tests use this so they
+/// never mutate the global `GROVE_DEVCONTAINER_COMMAND` env var.
+fn is_up_with(project_root: &Path, override_value: Option<&str>) -> bool {
+    let argv = base_argv_with(override_value);
     let cmd = match argv.first() {
         Some(c) => c.clone(),
         None => return false,
@@ -230,7 +239,14 @@ pub fn attach_instructions(info: &ContainerInfo, session_name: &str) -> String {
 /// env var contents are split on whitespace, so a value of `bash -c stub.sh`
 /// becomes ["bash", "-c", "stub.sh"].
 fn base_argv() -> Vec<String> {
-    if let Ok(raw) = std::env::var("GROVE_DEVCONTAINER_COMMAND") {
+    base_argv_with(std::env::var("GROVE_DEVCONTAINER_COMMAND").ok().as_deref())
+}
+
+/// Inner helper that accepts the override directly instead of reading the
+/// env. Tests call this so they never mutate the global `GROVE_DEVCONTAINER_COMMAND`
+/// (parallel test races otherwise observe each other's writes).
+fn base_argv_with(override_value: Option<&str>) -> Vec<String> {
+    if let Some(raw) = override_value {
         let tokens: Vec<String> = raw.split_whitespace().map(|s| s.to_string()).collect();
         if !tokens.is_empty() {
             return tokens;
@@ -322,22 +338,25 @@ mod tests {
 
     #[test]
     fn env_override_redirects_commands() {
-        // Saturate the env override; ensure base_argv() picks it up.
-        std::env::set_var("GROVE_DEVCONTAINER_COMMAND", "echo --");
-        let argv = base_argv();
-        std::env::remove_var("GROVE_DEVCONTAINER_COMMAND");
+        // Race-free: pass the override directly to the inner helper instead
+        // of mutating the global env var (which causes parallel-test flake).
+        let argv = base_argv_with(Some("echo --"));
         assert_eq!(argv, vec!["echo".to_string(), "--".to_string()]);
     }
 
     #[test]
+    fn base_argv_with_none_falls_back_to_default() {
+        let argv = base_argv_with(None);
+        assert_eq!(argv, vec!["devcontainer".to_string()]);
+    }
+
+    #[test]
     fn is_up_returns_false_when_command_missing() {
-        // Point GROVE_DEVCONTAINER_COMMAND at a binary that doesn't exist.
-        std::env::set_var(
-            "GROVE_DEVCONTAINER_COMMAND",
-            "/nonexistent/grove-test-no-such-cmd",
+        // Race-free variant: pass the override directly to is_up_with.
+        let up = is_up_with(
+            Path::new("/tmp"),
+            Some("/nonexistent/grove-test-no-such-cmd"),
         );
-        let up = is_up(Path::new("/tmp"));
-        std::env::remove_var("GROVE_DEVCONTAINER_COMMAND");
         assert!(!up);
     }
 }
