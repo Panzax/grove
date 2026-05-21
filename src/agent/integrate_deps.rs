@@ -1,3 +1,5 @@
+#![allow(dead_code)] // wired into commands::integrate in the next commit
+
 // Branch metadata + file-overlap helpers for `grove integrate`.
 //
 // `grove integrate` snapshots two pieces of dependency context into

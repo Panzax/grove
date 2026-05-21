@@ -125,23 +125,12 @@ pub fn run(
     };
     let agent_dir = final_agent_dir;
 
-    // Build the tmux session spec. Path translation to container-side
-    // happens inside `launch_detached` via the ContainerInfo.
-    let mut env: HashMap<String, String> = HashMap::new();
-    env.insert(
-        "GROVE_AGENT_DIR".into(),
-        agent_dir.to_string_lossy().to_string(),
-    );
-    env.insert("GROVE_AGENT_NAME".into(), name.to_string());
-
-    let mut cmd_tokens = launch_command_tokens();
-
-    // Append the bootstrap prompt as the final argv token. Claude treats a
-    // trailing positional arg as its initial user message, so the spawned
-    // session starts with a turn that explains grove + (when --task is set)
-    // instructs the agent to bootstrap its own loop. `--no-bootstrap`
-    // suppresses this for users who want a raw claude session.
-    if !no_bootstrap {
+    // Build the bootstrap prompt (Option<String>) unless suppressed by
+    // --no-bootstrap. `grove integrate` will reuse `launch_agent_in_container`
+    // with its own pre-built bootstrap prompt.
+    let bootstrap_prompt = if no_bootstrap {
+        None
+    } else {
         let container_worktree_path = container::host_to_container_path(&container, &worktree_path)
             .map(|p| p.to_string_lossy().to_string())
             .unwrap_or_else(|_| worktree_path.to_string_lossy().to_string());
@@ -161,7 +150,6 @@ pub fn run(
             resume,
         };
         let prompt = crate::agent::bootstrap::build_bootstrap_prompt(&spec);
-        cmd_tokens.push(prompt);
         println!(
             "  {} bootstrap prompt injected ({})",
             "·".dimmed(),
@@ -173,50 +161,19 @@ pub fn run(
                 "fresh + no-task"
             }
         );
-    }
-
-    let spec = SessionSpec {
-        name,
-        workdir: &worktree_path,
-        env,
-        command: cmd_tokens.clone(),
+        Some(prompt)
     };
 
-    let cmd_summary = summarize_command(&cmd_tokens);
-    match launch_detached(&spec, Some(&container)) {
-        Ok(session_name_str) => {
-            let verb = if resume { "Resumed" } else { "Spawned" };
-            println!(
-                "{} {} agent {} on {} (tmux {} {}) [in container]",
-                "✓".green(),
-                verb,
-                name.bold(),
-                target_branch.bold(),
-                session_name_str.bold(),
-                cmd_summary.dimmed()
-            );
-            println!(
-                "  attach: {}",
-                crate::session::tmux::attach_instructions(name, Some(&container))
-            );
-        }
-        Err(e) => {
-            eprintln!(
-                "{} could not launch tmux session: {}",
-                "Warning:".yellow(),
-                e
-            );
-            println!(
-                "  the worktree + agent dir are still in place; you can launch claude manually:"
-            );
-            println!(
-                "    cd {} && GROVE_AGENT_DIR={} {}",
-                worktree_path.display(),
-                agent_dir.display(),
-                cmd_summary
-            );
-        }
-    }
+    let verb = if resume { "Resumed" } else { "Spawned" };
+    launch_agent_in_container(&LaunchContext {
+        agent_name: name,
+        worktree_path: &worktree_path,
+        agent_dir: &agent_dir,
+        container: &container,
+        bootstrap_prompt: bootstrap_prompt.as_deref(),
+        display_branch: &target_branch,
+        verb_past: verb,
+    });
 
     println!();
     if resume {
@@ -230,6 +187,85 @@ pub fn run(
             "Next: edit PROMPT.md / STATE.md, then flip loop.md `active: true` to start the loop."
                 .dimmed()
         );
+    }
+}
+
+/// Context for `launch_agent_in_container` — bundle the args so spawn and
+/// integrate can both call it without a 7-arg signature.
+pub(crate) struct LaunchContext<'a> {
+    pub agent_name: &'a str,
+    pub worktree_path: &'a Path,
+    pub agent_dir: &'a Path,
+    pub container: &'a ContainerInfo,
+    /// Bootstrap prompt appended as claude's initial user message.
+    /// `None` means launch claude without an initial prompt (raw session).
+    pub bootstrap_prompt: Option<&'a str>,
+    /// Branch name shown in the success banner. Caller's choice — `grove
+    /// spawn` passes the worktree's branch, `grove integrate` passes the
+    /// integration branch.
+    pub display_branch: &'a str,
+    /// Past-tense verb in the success banner: "Spawned", "Resumed",
+    /// "Started", etc.
+    pub verb_past: &'a str,
+}
+
+/// Build the env + cmd_tokens, construct the SessionSpec, and call
+/// `launch_detached` inside the project's devcontainer. Prints success or
+/// fallback-manual-launch instructions. Reused by `grove spawn` and
+/// `grove integrate`.
+pub(crate) fn launch_agent_in_container(ctx: &LaunchContext<'_>) {
+    let mut env: HashMap<String, String> = HashMap::new();
+    env.insert(
+        "GROVE_AGENT_DIR".into(),
+        ctx.agent_dir.to_string_lossy().to_string(),
+    );
+    env.insert("GROVE_AGENT_NAME".into(), ctx.agent_name.to_string());
+
+    let mut cmd_tokens = launch_command_tokens();
+    if let Some(prompt) = ctx.bootstrap_prompt {
+        cmd_tokens.push(prompt.to_string());
+    }
+
+    let spec = SessionSpec {
+        name: ctx.agent_name,
+        workdir: ctx.worktree_path,
+        env,
+        command: cmd_tokens.clone(),
+    };
+
+    let cmd_summary = summarize_command(&cmd_tokens);
+    match launch_detached(&spec, Some(ctx.container)) {
+        Ok(session_name_str) => {
+            println!(
+                "{} {} agent {} on {} (tmux {} {}) [in container]",
+                "✓".green(),
+                ctx.verb_past,
+                ctx.agent_name.bold(),
+                ctx.display_branch.bold(),
+                session_name_str.bold(),
+                cmd_summary.dimmed()
+            );
+            println!(
+                "  attach: {}",
+                crate::session::tmux::attach_instructions(ctx.agent_name, Some(ctx.container))
+            );
+        }
+        Err(e) => {
+            eprintln!(
+                "{} could not launch tmux session: {}",
+                "Warning:".yellow(),
+                e
+            );
+            println!(
+                "  the worktree + agent dir are still in place; you can launch claude manually:"
+            );
+            println!(
+                "    cd {} && GROVE_AGENT_DIR={} {}",
+                ctx.worktree_path.display(),
+                ctx.agent_dir.display(),
+                cmd_summary
+            );
+        }
     }
 }
 
