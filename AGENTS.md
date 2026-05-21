@@ -188,6 +188,14 @@ The README at the repository root is the primary documentation. When updating:
   prompt are **container-side** (translated via
   `container::host_to_container_path`) because the prompt is consumed
   inside the container by claude.
+- **Host tmux config bind.** Phase 1 probes `$HOME/.config/tmux/tmux.conf`
+  (XDG) then `$HOME/.tmux.conf` (legacy). If found, adds a RO mount to
+  `/home/vscode/.tmux.conf` using the `${localEnv:HOME}/...` form so
+  devcontainer.json stays portable across machines. Helper lives in
+  `src/devcontainer/mod.rs::apply_baseline_tmux_mount`; idempotent;
+  silently skips when no host conf exists. The mount is always present
+  as the legacy path because tmux reads legacy first regardless of host
+  source location.
 
 ## Commit Message and PR Title Format
 

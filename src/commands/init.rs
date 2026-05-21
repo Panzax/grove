@@ -335,6 +335,23 @@ fn run_phase1_and_phase2(
         );
     }
 
+    // Optional: bind the host's tmux config RO so the container's tmux
+    // inherits the user's keybinds, theme, status line. Skipped silently
+    // when neither ~/.config/tmux/tmux.conf nor ~/.tmux.conf exists on
+    // the host.
+    match crate::devcontainer::apply_baseline_tmux_mount(project_root) {
+        Ok(true) => println!(
+            "  {} bound host tmux conf RO into /home/vscode/.tmux.conf",
+            "·".dimmed()
+        ),
+        Ok(false) => {}
+        Err(e) => eprintln!(
+            "  {} failed to add tmux conf mount: {}",
+            "Warning:".yellow(),
+            e
+        ),
+    }
+
     match crate::agent::hook::install_engine(context) {
         Ok(p) => println!("  {} installed engine at {}", "·".dimmed(), p.display()),
         Err(e) => eprintln!(

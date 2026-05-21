@@ -91,6 +91,12 @@ in-container claude can authenticate and the Stop hook engages. `grove
 spawn` hard-fails if it can't bring up a devcontainer; if your project
 doesn't need agentic spawning, you don't need grove.
 
+If a host tmux config is present (`~/.config/tmux/tmux.conf` or
+`~/.tmux.conf`), Phase 1 also adds a RO bind mount so the in-container
+tmux inherits your keybinds, theme, and status line. Skipped silently
+when neither exists. `grove devcontainer doctor` reports whether the
+mount is live.
+
 In both modes:
 
 1. **Phase 1 (deterministic)**: detect stack (Python/Rust/Node/Go/.NET), scaffold
