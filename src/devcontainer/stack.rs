@@ -309,21 +309,29 @@ pub struct VerifyDefaults {
     pub typecheck: Vec<String>,
 }
 
-/// Named cache volumes appropriate for the detected stack.
-pub fn cache_volumes(stack: ProjectStack, repo_name: &str) -> Vec<(String, String)> {
+/// Named cache volumes appropriate for the detected stack. Targets route
+/// to whichever container user the caller supplies — `apply_cache_volumes_to_devcontainer`
+/// reads `remoteUser`/`containerUser` from devcontainer.json (default
+/// "vscode" for fresh scaffolds) so a freqtrade-style image with
+/// `ftuser` gets caches under `/home/ftuser/...`, not the wrong-user
+/// `/home/vscode/...` paths that previous grove versions hardcoded.
+pub fn cache_volumes(stack: ProjectStack, repo_name: &str, user: &str) -> Vec<(String, String)> {
     let safe = repo_name
         .chars()
         .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
         .collect::<String>();
     match stack {
         ProjectStack::Python => vec![
-            ("grove-uv-cache".into(), "/home/vscode/.cache/uv".into()),
-            ("grove-pip-cache".into(), "/home/vscode/.cache/pip".into()),
+            ("grove-uv-cache".into(), format!("/home/{}/.cache/uv", user)),
+            (
+                "grove-pip-cache".into(),
+                format!("/home/{}/.cache/pip", user),
+            ),
         ],
         ProjectStack::Rust => vec![
             (
                 "grove-cargo-registry".into(),
-                "/home/vscode/.cargo/registry".into(),
+                format!("/home/{}/.cargo/registry", user),
             ),
             (
                 format!("grove-rust-target-{}", safe),
@@ -332,16 +340,19 @@ pub fn cache_volumes(stack: ProjectStack, repo_name: &str) -> Vec<(String, Strin
         ],
         ProjectStack::Node => vec![(
             format!("grove-node-cache-{}", safe),
-            "/home/vscode/.local/share/pnpm/store".into(),
+            format!("/home/{}/.local/share/pnpm/store", user),
         )],
         ProjectStack::Go => vec![
-            ("grove-go-mod".into(), "/home/vscode/go/pkg/mod".into()),
+            ("grove-go-mod".into(), format!("/home/{}/go/pkg/mod", user)),
             (
                 "grove-go-build".into(),
-                "/home/vscode/.cache/go-build".into(),
+                format!("/home/{}/.cache/go-build", user),
             ),
         ],
-        ProjectStack::DotNet => vec![("grove-nuget".into(), "/home/vscode/.nuget/packages".into())],
+        ProjectStack::DotNet => vec![(
+            "grove-nuget".into(),
+            format!("/home/{}/.nuget/packages", user),
+        )],
         ProjectStack::Unknown => vec![],
     }
 }
@@ -460,8 +471,20 @@ mod tests {
 
     #[test]
     fn cache_volumes_for_rust_include_target_dir() {
-        let vols = cache_volumes(ProjectStack::Rust, "demo");
+        let vols = cache_volumes(ProjectStack::Rust, "demo", "vscode");
         assert!(vols.iter().any(|(_, t)| t == "/workspaces/demo/target"));
         assert!(vols.iter().any(|(s, _)| s == "grove-cargo-registry"));
+        assert!(vols
+            .iter()
+            .any(|(_, t)| t == "/home/vscode/.cargo/registry"));
+    }
+
+    #[test]
+    fn cache_volumes_route_to_supplied_user() {
+        // Python stack — easy to inspect since both volumes are home-relative.
+        let vols = cache_volumes(ProjectStack::Python, "demo", "ftuser");
+        assert!(vols.iter().any(|(_, t)| t == "/home/ftuser/.cache/uv"));
+        assert!(vols.iter().any(|(_, t)| t == "/home/ftuser/.cache/pip"));
+        assert!(!vols.iter().any(|(_, t)| t.contains("/home/vscode/")));
     }
 }
