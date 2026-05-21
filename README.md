@@ -56,6 +56,25 @@ The binary lands at `~/.cargo/bin/grove`.
 - Docker + the [Dev Containers CLI](https://github.com/devcontainers/cli) (`npm i -g @devcontainers/cli`)
 - `tmux`
 - `jq`
+- git ≥ 2.46 on the host (Ubuntu 22.04 default is 2.34 — upgrade via `ppa:git-core/ppa`). Container git is auto-installed via the `ghcr.io/devcontainers/features/git:1` feature grove pins at init time.
+
+#### One-time: accept `--dangerously-skip-permissions` on the host
+
+**Do this BEFORE your first `grove spawn` / `grove integrate`.** Otherwise every spawned agent will hang on the in-container claude prompt asking you to acknowledge `--dangerously-skip-permissions` — and the agent has no human to acknowledge it, so the bootstrap turn freezes.
+
+```bash
+# Run claude once with the flag, accept the warning when prompted, then exit.
+claude --dangerously-skip-permissions
+# (type "I understand" / Y / whatever the prompt asks)
+# (Ctrl-C or /exit to leave)
+
+# Verify the accept state landed:
+grep -i 'bypass\|danger\|accept' ~/.claude.json
+```
+
+Once the accept flag is in your host's `~/.claude.json`, grove's baseline mount of that file (RO) carries the state into every devcontainer. The acknowledgement is now skipped for every spawn.
+
+> **Why:** `claude --dangerously-skip-permissions` shows a one-time interactive acknowledgement before granting the agent unrestricted shell + file access. The acceptance persists in `~/.claude.json`. Grove agents run inside the devcontainer with that mount RO from the host, so the host's accept state is what counts. Without it, the first prompt sits forever and the Stop hook never sees an assistant turn complete.
 
 Worktree primitives (`add`, `go`, `list`, `remove`, `prune`, `sync`, `pr`) work without
 any of these.
