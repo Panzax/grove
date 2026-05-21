@@ -1,8 +1,20 @@
-// `grove integrate` — merge every agent/* branch into a disposable
-// integration branch, with a headless Claude conflict resolver fed by bus +
-// per-agent STATE.md context.
+// `grove integrate` — bring up an integration worktree + branch, snapshot
+// dependency context, and spawn a Ralph-loop integration agent inside the
+// devcontainer. The agent owns the merge loop.
 //
-// Implementation port of `agent.sh cmd_integrate`.
+// Compared to v1 (which ran the merge loop in Rust and shelled out
+// `claude -p` per conflict, sometimes on the HOST), v2:
+//
+//   - Hard-requires the devcontainer. No host fallback. The resolver
+//     (now an autonomous Ralph-loop agent) only ever runs sandboxed.
+//   - Generates a dependency hint (branches.json + overlap.txt) so the
+//     agent can make an informed merge-ordering decision.
+//   - Spawns the agent with an integrate-specific bootstrap prompt that
+//     dictates the conflict-resolution + PR-creation protocol.
+//   - Exits after spawn; operator monitors via `grove attach integrate-<ts>`.
+//
+// The orchestrator's responsibilities are: worktree setup, branch creation,
+// context snapshot (RO), agent state seed, agent spawn. Nothing more.
 
 use std::path::Path;
 use std::process::Command;
@@ -10,7 +22,15 @@ use std::process::Command;
 use chrono::Utc;
 use colored::Colorize;
 
+use crate::agent::integrate_deps::{
+    compute_branch_metadata, pairwise_overlap, read_verify_command, resolve_base_sha,
+    IntegrationContext,
+};
+use crate::agent::integrate_seed::{build_integrate_bootstrap_prompt, seed_integrate_agent};
+use crate::agent::seed;
+use crate::commands::spawn::{launch_agent_in_container, LaunchContext};
 use crate::git::worktree_manager::{add_worktree, discover_repo, get_default_branch, project_root};
+use crate::git::worktree_paths::make_worktree_pointers_relative;
 use crate::models::GroveConfig;
 use crate::session::container::{self, ContainerInfo};
 
@@ -22,8 +42,9 @@ pub fn run(into: Option<&str>, no_test: bool) {
             std::process::exit(1);
         }
     };
-    let project = project_root(&ctx).to_path_buf();
+    let project_root_path = project_root(&ctx).to_path_buf();
 
+    // Resolve target branch (PR base).
     let base = match into
         .map(|s| s.to_string())
         .or_else(|| get_default_branch(&ctx).ok())
@@ -38,25 +59,49 @@ pub fn run(into: Option<&str>, no_test: bool) {
         }
     };
 
+    // List branches BEFORE creating the integration worktree so the agent
+    // never tries to merge itself.
+    let agent_branches = list_agent_branches(&project_root_path).unwrap_or_default();
+    if agent_branches.is_empty() {
+        println!(
+            "{} no agent/* branches found; nothing to integrate",
+            "Note:".yellow()
+        );
+        return;
+    }
+
     let stamp = Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
     let integration_branch = format!("integration/{}", stamp);
-    let integration_path = project.join("worktrees").join(".integration");
+    let agent_name = format!("integrate-{}", stamp);
+    let integration_path = project_root_path.join("worktrees").join(".integration");
     if let Err(e) = std::fs::create_dir_all(integration_path.parent().unwrap()) {
         eprintln!("{} create worktrees/: {}", "Error:".red(), e);
         std::process::exit(1);
     }
     if integration_path.exists() {
         eprintln!(
-            "{} {} already exists; remove it first (it is meant to be transient)",
+            "{} {} already exists; remove it first (transient by design)",
             "Error:".red(),
+            integration_path.display()
+        );
+        eprintln!(
+            "  hint: `git worktree remove {} && git branch -D <previous-integration-branch>`",
             integration_path.display()
         );
         std::process::exit(1);
     }
     let integration_str = integration_path.to_string_lossy().to_string();
-    // Branch the integration off `base` explicitly so the merges produce a clean
-    // history relative to the user's base branch.
-    if let Err(e) = git_in(&project, &["branch", &integration_branch, &base]) {
+
+    // Container is mandatory. Resolver is an agent. Agents only run sandboxed.
+    let container = ensure_container_up(&project_root_path);
+    println!(
+        "  {} devcontainer ready (workspace_target {})",
+        "·".dimmed(),
+        container.workspace_target.display()
+    );
+
+    // Branch the integration off `base`, then add the worktree on it.
+    if let Err(e) = git_in(&project_root_path, &["branch", &integration_branch, &base]) {
         eprintln!(
             "{} could not create integration branch off {}: {}",
             "Error:".red(),
@@ -66,8 +111,8 @@ pub fn run(into: Option<&str>, no_test: bool) {
         std::process::exit(1);
     }
     if let Err(e) = add_worktree(&ctx, &integration_str, &integration_branch, false, None) {
-        // Roll back the freshly-created branch so we don't strand a dangling ref.
-        let _ = git_in(&project, &["branch", "-D", &integration_branch]);
+        // Roll back the freshly-created branch ref.
+        let _ = git_in(&project_root_path, &["branch", "-D", &integration_branch]);
         eprintln!(
             "{} create integration worktree on branch {}: {}",
             "Error:".red(),
@@ -76,10 +121,30 @@ pub fn run(into: Option<&str>, no_test: bool) {
         );
         std::process::exit(1);
     }
+    println!(
+        "  {} integration worktree at {} on {}",
+        "·".dimmed(),
+        integration_path.display(),
+        integration_branch.bold()
+    );
 
-    // Snapshot bus + per-agent STATE.md BEFORE we start merging, so the
-    // conflict resolver always sees the pre-integration intent.
-    if let Err(e) = snapshot_context(&project, &integration_path) {
+    // Relativize the worktree's .git pointers (same reason as spawn: container
+    // bind-mount path differs from host path).
+    if let Err(e) = make_worktree_pointers_relative(&integration_path) {
+        eprintln!(
+            "  {} rewrite worktree pointers to relative: {}",
+            "Warning:".yellow(),
+            e
+        );
+    }
+
+    // Symlink .grove into the worktree so Stop hook + framework docs resolve.
+    if let Err(e) = seed::link_grove_into_worktree(&integration_path, &project_root_path) {
+        eprintln!("  {} link .grove into worktree: {}", "Warning:".yellow(), e);
+    }
+
+    // Snapshot context (existing helper, RO chmod).
+    if let Err(e) = snapshot_context(&project_root_path, &integration_path) {
         eprintln!(
             "{} snapshot bus/STATE: {} (continuing without context)",
             "Warning:".yellow(),
@@ -93,97 +158,124 @@ pub fn run(into: Option<&str>, no_test: bool) {
         );
     }
 
-    // Reset base, then merge each agent branch.
-    let agent_branches = list_agent_branches(&project).unwrap_or_default();
-    if agent_branches.is_empty() {
-        println!(
-            "{} no agent/* branches found; nothing to integrate",
-            "Note:".yellow()
-        );
-        return;
-    }
-
-    let config = read_config(&project);
+    // Build branches.json + overlap.txt.
+    let base_sha = resolve_base_sha(&project_root_path, &base).unwrap_or_default();
     let verify_cmd = if no_test {
-        None
+        Vec::new()
     } else {
-        first_verify_command(&config)
+        read_verify_command(&project_root_path)
+    };
+    let branches = match compute_branch_metadata(&project_root_path, &agent_branches, &base) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!(
+                "{} compute branch metadata: {} (continuing with names only)",
+                "Warning:".yellow(),
+                e
+            );
+            agent_branches
+                .iter()
+                .map(|name| crate::agent::integrate_deps::BranchMeta {
+                    name: name.clone(),
+                    head_sha: String::new(),
+                    files_changed: Vec::new(),
+                    commit_count: 0,
+                    tip_log: Vec::new(),
+                })
+                .collect()
+        }
+    };
+    let integration_ctx = IntegrationContext {
+        base: base.clone(),
+        base_sha,
+        integration_branch: integration_branch.clone(),
+        verify_cmd: verify_cmd.clone(),
+        no_test,
+        branches,
     };
 
-    // Adopt the project's devcontainer if it's already up. Resolver + verify
-    // route through `devcontainer exec` so the agent that resolves conflicts
-    // sees the same toolchain + environment as the spawning agents did.
-    // Note: we don't auto-`up` here — integrate operates on existing work;
-    // operator should have a container up already from prior `grove spawn`.
-    let container = resolve_container_for_integrate(&project);
-    if let Some(info) = &container {
-        println!(
-            "  {} routing resolver + verify through devcontainer ({})",
-            "·".dimmed(),
-            info.workspace_target.display()
+    let context_dir = integration_path.join(".grove-context");
+    let _ = std::fs::create_dir_all(&context_dir);
+    let json = integration_ctx.to_json().unwrap_or_default();
+    if let Err(e) = std::fs::write(context_dir.join("branches.json"), json) {
+        eprintln!(
+            "  {} write branches.json: {} (agent will not have machine context)",
+            "Warning:".yellow(),
+            e
         );
     }
-
-    let mut merged = Vec::new();
-    let mut failed = Vec::new();
-    for branch in &agent_branches {
-        println!();
-        println!("{} merging {}", "▶".cyan(), branch.bold());
-        match git_in(
-            &integration_path,
-            &["merge", "--no-ff", "--no-edit", branch],
-        ) {
-            Ok(_) => {
-                println!("  {} merge clean", "✓".green());
-                if let Some(cmd) = &verify_cmd {
-                    if !run_verify(&integration_path, cmd, container.as_ref()) {
-                        failed.push((branch.clone(), "verify failed".to_string()));
-                        continue;
-                    }
-                }
-                merged.push(branch.clone());
-            }
-            Err(e) => {
-                eprintln!("  {} merge produced conflicts: {}", "!".yellow(), e);
-                match resolve_conflicts(&integration_path, container.as_ref()) {
-                    Ok(()) => {
-                        println!("  {} conflicts resolved", "✓".green());
-                        if let Some(cmd) = &verify_cmd {
-                            if !run_verify(&integration_path, cmd, container.as_ref()) {
-                                failed.push((branch.clone(), "verify failed".to_string()));
-                                continue;
-                            }
-                        }
-                        merged.push(branch.clone());
-                    }
-                    Err(re) => {
-                        eprintln!("  {} {}", "Error:".red(), re);
-                        // Try to abort the in-progress merge so the integration branch
-                        // stays in a clean state.
-                        let _ = git_in(&integration_path, &["merge", "--abort"]);
-                        failed.push((branch.clone(), re));
-                    }
-                }
-            }
-        }
+    let overlap = pairwise_overlap(&integration_ctx.branches);
+    if let Err(e) = std::fs::write(context_dir.join("overlap.txt"), overlap) {
+        eprintln!(
+            "  {} write overlap.txt: {} (agent will not have overlap hint)",
+            "Warning:".yellow(),
+            e
+        );
     }
-
-    println!();
+    // Chmod the new files RO to match the rest of the context tree.
+    let _ = make_context_readonly(&context_dir);
     println!(
-        "{} integration branch: {}",
-        "✓".green(),
-        integration_branch.bold()
+        "  {} wrote branches.json + overlap.txt ({} branches)",
+        "·".dimmed(),
+        integration_ctx.branches.len()
     );
-    println!("  worktree: {}", integration_path.display());
-    println!("  merged   : {}", merged.len());
-    println!("  failed   : {}", failed.len());
-    for (b, why) in &failed {
-        println!("    - {} ({})", b, why);
-    }
+
+    // Seed the integrate-agent state.
+    let agent_dir = match seed_integrate_agent(&project_root_path, &agent_name, &integration_ctx) {
+        Ok(p) => {
+            println!("  {} seeded {}", "·".dimmed(), p.display());
+            p
+        }
+        Err(e) => {
+            eprintln!(
+                "{} seed integrate agent: {} (worktree still in place; remove with `git worktree remove`)",
+                "Error:".red(),
+                e
+            );
+            std::process::exit(1);
+        }
+    };
+
+    // Build the bootstrap prompt with container-side paths.
+    let container_worktree_path = container::host_to_container_path(&container, &integration_path)
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_else(|_| integration_path.to_string_lossy().to_string());
+    let container_agent_dir = container::host_to_container_path(&container, &agent_dir)
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_else(|_| agent_dir.to_string_lossy().to_string());
+    let repo_name = project_root_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("workspace");
+    let bootstrap_prompt = build_integrate_bootstrap_prompt(
+        &agent_name,
+        repo_name,
+        &container_worktree_path,
+        &container_agent_dir,
+        &integration_branch,
+        &base,
+    );
+
+    // Hand off to the spawn machinery.
+    launch_agent_in_container(&LaunchContext {
+        agent_name: &agent_name,
+        worktree_path: &integration_path,
+        agent_dir: &agent_dir,
+        container: &container,
+        bootstrap_prompt: Some(&bootstrap_prompt),
+        display_branch: &integration_branch,
+        verb_past: "Started",
+    });
+
     println!();
     println!(
         "{}",
-        "Review and (if happy) merge integration/<ts> into the base branch yourself.".dimmed()
+        "The agent will now read context, plan a merge order, merge each branch, run verify, and open a PR."
+            .dimmed()
+    );
+    println!(
+        "{}",
+        "Monitor: `grove agents status <name>` or `grove attach <name>`.".dimmed()
     );
 }
 
@@ -194,7 +286,6 @@ fn snapshot_context(project: &Path, integration: &Path) -> Result<(), String> {
     let bus_dst = target.join("bus");
     if bus_src.exists() {
         copy_dir(&bus_src, &bus_dst)?;
-        make_readonly(&bus_dst)?;
     }
     let agents_src = project.join(".grove").join("agents");
     let agents_dst = target.join("agents");
@@ -204,6 +295,14 @@ fn snapshot_context(project: &Path, integration: &Path) -> Result<(), String> {
         for entry in std::fs::read_dir(&agents_src).map_err(|e| e.to_string())? {
             let entry = entry.map_err(|e| e.to_string())?;
             let name = entry.file_name();
+            // Skip the orchestrator's own future agent (won't exist yet) and
+            // any other integrate-* agent dirs to keep the snapshot focused
+            // on the agent branches being merged.
+            if let Some(s) = name.to_str() {
+                if s.starts_with("integrate-") {
+                    continue;
+                }
+            }
             let state_src = entry.path().join("STATE.md");
             if !state_src.exists() {
                 continue;
@@ -213,9 +312,14 @@ fn snapshot_context(project: &Path, integration: &Path) -> Result<(), String> {
             let dst = dst_dir.join("STATE.md");
             std::fs::copy(&state_src, &dst).map_err(|e| e.to_string())?;
         }
-        make_readonly(&agents_dst)?;
     }
     Ok(())
+}
+
+/// chmod the context tree RO so the agent can read but not mutate. Called
+/// after branches.json + overlap.txt are written so they also get locked.
+fn make_context_readonly(context_dir: &Path) -> Result<(), String> {
+    make_readonly(context_dir)
 }
 
 fn copy_dir(src: &Path, dst: &Path) -> Result<(), String> {
@@ -237,8 +341,6 @@ fn copy_dir(src: &Path, dst: &Path) -> Result<(), String> {
 fn make_readonly(path: &Path) -> Result<(), String> {
     use std::os::unix::fs::PermissionsExt;
     fn walk(p: &Path) -> Result<(), String> {
-        // Files first (so the dir is still writable while we touch its children),
-        // then strip write on the dir itself.
         for entry in std::fs::read_dir(p).map_err(|e| e.to_string())? {
             let entry = entry.map_err(|e| e.to_string())?;
             let pth = entry.path();
@@ -252,8 +354,6 @@ fn make_readonly(path: &Path) -> Result<(), String> {
                 std::fs::set_permissions(&pth, perms).map_err(|e| e.to_string())?;
             }
         }
-        // Dir: r-x for owner/group/other so descent works but new entries can't be
-        // created. The resolver gets a truly immutable context snapshot.
         let mut perms = std::fs::metadata(p)
             .map_err(|e| e.to_string())?
             .permissions();
@@ -270,8 +370,6 @@ fn make_readonly(_path: &Path) -> Result<(), String> {
 }
 
 fn list_agent_branches(project: &Path) -> Result<Vec<String>, String> {
-    // We want branches named exactly `agent/*` (but NOT `agent/shared`, which is
-    // the hub branch — its content gets in via the regular merges anyway).
     let out = Command::new("git")
         .current_dir(project)
         .args(["branch", "--list", "--format=%(refname:short)", "agent/*"])
@@ -290,214 +388,25 @@ fn list_agent_branches(project: &Path) -> Result<Vec<String>, String> {
     Ok(branches)
 }
 
+fn ensure_container_up(project_root: &Path) -> ContainerInfo {
+    // Read the config first so we can fall back to it for workspace_target
+    // when the CLI doesn't tell us.
+    let _ = read_config(project_root); // ensure path exists; result currently unused
+    match container::ensure_up(project_root) {
+        Ok(info) => info,
+        Err(e) => {
+            eprintln!("{} `devcontainer up` failed: {}", "Error:".red(), e);
+            eprintln!("  grove integrate requires a working devcontainer (the integration agent runs sandboxed).");
+            eprintln!("  Install the devcontainer CLI (`npm i -g @devcontainers/cli`) and Docker, then retry.");
+            std::process::exit(1);
+        }
+    }
+}
+
 fn read_config(project: &Path) -> GroveConfig {
     let path = project.join(".grove").join("config.toml");
     let raw = std::fs::read_to_string(&path).unwrap_or_default();
     toml::from_str(&raw).unwrap_or_default()
-}
-
-fn first_verify_command(config: &GroveConfig) -> Option<Vec<String>> {
-    if !config.verify.test.is_empty() {
-        Some(config.verify.test.clone())
-    } else {
-        None
-    }
-}
-
-fn run_verify(integration: &Path, cmd: &[String], container: Option<&ContainerInfo>) -> bool {
-    if cmd.is_empty() {
-        return true;
-    }
-    println!("  {} verify: {}", "·".dimmed(), cmd.join(" ").bold());
-    let status = match container {
-        None => {
-            let mut iter = cmd.iter();
-            let program = iter.next().unwrap();
-            let args: Vec<&String> = iter.collect();
-            Command::new(program)
-                .args(args.iter().map(|s| s.as_str()))
-                .current_dir(integration)
-                .status()
-                .map_err(|e| e.to_string())
-        }
-        Some(info) => {
-            // Translate the integration worktree path into the container, then
-            // cd into it before running the verify command.
-            let target = match container::host_to_container_path(info, integration) {
-                Ok(p) => p,
-                Err(e) => {
-                    eprintln!("  {} verify path translation: {}", "!".yellow(), e);
-                    return false;
-                }
-            };
-            let mut argv: Vec<&str> = vec!["sh", "-c"];
-            let joined = format!(
-                "cd {} && {}",
-                target.display(),
-                cmd.iter()
-                    .map(|s| shell_escape(s))
-                    .collect::<Vec<_>>()
-                    .join(" ")
-            );
-            argv.push(&joined);
-            container::exec_streaming(info, &argv).map_err(|e| e.to_string())
-        }
-    };
-    match status {
-        Ok(s) if s.success() => {
-            println!("  {} verify passed", "✓".green());
-            true
-        }
-        Ok(s) => {
-            eprintln!(
-                "  {} verify failed (exit {})",
-                "!".yellow(),
-                s.code().unwrap_or(-1)
-            );
-            false
-        }
-        Err(e) => {
-            eprintln!("  {} verify could not run: {}", "!".yellow(), e);
-            false
-        }
-    }
-}
-
-/// Minimal POSIX shell escaping for command tokens passed via `sh -c`.
-fn shell_escape(s: &str) -> String {
-    if s.chars()
-        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '/' | '.' | '-' | '_' | '='))
-    {
-        s.to_string()
-    } else {
-        format!("'{}'", s.replace('\'', "'\\''"))
-    }
-}
-
-/// Try to resolve conflicts with the headless Claude resolver. Honors
-/// GROVE_RESOLVE_COMMAND for tests / alternative providers; defaults to
-/// `claude -p` with a context-aware prompt. When the project has a running
-/// devcontainer, the resolver runs INSIDE it via `devcontainer exec` so the
-/// agent sees the same env + tools the spawning agents had.
-fn resolve_conflicts(integration: &Path, container: Option<&ContainerInfo>) -> Result<(), String> {
-    let conflicted =
-        git_in(integration, &["diff", "--name-only", "--diff-filter=U"]).unwrap_or_default();
-    if conflicted.trim().is_empty() {
-        return Ok(());
-    }
-    let prompt = format!(
-        "There are git merge conflicts inside this worktree (paths below). \
-You have read-only access to .grove-context/{{bus,agents}}/ for intent context. \
-Resolve each conflict to match the merging branches' intent, then `git add` the \
-resolved files. Do NOT run `git commit` — the orchestrator will commit after \
-verification. Conflicted files:\n{}",
-        conflicted
-    );
-
-    let cmd_tokens = resolver_command_tokens();
-    println!(
-        "  {} resolving conflicts via {} {}",
-        "·".dimmed(),
-        cmd_tokens.join(" "),
-        if container.is_some() {
-            "[in container]".dimmed().to_string()
-        } else {
-            "[host]".dimmed().to_string()
-        }
-    );
-
-    let status = match container {
-        None => {
-            let mut iter = cmd_tokens.iter();
-            let program = iter.next().ok_or("resolver command empty")?;
-            let args: Vec<&String> = iter.collect();
-            Command::new(program)
-                .args(args.iter().map(|s| s.as_str()))
-                .arg(&prompt)
-                .current_dir(integration)
-                .status()
-                .map_err(|e| format!("invoke {}: {}", program, e))?
-        }
-        Some(info) => {
-            let target = container::host_to_container_path(info, integration)
-                .map_err(|e| format!("path translation: {}", e))?;
-            let joined = format!(
-                "cd {} && {} {}",
-                target.display(),
-                cmd_tokens
-                    .iter()
-                    .map(|s| shell_escape(s))
-                    .collect::<Vec<_>>()
-                    .join(" "),
-                shell_escape(&prompt)
-            );
-            let argv: Vec<&str> = vec!["sh", "-c", &joined];
-            container::exec_streaming(info, &argv)
-                .map_err(|e| format!("devcontainer exec resolver: {}", e))?
-        }
-    };
-    if !status.success() {
-        return Err(format!("resolver exited {}", status.code().unwrap_or(-1)));
-    }
-    // Verify the resolver actually staged the previously-conflicted files. If any
-    // path is still in the unmerged-paths set (`--diff-filter=U`), the resolver
-    // bailed without running `git add` — refuse to commit a half-resolved merge.
-    let still_unmerged =
-        git_in(integration, &["diff", "--name-only", "--diff-filter=U"]).unwrap_or_default();
-    if !still_unmerged.trim().is_empty() {
-        return Err(format!(
-            "resolver returned 0 but left unmerged paths:\n{}",
-            still_unmerged.trim()
-        ));
-    }
-    // Also ensure something is actually staged so we don't create an empty commit.
-    let staged = git_in(integration, &["diff", "--name-only", "--cached"]).unwrap_or_default();
-    if staged.trim().is_empty() {
-        return Err("resolver returned 0 with no staged changes; nothing to commit".to_string());
-    }
-    // Commit the resolved state to close out the merge.
-    git_in(integration, &["commit", "--no-edit"])?;
-    Ok(())
-}
-
-/// Resolve a ContainerInfo if the project's devcontainer is currently up.
-/// Does NOT bring the container up — integrate expects the operator to have
-/// spawned at least one agent already, so the container should be running.
-fn resolve_container_for_integrate(project_root: &Path) -> Option<ContainerInfo> {
-    if !container::is_up(project_root) {
-        return None;
-    }
-    let cfg_path = project_root.join(".grove").join("config.toml");
-    let raw = std::fs::read_to_string(&cfg_path).ok()?;
-    let cfg: GroveConfig = toml::from_str(&raw).ok()?;
-    let workspace_target = cfg.devcontainer.workspace_target.unwrap_or_else(|| {
-        format!(
-            "/workspaces/{}",
-            project_root
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("workspace")
-        )
-    });
-    Some(ContainerInfo::new(
-        project_root.to_path_buf(),
-        std::path::PathBuf::from(workspace_target),
-        cfg.devcontainer.remote_user,
-    ))
-}
-
-fn resolver_command_tokens() -> Vec<String> {
-    if let Ok(raw) = std::env::var("GROVE_RESOLVE_COMMAND") {
-        let tokens: Vec<String> = raw.split_whitespace().map(|s| s.to_string()).collect();
-        if !tokens.is_empty() {
-            return tokens;
-        }
-    }
-    vec![
-        "claude".into(),
-        "-p".into(),
-        "--dangerously-skip-permissions".into(),
-    ]
 }
 
 fn git_in(dir: &Path, args: &[&str]) -> Result<String, String> {

@@ -12,6 +12,7 @@
 pub mod bootstrap;
 pub mod hook;
 pub mod integrate_deps;
+pub mod integrate_seed;
 pub mod loop_md;
 pub mod seed;
 pub mod setup;
