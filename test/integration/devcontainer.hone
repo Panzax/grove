@@ -50,6 +50,42 @@ ASSERT read-mounts.stdout contains "/.claude/settings.json"
 ASSERT read-mounts.stdout contains "readonly"
 RUN cleanup: rm -rf $TEST_DIR
 
+TEST "grove init binds host tmux.conf when present (legacy path)"
+
+ENV TEST_DIR=/tmp/grove-init-tmux-legacy
+ENV FAKE_HOME=/tmp/grove-init-tmux-home-legacy
+RUN setup: rm -rf $TEST_DIR $FAKE_HOME && mkdir -p $TEST_DIR $FAKE_HOME && echo 'set -g status off' > $FAKE_HOME/.tmux.conf && cd $TEST_DIR && git init -q && git -c user.email=t@t -c user.name=t commit --allow-empty -q -m init
+RUN init: cd $TEST_DIR && HOME=$FAKE_HOME grove init --no-agent
+ASSERT init.exit_code == 0
+ASSERT init.stdout contains "bound host tmux conf"
+RUN read-mounts: cat $TEST_DIR/.devcontainer/devcontainer.json
+ASSERT read-mounts.stdout contains "${localEnv:HOME}/.tmux.conf"
+ASSERT read-mounts.stdout contains "target=/home/vscode/.tmux.conf"
+RUN cleanup: rm -rf $TEST_DIR $FAKE_HOME
+
+TEST "grove init binds host tmux.conf when present (XDG path)"
+
+ENV TEST_DIR=/tmp/grove-init-tmux-xdg
+ENV FAKE_HOME=/tmp/grove-init-tmux-home-xdg
+RUN setup: rm -rf $TEST_DIR $FAKE_HOME && mkdir -p $TEST_DIR $FAKE_HOME/.config/tmux && echo 'set -g status off' > $FAKE_HOME/.config/tmux/tmux.conf && cd $TEST_DIR && git init -q && git -c user.email=t@t -c user.name=t commit --allow-empty -q -m init
+RUN init: cd $TEST_DIR && HOME=$FAKE_HOME grove init --no-agent
+ASSERT init.exit_code == 0
+RUN read-mounts: cat $TEST_DIR/.devcontainer/devcontainer.json
+ASSERT read-mounts.stdout contains "${localEnv:HOME}/.config/tmux/tmux.conf"
+ASSERT read-mounts.stdout contains "target=/home/vscode/.tmux.conf"
+RUN cleanup: rm -rf $TEST_DIR $FAKE_HOME
+
+TEST "grove init skips tmux mount when host has no conf"
+
+ENV TEST_DIR=/tmp/grove-init-tmux-none
+ENV FAKE_HOME=/tmp/grove-init-tmux-home-none
+RUN setup: rm -rf $TEST_DIR $FAKE_HOME && mkdir -p $TEST_DIR $FAKE_HOME && cd $TEST_DIR && git init -q && git -c user.email=t@t -c user.name=t commit --allow-empty -q -m init
+RUN init: cd $TEST_DIR && HOME=$FAKE_HOME grove init --no-agent
+ASSERT init.exit_code == 0
+RUN read-mounts: cat $TEST_DIR/.devcontainer/devcontainer.json
+ASSERT read-mounts.stdout not contains "/.tmux.conf"
+RUN cleanup: rm -rf $TEST_DIR $FAKE_HOME
+
 TEST "grove devcontainer doctor outside a grove repo errors cleanly"
 
 ENV TEST_DIR=/tmp/grove-devcontainer-doctor-no-repo
@@ -127,3 +163,56 @@ ASSERT stdout contains "list"
 ASSERT stdout contains "status"
 ASSERT stdout contains "kill"
 ASSERT stdout contains "purge"
+ASSERT stdout contains "repair-pointers"
+
+TEST "grove agents repair-pointers outside a grove repo errors cleanly"
+
+ENV TEST_DIR=/tmp/grove-agents-repair-no-repo
+RUN setup: rm -rf $TEST_DIR && mkdir -p $TEST_DIR
+RUN repair: cd $TEST_DIR && grove agents repair-pointers
+ASSERT repair.exit_code != 0
+ASSERT repair.stderr contains "Not in a grove repository"
+RUN cleanup: rm -rf $TEST_DIR
+
+TEST "grove agents repair-pointers with no agents is a clean no-op"
+
+ENV TEST_DIR=/tmp/grove-agents-repair-empty
+RUN setup: rm -rf $TEST_DIR && mkdir -p $TEST_DIR && cd $TEST_DIR && git init -q && git -c user.email=t@t -c user.name=t commit --allow-empty -q -m init && grove init --no-agent
+RUN repair: cd $TEST_DIR && grove agents repair-pointers
+ASSERT repair.exit_code == 0
+ASSERT repair.stdout contains "no agents found"
+RUN cleanup: rm -rf $TEST_DIR
+
+TEST "grove attach --help surfaces the subcommand"
+
+RUN grove attach --help
+ASSERT exit_code == 0
+ASSERT stdout contains "Re-attach"
+ASSERT stdout contains "tmux session"
+
+TEST "grove attach outside a grove repo errors cleanly"
+
+ENV TEST_DIR=/tmp/grove-attach-no-repo
+RUN setup: rm -rf $TEST_DIR && mkdir -p $TEST_DIR
+RUN attach: cd $TEST_DIR && grove attach some-agent
+ASSERT attach.exit_code != 0
+ASSERT attach.stderr contains "Not in a grove repository"
+RUN cleanup: rm -rf $TEST_DIR
+
+TEST "grove spawn --help advertises --no-bootstrap"
+
+RUN grove spawn --help
+ASSERT exit_code == 0
+ASSERT stdout contains "--no-bootstrap"
+ASSERT stdout contains "bootstrap prompt"
+
+TEST "grove attach errors when devcontainer is down"
+
+ENV TEST_DIR=/tmp/grove-attach-down
+RUN setup: rm -rf $TEST_DIR && mkdir -p $TEST_DIR && cd $TEST_DIR && git init -q && git -c user.email=t@t -c user.name=t commit --allow-empty -q -m init && grove init --no-agent
+ENV GROVE_DEVCONTAINER_COMMAND=/usr/bin/false
+RUN attach: cd $TEST_DIR && grove attach some-agent
+ASSERT attach.exit_code != 0
+ASSERT attach.stderr contains "devcontainer is not running"
+ASSERT attach.stderr contains "grove devcontainer up"
+RUN cleanup: rm -rf $TEST_DIR

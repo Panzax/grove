@@ -185,6 +185,24 @@ pub fn doctor() {
         }
     }
 
+    // Informational: host tmux config bind mount. Not a prereq, no exit
+    // code impact — but useful to know whether the in-container tmux is
+    // running with the user's keybinds or stock defaults.
+    let has_tmux_conf = file_readable_in_container(&info, "/home/vscode/.tmux.conf");
+    if has_tmux_conf {
+        println!(
+            "  {} {} mounted at /home/vscode/.tmux.conf (in-container tmux inherits host config)",
+            "·".dimmed(),
+            "tmux.conf".bold()
+        );
+    } else {
+        println!(
+            "  {} {} not mounted (stock tmux defaults — see grove init's tmux conf detection)",
+            "·".dimmed(),
+            "tmux.conf".bold()
+        );
+    }
+
     if missing.is_empty() {
         println!();
         println!("{} all grove prereqs are installed", "✓".green());
@@ -209,6 +227,14 @@ pub fn doctor() {
 fn is_tool_in_container(info: &ContainerInfo, tool: &str) -> bool {
     // `command -v <tool>` exits 0 if the tool is on PATH inside the container.
     let script = format!("command -v {} >/dev/null 2>&1", tool);
+    let argv: Vec<&str> = vec!["sh", "-c", &script];
+    container::exec(info, &argv)
+        .map(|out| out.status.success())
+        .unwrap_or(false)
+}
+
+fn file_readable_in_container(info: &ContainerInfo, path: &str) -> bool {
+    let script = format!("test -r {}", path);
     let argv: Vec<&str> = vec!["sh", "-c", &script];
     container::exec(info, &argv)
         .map(|out| out.status.success())

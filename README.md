@@ -91,6 +91,12 @@ in-container claude can authenticate and the Stop hook engages. `grove
 spawn` hard-fails if it can't bring up a devcontainer; if your project
 doesn't need agentic spawning, you don't need grove.
 
+If a host tmux config is present (`~/.config/tmux/tmux.conf` or
+`~/.tmux.conf`), Phase 1 also adds a RO bind mount so the in-container
+tmux inherits your keybinds, theme, and status line. Skipped silently
+when neither exists. `grove devcontainer doctor` reports whether the
+mount is live.
+
 In both modes:
 
 1. **Phase 1 (deterministic)**: detect stack (Python/Rust/Node/Go/.NET), scaffold
@@ -145,11 +151,36 @@ from the worktree's cwd, brings the devcontainer up (idempotent), and launches a
 tmux session **inside the container** with `claude` and `GROVE_AGENT_DIR`
 exported. Per-spawn flags:
 
-- `--task "<text>"` seeds STATE.md with one initial workitem.
+- `--task "<text>"` seeds STATE.md with one initial workitem AND switches the
+  injected bootstrap prompt into "self-init" mode (see below).
 - `--promise "<text>"` sets the `<promise>X</promise>` completion contract.
 - `--max-iter N` caps the loop (default 30; 0 = unlimited).
 - `--branch <existing>` attaches the worktree to an existing branch instead of
   creating `agent/<name>`. Refuses if the branch is already checked out elsewhere.
+- `--no-bootstrap` skips the bootstrap-prompt injection (advanced — claude
+  launches with an empty turn instead of a grove-aware first prompt).
+
+##### Bootstrap prompt (injected as claude's first turn)
+
+`grove spawn` appends a bootstrap prompt as the final argv token to
+`claude --dangerously-skip-permissions`, so the agent's first turn already
+explains where it is and what to do:
+
+- **Orientation** (always): tells the agent its name, repo, worktree cwd,
+  `$GROVE_AGENT_DIR`, and points at `.grove/{RALPH-LOOP.md, PROTOCOL.md,
+  SHARED.md}` + the three editable files (`PROMPT.md`, `STATE.md`,
+  `loop.md`).
+- **Fresh + `--task`**: instructs the agent to use the plan workflow to
+  decompose the task into 3–10 verifiable workitems, write them into
+  STATE.md, tune PROMPT.md, set `loop.md.completion_promise` + `active:
+  true`, then stop. The Stop hook then re-injects PROMPT.md as turn 2 and
+  the loop begins. Agents bootstrap their own loop with zero hand-holding.
+- **Fresh + no task**: tells the agent the user will define PROMPT/STATE.
+- **Resume**: short "you're resuming — read loop.md + STATE.md, don't redo
+  bootstrap" note.
+
+Templates live in `assets/AGENT_BOOTSTRAP*.md`. Edit if you want to change
+the project-wide bootstrap content.
 
 ##### How spawn finds the agent across host/container
 
@@ -215,11 +246,29 @@ grove loop --agent feat-auth
 #### Manage running agents
 
 ```bash
-grove agents list                # one line per agent
+grove agents list                       # one line per agent
 grove agents status feat-auth
-grove agents kill feat-auth      # stop the tmux session; loop.md flipped active:false
-grove agents purge feat-auth     # delete .grove/agents/<name>/ entirely (so next spawn starts FRESH instead of resuming). Worktree NOT removed — use `grove remove`.
+grove agents kill feat-auth             # stop the tmux session; loop.md flipped active:false
+grove agents purge feat-auth            # delete .grove/agents/<name>/ entirely (so next spawn starts FRESH instead of resuming). Worktree NOT removed — use `grove remove`.
+grove agents repair-pointers            # rewrite every worktree's .git pointer files to relative paths
+grove agents repair-pointers feat-auth  # ...or just one
 ```
+
+`repair-pointers` rewrites the worktree's `.git` forward pointer and the
+matching back-pointer (`<gitdir>/worktrees/<n>/gitdir`) from absolute → relative
+so they resolve identically on host and inside the devcontainer. Fresh `grove
+spawn` already does this — run `repair-pointers` to fix worktrees created by
+older grove versions.
+
+#### Attach to a running agent
+
+```bash
+grove attach feat-auth   # devcontainer exec ... -- tmux attach -t grove-feat-auth
+```
+
+Reattaches your terminal to the agent's tmux session inside the devcontainer.
+Detach with `Ctrl-b d` (default tmux prefix) and the agent keeps running.
+Errors cleanly if the container is down or the session doesn't exist.
 
 #### Resume semantics
 

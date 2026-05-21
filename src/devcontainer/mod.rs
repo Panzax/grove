@@ -214,6 +214,106 @@ pub fn read_head_or_empty(ctx: &RepoContext, file: &str) -> String {
     show_head_file(ctx, file).unwrap_or_default()
 }
 
+/// Probe the host filesystem for a tmux config file. Returns the
+/// `${localEnv:HOME}`-relative path so the bind mount survives
+/// `grove init`'s host-side write into devcontainer.json. We don't
+/// inline the absolute host path because devcontainer.json gets
+/// committed; users on different machines should still pick up their
+/// own conf at devcontainer-up time.
+///
+/// Lookup order matches tmux's own search order:
+///   1. `$HOME/.config/tmux/tmux.conf` (XDG)
+///   2. `$HOME/.tmux.conf`             (legacy)
+///
+/// `$TMUX_CONF` isn't honored: it points at an absolute path, which
+/// defeats the localEnv:HOME pattern; users with non-standard locations
+/// can edit devcontainer.json by hand.
+///
+/// Returns the `${localEnv:HOME}/...` source string, or None if no
+/// host config is present (init prints a skip note).
+pub fn detect_host_tmux_conf() -> Option<&'static str> {
+    let home = std::env::var("HOME").ok().filter(|s| !s.is_empty())?;
+    detect_host_tmux_conf_in(Path::new(&home))
+}
+
+/// Inner helper that takes the home directory as a parameter instead of
+/// reading the env. Tests use this directly so they don't have to mutate
+/// the global `HOME` env var (which races under parallel `cargo test`).
+fn detect_host_tmux_conf_in(home: &Path) -> Option<&'static str> {
+    let candidates: [(&str, &str); 2] = [
+        (
+            ".config/tmux/tmux.conf",
+            "${localEnv:HOME}/.config/tmux/tmux.conf",
+        ),
+        (".tmux.conf", "${localEnv:HOME}/.tmux.conf"),
+    ];
+    for (suffix, mount_source) in candidates {
+        if home.join(suffix).is_file() {
+            return Some(mount_source);
+        }
+    }
+    None
+}
+
+/// Append a RO bind mount for the host's tmux config to the project's
+/// devcontainer.json `mounts` array, so the in-container tmux inherits
+/// the host user's keybinds, theme, etc.
+///
+/// Container target is always `/home/vscode/.tmux.conf` (legacy path);
+/// tmux reads both legacy and XDG locations but the legacy form is
+/// honored by every tmux version we ship against.
+///
+/// Idempotent: skips if a mount already targets the legacy path.
+/// Returns Ok(true) if a mount was added, Ok(false) if no host conf was
+/// detected or the mount was already present.
+pub fn apply_baseline_tmux_mount(project_root: &Path) -> Result<bool, String> {
+    apply_baseline_tmux_mount_with(project_root, detect_host_tmux_conf())
+}
+
+/// Inner helper that accepts the pre-detected mount source. Tests call
+/// this directly so they don't have to set `HOME` (parallel-test race).
+fn apply_baseline_tmux_mount_with(
+    project_root: &Path,
+    mount_source: Option<&str>,
+) -> Result<bool, String> {
+    let Some(mount_source) = mount_source else {
+        return Ok(false);
+    };
+    let dev_path = project_root.join(".devcontainer").join("devcontainer.json");
+    if !dev_path.exists() {
+        return Ok(false);
+    }
+    let raw =
+        fs::read_to_string(&dev_path).map_err(|e| format!("read {}: {}", dev_path.display(), e))?;
+    let mut value: Value =
+        serde_json::from_str(&raw).map_err(|e| format!("parse {}: {}", dev_path.display(), e))?;
+    let obj = value
+        .as_object_mut()
+        .ok_or_else(|| "devcontainer.json top-level is not a JSON object".to_string())?;
+    let mounts = obj
+        .entry("mounts")
+        .or_insert_with(|| json!([]))
+        .as_array_mut()
+        .ok_or_else(|| "devcontainer.json `mounts` is not an array".to_string())?;
+    let target = "/home/vscode/.tmux.conf";
+    if mounts
+        .iter()
+        .filter_map(|v| v.as_str())
+        .any(|s| s.contains(&format!("target={}", target)))
+    {
+        return Ok(false);
+    }
+    let entry = format!(
+        "source={},target={},type=bind,readonly",
+        mount_source, target
+    );
+    mounts.push(Value::String(entry));
+    let body = serde_json::to_string_pretty(&value)
+        .map_err(|e| format!("serialize {}: {}", dev_path.display(), e))?;
+    fs::write(&dev_path, body).map_err(|e| format!("write {}: {}", dev_path.display(), e))?;
+    Ok(true)
+}
+
 /// Extract `(workspaceFolder, remoteUser)` from a parsed devcontainer.json.
 /// Used by `grove init` to populate `.grove/config.toml [devcontainer]
 /// workspace_target` + `remote_user` so the `container` module can translate
@@ -287,5 +387,112 @@ mod tests {
         };
         let skel = build_devcontainer_skeleton(&project);
         assert_eq!(skel["image"], ProjectStack::Unknown.default_image());
+    }
+
+    fn tmp_dir(label: &str) -> std::path::PathBuf {
+        let pid = std::process::id();
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let p = std::env::temp_dir().join(format!("grove-tmux-mount-{}-{}-{}", label, pid, nanos));
+        let _ = fs::remove_dir_all(&p);
+        fs::create_dir_all(&p).unwrap();
+        p
+    }
+
+    fn write_devcontainer(project_root: &std::path::Path) {
+        let dc_dir = project_root.join(".devcontainer");
+        fs::create_dir_all(&dc_dir).unwrap();
+        fs::write(
+            dc_dir.join("devcontainer.json"),
+            r#"{"name":"x","image":"y","mounts":[]}"#,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn detect_returns_xdg_when_present() {
+        let home = tmp_dir("xdg");
+        fs::create_dir_all(home.join(".config/tmux")).unwrap();
+        fs::write(home.join(".config/tmux/tmux.conf"), "set -g status off").unwrap();
+        let got = detect_host_tmux_conf_in(&home);
+        assert_eq!(got, Some("${localEnv:HOME}/.config/tmux/tmux.conf"));
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn detect_falls_back_to_legacy() {
+        let home = tmp_dir("legacy");
+        fs::write(home.join(".tmux.conf"), "set -g status off").unwrap();
+        let got = detect_host_tmux_conf_in(&home);
+        assert_eq!(got, Some("${localEnv:HOME}/.tmux.conf"));
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn detect_xdg_wins_over_legacy() {
+        let home = tmp_dir("both");
+        fs::create_dir_all(home.join(".config/tmux")).unwrap();
+        fs::write(home.join(".config/tmux/tmux.conf"), "xdg").unwrap();
+        fs::write(home.join(".tmux.conf"), "legacy").unwrap();
+        let got = detect_host_tmux_conf_in(&home);
+        assert_eq!(got, Some("${localEnv:HOME}/.config/tmux/tmux.conf"));
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn detect_returns_none_when_no_conf() {
+        let home = tmp_dir("empty");
+        let got = detect_host_tmux_conf_in(&home);
+        assert_eq!(got, None);
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn apply_baseline_tmux_mount_writes_entry() {
+        let project_root = tmp_dir("apply-proj");
+        write_devcontainer(&project_root);
+        let added =
+            apply_baseline_tmux_mount_with(&project_root, Some("${localEnv:HOME}/.tmux.conf"))
+                .unwrap();
+        assert!(added);
+        let body =
+            fs::read_to_string(project_root.join(".devcontainer/devcontainer.json")).unwrap();
+        assert!(body.contains("${localEnv:HOME}/.tmux.conf"));
+        assert!(body.contains("target=/home/vscode/.tmux.conf"));
+        assert!(body.contains("readonly"));
+        let _ = fs::remove_dir_all(&project_root);
+    }
+
+    #[test]
+    fn apply_baseline_tmux_mount_idempotent() {
+        let project_root = tmp_dir("idem-proj");
+        write_devcontainer(&project_root);
+        let first =
+            apply_baseline_tmux_mount_with(&project_root, Some("${localEnv:HOME}/.tmux.conf"))
+                .unwrap();
+        let second =
+            apply_baseline_tmux_mount_with(&project_root, Some("${localEnv:HOME}/.tmux.conf"))
+                .unwrap();
+        assert!(first);
+        assert!(!second, "second call should be a no-op");
+        let body =
+            fs::read_to_string(project_root.join(".devcontainer/devcontainer.json")).unwrap();
+        let count = body.matches("target=/home/vscode/.tmux.conf").count();
+        assert_eq!(count, 1, "mount must appear exactly once");
+        let _ = fs::remove_dir_all(&project_root);
+    }
+
+    #[test]
+    fn apply_baseline_tmux_mount_skips_without_host_conf() {
+        let project_root = tmp_dir("none-proj");
+        write_devcontainer(&project_root);
+        let added = apply_baseline_tmux_mount_with(&project_root, None).unwrap();
+        assert!(!added);
+        let body =
+            fs::read_to_string(project_root.join(".devcontainer/devcontainer.json")).unwrap();
+        assert!(!body.contains("tmux.conf"));
+        let _ = fs::remove_dir_all(&project_root);
     }
 }

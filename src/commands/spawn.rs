@@ -14,6 +14,7 @@ use crate::agent::seed;
 use crate::git::worktree_manager::{
     add_worktree, branch_exists, discover_repo, layout, project_root,
 };
+use crate::git::worktree_paths::make_worktree_pointers_relative;
 use crate::models::{AgentMetadata, ProjectLayout};
 use crate::session::container::{self, ContainerInfo};
 use crate::session::tmux::{launch_detached, SessionSpec};
@@ -27,6 +28,7 @@ pub fn run(
     task: Option<&str>,
     promise: Option<&str>,
     max_iter: Option<u32>,
+    no_bootstrap: bool,
 ) {
     let ctx = match discover_repo() {
         Ok(c) => c,
@@ -132,7 +134,47 @@ pub fn run(
     );
     env.insert("GROVE_AGENT_NAME".into(), name.to_string());
 
-    let cmd_tokens = launch_command_tokens();
+    let mut cmd_tokens = launch_command_tokens();
+
+    // Append the bootstrap prompt as the final argv token. Claude treats a
+    // trailing positional arg as its initial user message, so the spawned
+    // session starts with a turn that explains grove + (when --task is set)
+    // instructs the agent to bootstrap its own loop. `--no-bootstrap`
+    // suppresses this for users who want a raw claude session.
+    if !no_bootstrap {
+        let container_worktree_path = container::host_to_container_path(&container, &worktree_path)
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_else(|_| worktree_path.to_string_lossy().to_string());
+        let container_agent_dir = container::host_to_container_path(&container, &agent_dir)
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_else(|_| agent_dir.to_string_lossy().to_string());
+        let repo_name = project_root_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("workspace");
+        let spec = crate::agent::bootstrap::BootstrapSpec {
+            agent_name: name,
+            repo_name,
+            container_worktree_path: &container_worktree_path,
+            container_agent_dir: &container_agent_dir,
+            task,
+            resume,
+        };
+        let prompt = crate::agent::bootstrap::build_bootstrap_prompt(&spec);
+        cmd_tokens.push(prompt);
+        println!(
+            "  {} bootstrap prompt injected ({})",
+            "·".dimmed(),
+            if resume {
+                "resume"
+            } else if task.is_some() {
+                "fresh + task"
+            } else {
+                "fresh + no-task"
+            }
+        );
+    }
+
     let spec = SessionSpec {
         name,
         workdir: &worktree_path,
@@ -140,6 +182,7 @@ pub fn run(
         command: cmd_tokens.clone(),
     };
 
+    let cmd_summary = summarize_command(&cmd_tokens);
     match launch_detached(&spec, Some(&container)) {
         Ok(session_name_str) => {
             let verb = if resume { "Resumed" } else { "Spawned" };
@@ -150,7 +193,7 @@ pub fn run(
                 name.bold(),
                 target_branch.bold(),
                 session_name_str.bold(),
-                cmd_tokens.join(" ").dimmed()
+                cmd_summary.dimmed()
             );
             println!(
                 "  attach: {}",
@@ -170,7 +213,7 @@ pub fn run(
                 "    cd {} && GROVE_AGENT_DIR={} {}",
                 worktree_path.display(),
                 agent_dir.display(),
-                cmd_tokens.join(" ")
+                cmd_summary
             );
         }
     }
@@ -243,6 +286,22 @@ fn fresh_agent(
         worktree_path.display(),
         target_branch.bold()
     );
+
+    // Rewrite the two .git pointer files (forward + back) to use RELATIVE
+    // paths so the worktree resolves identically on host and inside the
+    // devcontainer (host /home/u/proj vs container /workspaces/proj).
+    if let Err(e) = make_worktree_pointers_relative(worktree_path) {
+        eprintln!(
+            "  {} rewrite worktree pointers to relative: {} (git ops inside the container may fail)",
+            "Warning:".yellow(),
+            e
+        );
+    } else {
+        println!(
+            "  {} relativized .git pointers (works under host + container)",
+            "·".dimmed()
+        );
+    }
 
     if let Err(e) = seed::link_grove_into_worktree(worktree_path, project_root_path) {
         eprintln!("  {} link .grove into worktree: {}", "Warning:".yellow(), e);
@@ -367,6 +426,17 @@ fn resume_agent(
         );
     }
 
+    // Always relativize pointers on resume — covers two cases: (1) a fresh
+    // re-create above; (2) a worktree from an older grove that wrote absolute
+    // paths. Idempotent when already relative.
+    if let Err(e) = make_worktree_pointers_relative(worktree_path) {
+        eprintln!(
+            "  {} rewrite worktree pointers to relative: {}",
+            "Warning:".yellow(),
+            e
+        );
+    }
+
     // Re-link .grove (idempotent — Ok if symlink exists).
     if let Err(e) = seed::link_grove_into_worktree(worktree_path, project_root_path) {
         eprintln!("  {} link .grove into worktree: {}", "Warning:".yellow(), e);
@@ -444,10 +514,34 @@ fn tool_in_container(info: &ContainerInfo, tool: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Render `cmd_tokens` for human display without flooding the terminal with
+/// the multi-KB bootstrap prompt. Tokens shorter than 200 chars are kept
+/// verbatim; longer ones are abbreviated to first 60 chars + "…".
+fn summarize_command(cmd_tokens: &[String]) -> String {
+    cmd_tokens
+        .iter()
+        .map(|tok| {
+            if tok.len() <= 200 {
+                tok.clone()
+            } else {
+                let head: String = tok.chars().take(60).collect();
+                format!("'{}…' ({} chars)", head, tok.len())
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 /// Command vec passed to tmux. Honors `GROVE_AGENT_COMMAND` env override so tests
 /// can substitute `bash` or `echo` for `claude`.
 fn launch_command_tokens() -> Vec<String> {
-    if let Ok(raw) = std::env::var("GROVE_AGENT_COMMAND") {
+    launch_command_tokens_with(std::env::var("GROVE_AGENT_COMMAND").ok().as_deref())
+}
+
+/// Inner helper that accepts the override directly. Tests call this so they
+/// never mutate the global `GROVE_AGENT_COMMAND` env var (parallel-test race).
+fn launch_command_tokens_with(override_value: Option<&str>) -> Vec<String> {
+    if let Some(raw) = override_value {
         let tokens: Vec<String> = raw.split_whitespace().map(|s| s.to_string()).collect();
         if !tokens.is_empty() {
             return tokens;
@@ -462,17 +556,21 @@ mod tests {
 
     #[test]
     fn default_command_uses_claude() {
-        std::env::remove_var("GROVE_AGENT_COMMAND");
-        let tokens = launch_command_tokens();
+        let tokens = launch_command_tokens_with(None);
         assert_eq!(tokens[0], "claude");
+        assert_eq!(tokens[1], "--dangerously-skip-permissions");
     }
 
     #[test]
     fn env_override_picks_up_tokens() {
-        std::env::set_var("GROVE_AGENT_COMMAND", "bash -c 'sleep 30'");
-        let tokens = launch_command_tokens();
-        std::env::remove_var("GROVE_AGENT_COMMAND");
+        let tokens = launch_command_tokens_with(Some("bash -c 'sleep 30'"));
         assert_eq!(tokens[0], "bash");
         assert!(tokens.iter().any(|t| t.contains("sleep")));
+    }
+
+    #[test]
+    fn empty_override_falls_back_to_default() {
+        let tokens = launch_command_tokens_with(Some("   "));
+        assert_eq!(tokens[0], "claude");
     }
 }
