@@ -145,6 +145,13 @@ pub fn build_devcontainer_skeleton(project: &ProjectContext) -> Value {
         "containerEnv": {
             "GH_TOKEN": "${localEnv:GH_TOKEN_RO}"
         },
+        // Pin git ≥ 2.46 so the container can parse the relative worktree
+        // pointers grove writes. Ubuntu 22.04 / Debian 12 base images
+        // ship 2.34 / 2.39 respectively; the devcontainer git feature
+        // with `ppa: true` adds git-core/ppa and installs latest.
+        "features": {
+            "ghcr.io/devcontainers/features/git:1": { "ppa": true, "version": "latest" }
+        },
         "mounts": [],
         "customizations": {
             "vscode": {
@@ -421,6 +428,20 @@ mod tests {
         let skel = build_devcontainer_skeleton(&project);
         let env = &skel["containerEnv"];
         assert_eq!(env["GH_TOKEN"], "${localEnv:GH_TOKEN_RO}");
+    }
+
+    #[test]
+    fn skeleton_pins_git_feature_for_relative_worktrees() {
+        let project = ProjectContext {
+            stack: Some(ProjectStack::Rust),
+            default_image: ProjectStack::Rust.default_image().to_string(),
+            repo_name: "demo".to_string(),
+            ..Default::default()
+        };
+        let skel = build_devcontainer_skeleton(&project);
+        let git_feat = &skel["features"]["ghcr.io/devcontainers/features/git:1"];
+        assert_eq!(git_feat["ppa"], true);
+        assert_eq!(git_feat["version"], "latest");
     }
 
     #[test]

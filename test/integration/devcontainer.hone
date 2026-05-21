@@ -37,6 +37,8 @@ ASSERT read-config.stdout contains "command -v claude"
 ASSERT read-config.stdout contains "command -v gh"
 ASSERT read-config.stdout contains "@anthropic-ai/claude-code"
 ASSERT read-config.stdout contains "cli.github.com/packages"
+ASSERT read-config.stdout contains "ghcr.io/devcontainers/features/git:1"
+ASSERT read-config.stdout contains "\"ppa\": true"
 RUN cleanup: rm -rf $TEST_DIR
 
 TEST "grove init warns about literal ~ in mount sources"

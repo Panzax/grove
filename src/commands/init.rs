@@ -364,6 +364,24 @@ fn run_phase1_and_phase2(
         ),
     }
 
+    // Ensure the container's git is ≥ 2.46 by pinning the official git
+    // devcontainer feature with ppa: true + version: latest. Grove's
+    // relative-worktree-pointer rewrite is unreadable by older git, so
+    // host AND container both need 2.46+. Idempotent; preserves any
+    // user-set version override.
+    match ensure_container_git_feature(project_root) {
+        Ok(true) => println!(
+            "  {} pinned `ghcr.io/devcontainers/features/git:1` (ppa, latest) so container git ≥ 2.46",
+            "·".dimmed()
+        ),
+        Ok(false) => {}
+        Err(e) => eprintln!(
+            "  {} could not add git feature: {} (container git may stay outdated)",
+            "Warning:".yellow(),
+            e
+        ),
+    }
+
     // Lint: warn about literal `~` in mount source= clauses. docker does NOT
     // expand `~`; the bind silently fails or refuses with `invalid mount
     // path: '~/...' mount path must be absolute`. Hardest-to-diagnose
@@ -1162,6 +1180,46 @@ fn apply_cache_volumes_to_devcontainer(
         .map_err(|e| format!("serialize {}: {}", dev_path.display(), e))?;
     fs::write(&dev_path, body).map_err(|e| format!("write {}: {}", dev_path.display(), e))?;
     Ok(())
+}
+
+/// Pin `ghcr.io/devcontainers/features/git:1` in devcontainer.json's
+/// `features` map so the container ends up with git ≥ 2.46. Required
+/// because grove writes relative worktree pointers which older git
+/// can't parse, and base images often ship 2.34 (Ubuntu 22.04).
+///
+/// Idempotent: if a `ghcr.io/devcontainers/features/git:1` key already
+/// exists (regardless of version pin), leave it alone — operator may
+/// have customized it. Returns Ok(true) if a new entry was added,
+/// Ok(false) if already present, Err on parse/write failure.
+fn ensure_container_git_feature(project_root: &Path) -> Result<bool, String> {
+    let dev_path = project_root.join(".devcontainer").join("devcontainer.json");
+    if !dev_path.exists() {
+        return Ok(false);
+    }
+    let raw =
+        fs::read_to_string(&dev_path).map_err(|e| format!("read {}: {}", dev_path.display(), e))?;
+    let mut value: serde_json::Value =
+        serde_json::from_str(&raw).map_err(|e| format!("parse {}: {}", dev_path.display(), e))?;
+    let obj = value
+        .as_object_mut()
+        .ok_or_else(|| "devcontainer.json top-level is not a JSON object".to_string())?;
+    let features = obj
+        .entry("features")
+        .or_insert_with(|| serde_json::json!({}))
+        .as_object_mut()
+        .ok_or_else(|| "devcontainer.json `features` is not an object".to_string())?;
+    let key = "ghcr.io/devcontainers/features/git:1";
+    if features.contains_key(key) {
+        return Ok(false);
+    }
+    features.insert(
+        key.to_string(),
+        serde_json::json!({ "ppa": true, "version": "latest" }),
+    );
+    let body = serde_json::to_string_pretty(&value)
+        .map_err(|e| format!("serialize {}: {}", dev_path.display(), e))?;
+    fs::write(&dev_path, body).map_err(|e| format!("write {}: {}", dev_path.display(), e))?;
+    Ok(true)
 }
 
 /// Scan `.devcontainer/devcontainer.json` for mount entries whose
