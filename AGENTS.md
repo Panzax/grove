@@ -188,6 +188,24 @@ The README at the repository root is the primary documentation. When updating:
   prompt are **container-side** (translated via
   `container::host_to_container_path`) because the prompt is consumed
   inside the container by claude.
+- **`grove integrate` is agent-driven.** Orchestrator (Rust) only does
+  worktree setup, branch creation, context snapshot, agent seed, and
+  spawn — then exits. The integration agent (`integrate-<ts>`) is a
+  standard Ralph-loop agent: same Stop hook, same PROMPT/STATE/loop
+  triad, same launch path (`commands::spawn::launch_agent_in_container`).
+  Differences from a `grove spawn` agent: integrate-flavor templates
+  in `assets/INTEGRATE_*.md`, max_iterations bumped to 50,
+  pre-populated STATE.md workitems (one per `agent/*` branch + verify
+  + open PR), `.grove-context/branches.json` + `overlap.txt` written by
+  `agent::integrate_deps`. Resolver runs only sandboxed (no host
+  fallback). `gh` installed in container prereqs; `GH_TOKEN` flows from
+  host via `containerEnv` (mapped from `GH_TOKEN_RO`).
+- **`launch_agent_in_container` is shared by spawn + integrate.** Lives
+  in `commands::spawn`. Bundles env build + cmd_tokens + bootstrap
+  prompt append + SessionSpec + `launch_detached` + status printing.
+  Takes a `LaunchContext` (agent_name, worktree_path, agent_dir,
+  container, bootstrap_prompt, display_branch, verb_past). Future
+  agent-flavors (e.g. a release agent) should reuse this same helper.
 - **Host tmux config bind.** Phase 1 probes `$HOME/.config/tmux/tmux.conf`
   (XDG) then `$HOME/.tmux.conf` (legacy). If found, adds a RO mount to
   `/home/vscode/.tmux.conf` using the `${localEnv:HOME}/...` form so
