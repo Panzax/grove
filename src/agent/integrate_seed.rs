@@ -13,7 +13,10 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use chrono::Utc;
+
 use crate::agent::integrate_deps::IntegrationContext;
+use crate::models::AgentMetadata;
 
 pub const INTEGRATE_PROMPT_TEMPLATE: &str =
     include_str!("../../assets/INTEGRATE_PROMPT.template.md");
@@ -82,6 +85,31 @@ pub fn seed_integrate_agent(
         INTEGRATE_BOOTSTRAP_TEMPLATE,
     )
     .map_err(|e| format!("write bootstrap snapshot: {}", e))?;
+
+    // agent.toml so `grove agents list` / `status` / `attach` machinery
+    // sees the integrate agent the same way as a spawn agent. Without
+    // this the agent dir is invisible to commands::agents::collect_agents.
+    let metadata = AgentMetadata {
+        id: uuid::Uuid::new_v4().to_string(),
+        name: name.to_string(),
+        worktree: format!(
+            "{}/worktrees/.integration",
+            project_root_path.to_string_lossy()
+        ),
+        branch: ctx.integration_branch.clone(),
+        task: Some(format!(
+            "Integrate {} agent/* branch(es) into {}",
+            ctx.branches.len(),
+            ctx.base
+        )),
+        tmux_session: Some(crate::session::tmux::session_name(name)),
+        spawned_at: Utc::now(),
+        provider: "claude-code".to_string(),
+    };
+    let agent_toml = dir.join("agent.toml");
+    let body =
+        toml::to_string_pretty(&metadata).map_err(|e| format!("serialize agent.toml: {}", e))?;
+    fs::write(&agent_toml, body).map_err(|e| format!("write agent.toml: {}", e))?;
 
     Ok(dir)
 }
@@ -180,14 +208,28 @@ mod tests {
     }
 
     #[test]
-    fn seed_creates_four_files() {
-        let root = tmp("four");
+    fn seed_creates_five_files_including_agent_toml() {
+        let root = tmp("five");
         let ctx = sample_ctx();
         let agent_dir = seed_integrate_agent(&root, "integrate-x", &ctx).unwrap();
         assert!(agent_dir.join("PROMPT.md").exists());
         assert!(agent_dir.join("STATE.md").exists());
         assert!(agent_dir.join("loop.md").exists());
         assert!(agent_dir.join("INTEGRATE_BOOTSTRAP.snapshot.md").exists());
+        assert!(agent_dir.join("agent.toml").exists());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn agent_toml_records_integration_branch_and_session_name() {
+        let root = tmp("agenttoml");
+        let ctx = sample_ctx();
+        let agent_dir = seed_integrate_agent(&root, "integrate-y", &ctx).unwrap();
+        let raw = fs::read_to_string(agent_dir.join("agent.toml")).unwrap();
+        assert!(raw.contains("name = \"integrate-y\""));
+        assert!(raw.contains("branch = \"integration/20260521T010203Z\""));
+        assert!(raw.contains("tmux_session = \"grove-integrate-y\""));
+        assert!(raw.contains("Integrate 2 agent/* branch(es) into main"));
         let _ = fs::remove_dir_all(&root);
     }
 
