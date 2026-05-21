@@ -352,6 +352,12 @@ fn run_phase1_and_phase2(
         ),
     }
 
+    // Lint: warn about literal `~` in mount source= clauses. docker does NOT
+    // expand `~`; the bind silently fails or refuses with `invalid mount
+    // path: '~/...' mount path must be absolute`. Hardest-to-diagnose
+    // devcontainer.json bug there is — surface at init time.
+    warn_about_tilde_mounts(project_root);
+
     match crate::agent::hook::install_engine(context) {
         Ok(p) => println!("  {} installed engine at {}", "·".dimmed(), p.display()),
         Err(e) => eprintln!(
@@ -1105,6 +1111,82 @@ fn apply_cache_volumes_to_devcontainer(
     Ok(())
 }
 
+/// Scan `.devcontainer/devcontainer.json` for mount entries whose
+/// `source=` value starts with a literal `~`. docker silently refuses
+/// these at `docker run` time with "invalid mount path: must be absolute"
+/// — debugging is brutal because the cause is far from the symptom.
+/// Print a clear warning + fix hint per finding.
+///
+/// Handles both the string form (`"source=~/x,target=/y,type=bind"`) and
+/// the object form (`{"source": "~/x", "target": "/y", ...}`).
+fn warn_about_tilde_mounts(project_root: &Path) {
+    let path = project_root.join(".devcontainer").join("devcontainer.json");
+    let raw = match fs::read_to_string(&path) {
+        Ok(s) => s,
+        Err(_) => return,
+    };
+    let value: serde_json::Value = match serde_json::from_str(&raw) {
+        Ok(v) => v,
+        Err(_) => return,
+    };
+    let mounts = match value.get("mounts").and_then(|v| v.as_array()) {
+        Some(a) => a,
+        None => return,
+    };
+
+    let mut findings: Vec<String> = Vec::new();
+    for m in mounts {
+        if let Some(src) = mount_source_with_literal_tilde(m) {
+            findings.push(src);
+        }
+    }
+
+    if findings.is_empty() {
+        return;
+    }
+
+    eprintln!(
+        "  {} `.devcontainer/devcontainer.json` mount source(s) use a literal `~`:",
+        "Warning:".yellow()
+    );
+    for src in &findings {
+        eprintln!("    source={}", src.bold());
+    }
+    eprintln!(
+        "    {} docker does NOT expand `~`; container creation will fail with `invalid mount path`.",
+        "·".dimmed()
+    );
+    eprintln!(
+        "    {} Fix: replace `~/...` with `${{localEnv:HOME}}/...` in each offending source.",
+        "·".dimmed()
+    );
+}
+
+/// If `mount` (string or object form) has a `source` value that begins
+/// with a literal `~`, return that source string. Otherwise None.
+fn mount_source_with_literal_tilde(mount: &serde_json::Value) -> Option<String> {
+    if let Some(s) = mount.as_str() {
+        // "source=~/.foo,target=/bar,..." — split on `,`, look for source=.
+        for part in s.split(',') {
+            if let Some(rest) = part.strip_prefix("source=") {
+                if rest.starts_with('~') {
+                    return Some(rest.to_string());
+                }
+                return None;
+            }
+        }
+        return None;
+    }
+    if let Some(obj) = mount.as_object() {
+        if let Some(src) = obj.get("source").and_then(|v| v.as_str()) {
+            if src.starts_with('~') {
+                return Some(src.to_string());
+            }
+        }
+    }
+    None
+}
+
 fn patch_gitignore(project_root: &Path) -> Result<(), String> {
     let path = project_root.join(".gitignore");
     let existing = fs::read_to_string(&path).unwrap_or_default();
@@ -1482,5 +1564,49 @@ mod tests {
         assert!(!exts.is_empty());
         assert!(exts.iter().any(|e| e == "rust-lang.rust-analyzer"));
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn tilde_mount_string_form_detected() {
+        let v = serde_json::json!("source=~/.config/x,target=/y,type=bind,readonly");
+        let got = mount_source_with_literal_tilde(&v);
+        assert_eq!(got, Some("~/.config/x".to_string()));
+    }
+
+    #[test]
+    fn tilde_mount_object_form_detected() {
+        let v = serde_json::json!({
+            "source": "~/.config/x",
+            "target": "/y",
+            "type": "bind"
+        });
+        let got = mount_source_with_literal_tilde(&v);
+        assert_eq!(got, Some("~/.config/x".to_string()));
+    }
+
+    #[test]
+    fn local_env_home_mount_not_flagged() {
+        let v = serde_json::json!("source=${localEnv:HOME}/.config/x,target=/y,type=bind");
+        assert_eq!(mount_source_with_literal_tilde(&v), None);
+        let v2 = serde_json::json!({"source": "${localEnv:HOME}/.config/x", "target": "/y"});
+        assert_eq!(mount_source_with_literal_tilde(&v2), None);
+    }
+
+    #[test]
+    fn absolute_path_mount_not_flagged() {
+        let v = serde_json::json!("source=/home/martin/.config/x,target=/y,type=bind");
+        assert_eq!(mount_source_with_literal_tilde(&v), None);
+    }
+
+    #[test]
+    fn named_volume_mount_not_flagged() {
+        let v = serde_json::json!("source=grove-uv-cache,target=/cache,type=volume");
+        assert_eq!(mount_source_with_literal_tilde(&v), None);
+    }
+
+    #[test]
+    fn mount_without_source_clause_not_flagged() {
+        let v = serde_json::json!("type=tmpfs,target=/tmp");
+        assert_eq!(mount_source_with_literal_tilde(&v), None);
     }
 }

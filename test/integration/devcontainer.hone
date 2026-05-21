@@ -39,6 +39,27 @@ ASSERT read-config.stdout contains "@anthropic-ai/claude-code"
 ASSERT read-config.stdout contains "cli.github.com/packages"
 RUN cleanup: rm -rf $TEST_DIR
 
+TEST "grove init warns about literal ~ in mount sources"
+
+ENV TEST_DIR=/tmp/grove-init-tilde-warn
+RUN setup: rm -rf $TEST_DIR && mkdir -p $TEST_DIR/.devcontainer && cd $TEST_DIR && git init -q -b main && git -c user.email=t@t -c user.name=t commit --allow-empty -q -m init
+RUN seed: printf '%s\n' '{' '  "name":"x",' '  "image":"y",' '  "mounts": [' '    "source=~/.config/foo,target=/home/vscode/.config/foo,type=bind,readonly"' '  ]' '}' > $TEST_DIR/.devcontainer/devcontainer.json
+RUN init: cd $TEST_DIR && grove init --no-agent
+ASSERT init.exit_code == 0
+ASSERT init.stderr contains "literal"
+ASSERT init.stderr contains "~/.config/foo"
+ASSERT init.stderr contains "localEnv:HOME"
+RUN cleanup: rm -rf $TEST_DIR
+
+TEST "grove init does not warn when mounts use localEnv:HOME"
+
+ENV TEST_DIR=/tmp/grove-init-tilde-clean
+RUN setup: rm -rf $TEST_DIR && mkdir -p $TEST_DIR && cd $TEST_DIR && git init -q -b main && git -c user.email=t@t -c user.name=t commit --allow-empty -q -m init
+RUN init: cd $TEST_DIR && grove init --no-agent
+ASSERT init.exit_code == 0
+ASSERT init.stderr not contains "literal"
+RUN cleanup: rm -rf $TEST_DIR
+
 TEST "grove init maps GH_TOKEN_RO into container as GH_TOKEN"
 
 ENV TEST_DIR=/tmp/grove-init-gh-token-env
