@@ -117,6 +117,57 @@ pub fn list_grove_sessions(container: Option<&ContainerInfo>) -> Result<Vec<Stri
 }
 
 /// Send SIGTERM-equivalent via tmux. Idempotent: missing session = Ok(()).
+/// Mirror a tmux session's pane output to a file via `tmux pipe-pane`.
+/// Unlike piping the launched command through `tee`, this keeps claude's
+/// stdout as a real PTY (required for TUI rendering) while still
+/// archiving everything it draws to the log.
+///
+/// `log_path` is interpreted INSIDE the container (or on the host if
+/// `container` is None). Caller is responsible for ensuring the path is
+/// container-side when targeting a container.
+///
+/// `-o` toggles only-when-not-piped, meaning calling this twice is
+/// effectively idempotent (second call is a no-op while the first is
+/// active). Best-effort: returns Err on failure but doesn't kill the
+/// session.
+pub fn pipe_pane_to_log(
+    name: &str,
+    log_path: &str,
+    container: Option<&ContainerInfo>,
+) -> Result<(), String> {
+    // `mkdir -p` defends against the log dir not yet existing inside the
+    // container's view (host workspace mounts are usually fine, but
+    // belt+suspenders). `cat >>` (NOT >) appends so re-launching an
+    // agent with the same name preserves history.
+    let shell_cmd = format!(
+        "mkdir -p \"$(dirname {log})\" && cat >> {log}",
+        log = shell_quote(log_path)
+    );
+    let target = format!("{}:", name); // session target, default window/pane
+    let out = run_tmux(container, &["pipe-pane", "-o", "-t", &target, &shell_cmd])?;
+    if !out.status.success() {
+        return Err(format!(
+            "tmux pipe-pane: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    Ok(())
+}
+
+/// Minimal POSIX shell-escape for a single argument embedded in a shell
+/// command string. Wraps in single quotes when the value contains
+/// anything beyond identifier-safe characters.
+fn shell_quote(s: &str) -> String {
+    if !s.is_empty()
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '/' | '.' | '-' | '_' | '=' | ':'))
+    {
+        s.to_string()
+    } else {
+        format!("'{}'", s.replace('\'', "'\\''"))
+    }
+}
+
 pub fn kill_session(name: &str, container: Option<&ContainerInfo>) -> Result<(), String> {
     if !has_session(name, container)? {
         return Ok(());
