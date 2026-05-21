@@ -74,6 +74,17 @@ pub fn make_worktree_pointers_relative(worktree_path: &Path) -> Result<(), Strin
     let new_back = format!("{}\n", back_rel.display());
     write_if_changed(&back_file, &new_back)?;
 
+    // Note: we deliberately do NOT set `extensions.relativeWorktrees=true`
+    // on the main gitdir. That extension requires
+    // `core.repositoryFormatVersion=1`, which silently breaks every git
+    // version below 2.42. Host operators with older git would lose
+    // access to the entire repo. The relative-path rewrite alone is
+    // enough for the container (newer git) to work; older host-side
+    // git will reject `worktree remove` on these worktrees — operators
+    // should upgrade git (via `ppa:git-core/ppa` on Ubuntu) or do
+    // git ops through the container (`grove devcontainer exec git ...`
+    // / `grove integrate --abort` for cleanup).
+
     Ok(())
 }
 

@@ -17,14 +17,24 @@ ASSERT stdout contains "integrate"
 ASSERT stdout contains "loop"
 ASSERT stdout contains "msg"
 
-TEST "grove integrate --help advertises --into, --no-test, and positional branches"
+TEST "grove integrate --help advertises --into, --no-test, --abort, and positional branches"
 
 RUN grove integrate --help
 ASSERT exit_code == 0
 ASSERT stdout contains "--into"
 ASSERT stdout contains "--no-test"
+ASSERT stdout contains "--abort"
 ASSERT stdout contains "Branches to integrate"
 ASSERT stdout contains "agent/"
+
+TEST "grove integrate --abort outside repo errors cleanly"
+
+ENV TEST_DIR=/tmp/grove-integrate-abort-no-repo
+RUN setup: rm -rf $TEST_DIR && mkdir -p $TEST_DIR
+RUN abort: cd $TEST_DIR && grove integrate --abort
+ASSERT abort.exit_code != 0
+ASSERT abort.stderr contains "Not in a grove repository"
+RUN cleanup: rm -rf $TEST_DIR
 
 TEST "grove integrate with unknown positional branch errors cleanly"
 

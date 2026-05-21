@@ -256,6 +256,13 @@ enum Commands {
         /// Skip the per-merge verify command
         #[arg(long = "no-test")]
         no_test: bool,
+        /// Tear down a previous integration: kill any live tmux session,
+        /// chmod -R u+w the worktree (RO context files), git worktree
+        /// remove --force worktrees/.integration, git branch -D the
+        /// integration branch, and purge .grove/agents/integrate-*. Use
+        /// after a failed integrate when worktrees/.integration is stuck.
+        #[arg(long = "abort")]
+        abort: bool,
     },
     /// Manage the project's devcontainer (up/down/status/exec/rebuild/logs)
     Devcontainer {
@@ -431,8 +438,13 @@ fn main() {
             branches,
             into,
             no_test,
+            abort,
         }) => {
-            commands::integrate::run(&branches, into.as_deref(), no_test);
+            if abort {
+                commands::integrate::abort();
+            } else {
+                commands::integrate::run(&branches, into.as_deref(), no_test);
+            }
         }
         Some(Commands::Devcontainer { command }) => match command {
             DevcontainerCommand::Up => commands::devcontainer::up(),

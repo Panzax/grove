@@ -105,6 +105,7 @@ RUN read-mounts: cat $TEST_DIR/.devcontainer/devcontainer.json
 ASSERT read-mounts.stdout contains "/.claude/plugins"
 ASSERT read-mounts.stdout contains "/.claude/.credentials.json"
 ASSERT read-mounts.stdout contains "/.claude/settings.json"
+ASSERT read-mounts.stdout contains "/.claude.json"
 ASSERT read-mounts.stdout contains "readonly"
 RUN cleanup: rm -rf $TEST_DIR
 
