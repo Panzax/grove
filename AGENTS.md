@@ -188,6 +188,26 @@ The README at the repository root is the primary documentation. When updating:
   prompt are **container-side** (translated via
   `container::host_to_container_path`) because the prompt is consumed
   inside the container by claude.
+- **`grove integrate` is agent-driven.** Orchestrator (Rust) only does
+  worktree setup, branch creation, context snapshot, agent seed, and
+  spawn — then exits. The integration agent (`integrate-<ts>`) is a
+  standard Ralph-loop agent: same Stop hook, same PROMPT/STATE/loop
+  triad, same launch path (`commands::spawn::launch_agent_in_container`).
+  Differences from a `grove spawn` agent: integrate-flavor templates
+  in `assets/INTEGRATE_*.md`, max_iterations bumped to 50,
+  pre-populated STATE.md workitems (one per `agent/*` branch + verify
+  + open PR), `.grove-context/branches.json` + `overlap.txt` written by
+  `agent::integrate_deps`. Resolver runs only sandboxed (no host
+  fallback). `gh` installed in container prereqs; `GH_TOKEN` flows from
+  host via `containerEnv` (mapped from `GH_TOKEN_RO`).
+- **Bootstrap prompts invoke the plan workflow as a reasoning skill, not a tool.** Both `assets/AGENT_BOOTSTRAP_TASK.md` and `assets/INTEGRATE_BOOTSTRAP.md` instruct the spawned agent to decompose its goal using the same structured thinking it would apply in plan mode — but explicitly forbid calling `ExitPlanMode` or invoking a `/plan` slash command, which would block forever waiting for user approval the loop has no way to provide. The agent flattens its plan directly into STATE.md workitems; STATE.md IS the live plan from that point forward. Autonomy rule baked into both prompts: the agent makes the most defensible call itself, logs reasoning to STATE.md iteration log, and only roadblocks (`[!]`) for true unsafe-without-input situations (credentials, irreversible ops, semantic conflicts that genuinely need user judgment).
+- **`grove integrate` accepts positional branch names.** Empty positional args = "merge every `agent/*`" (the default). With names, each input is resolved via `commands::integrate::resolve_branch_input` which tries the literal name first, then `agent/<name>`. Lets users say `grove integrate feat-a feature/x` and have it Just Work. Unknown names abort BEFORE any worktree side-effects (integration branch + worktree creation only happen after resolution succeeds for every input). `agent/shared` is filtered out even if explicitly listed (it's the hub branch).
+- **`launch_agent_in_container` is shared by spawn + integrate.** Lives
+  in `commands::spawn`. Bundles env build + cmd_tokens + bootstrap
+  prompt append + SessionSpec + `launch_detached` + status printing.
+  Takes a `LaunchContext` (agent_name, worktree_path, agent_dir,
+  container, bootstrap_prompt, display_branch, verb_past). Future
+  agent-flavors (e.g. a release agent) should reuse this same helper.
 - **Host tmux config bind.** Phase 1 probes `$HOME/.config/tmux/tmux.conf`
   (XDG) then `$HOME/.tmux.conf` (legacy). If found, adds a RO mount to
   `/home/vscode/.tmux.conf` using the `${localEnv:HOME}/...` form so

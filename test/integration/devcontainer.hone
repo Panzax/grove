@@ -34,7 +34,20 @@ ASSERT read-config.stdout contains "command -v tmux"
 ASSERT read-config.stdout contains "command -v jq"
 ASSERT read-config.stdout contains "command -v perl"
 ASSERT read-config.stdout contains "command -v claude"
+ASSERT read-config.stdout contains "command -v gh"
 ASSERT read-config.stdout contains "@anthropic-ai/claude-code"
+ASSERT read-config.stdout contains "cli.github.com/packages"
+RUN cleanup: rm -rf $TEST_DIR
+
+TEST "grove init maps GH_TOKEN_RO into container as GH_TOKEN"
+
+ENV TEST_DIR=/tmp/grove-init-gh-token-env
+RUN setup: rm -rf $TEST_DIR && mkdir -p $TEST_DIR && cd $TEST_DIR && git init -q && git -c user.email=t@t -c user.name=t commit --allow-empty -q -m init
+RUN init: cd $TEST_DIR && grove init --no-agent
+ASSERT init.exit_code == 0
+RUN read-env: cat $TEST_DIR/.devcontainer/devcontainer.json
+ASSERT read-env.stdout contains "GH_TOKEN"
+ASSERT read-env.stdout contains "localEnv:GH_TOKEN_RO"
 RUN cleanup: rm -rf $TEST_DIR
 
 TEST "grove init adds baseline claude mounts"

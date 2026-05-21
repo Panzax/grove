@@ -294,14 +294,45 @@ Messages land in `.grove/bus/`. Direct goes to `inbox/<recipient>/`; broadcast t
 #### Integrate finished work
 
 ```bash
-grove integrate
+grove integrate --into main                        # merge every agent/* branch
+grove integrate feat-a feat-b --into develop       # merge only the named branches
+grove integrate agent/feat-a feature/x --into main # mix shorthand and full ref names
+grove attach integrate-<ts>                        # watch the agent do its thing
 ```
 
-Creates a disposable `integration/<timestamp>` branch and merges every `agent/*` branch
-into it. On conflict, snapshots bus + per-branch `STATE.md` into a read-only context
-directory and invokes a headless Claude session to resolve with intent. Runs the
-project's `[verify].test_command` between merges if configured. Human reviews and merges
-into the base branch.
+Positional branch names are optional. With none, the orchestrator merges
+every `agent/*` branch (minus `agent/shared`). With one or more names, only
+those branches are merged. Each name is resolved literally first, then with
+an `agent/` prefix — so `feat-a` resolves to `agent/feat-a` if no literal
+`feat-a` branch exists. Non-`agent/*` branches (like `feature/x`) work too;
+the agent prefix is only a fallback. Unknown names abort the run before any
+worktree side-effects.
+
+`grove integrate` is agent-driven: it sets up an integration worktree on
+`integration/<ts>` (branched off `--into`), snapshots bus + per-branch
+`STATE.md` plus auto-generated `branches.json` + `overlap.txt` (file
+dependency hints) into a read-only `.grove-context/` directory, then
+**spawns a Ralph-loop integration agent inside the devcontainer** to:
+
+1. Decide a merge order from the overlap matrix (lower overlap first).
+2. Merge each `agent/*` branch, resolving conflicts using per-branch
+   intent from the context snapshot.
+3. Run the project's `[verify].test_command` (or skip with `--no-test`).
+4. Open a PR against `--into` via `gh pr create` with a standardized
+   body summarizing per-branch deliverables and conflict resolutions.
+
+Container requirement is hard: the resolver is an autonomous agent, so
+sandboxing is mandatory. No `--allow-host` escape hatch.
+
+`gh` is installed in the container automatically (Phase 1 prereqs); the
+host's `GH_TOKEN_RO` env var is mapped to the container's `GH_TOKEN`
+(see `.devcontainer/devcontainer.json::containerEnv`). The agent runs
+`gh auth status` first and roadblocks on auth failure instead of looping.
+
+Monitor live with `grove attach integrate-<ts>` or check status via
+`grove agents status integrate-<ts>`. The agent's PROMPT.md / STATE.md /
+loop.md are in `.grove/agents/integrate-<ts>/` — operator can edit + flip
+`active: true` to resume if the agent roadblocks.
 
 ### Worktree commands (full reference)
 
