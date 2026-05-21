@@ -751,8 +751,14 @@ fn build_grove_config(
         crate::devcontainer::ci_scrape::into_verify_section(scraped)
     };
 
+    // build_grove_config runs BEFORE devcontainer.json may be on disk
+    // (clone mode) or alongside an existing one (in-place). We don't
+    // need a perfect user here — the actual devcontainer mounts come
+    // from apply_cache_volumes_to_devcontainer which re-reads
+    // devcontainer.json. This is .grove/config.toml metadata only;
+    // "vscode" is the safe scaffold default.
     config.caches.volumes =
-        crate::devcontainer::stack::cache_volumes(stack_enum, &project.repo_name)
+        crate::devcontainer::stack::cache_volumes(stack_enum, &project.repo_name, "vscode")
             .into_iter()
             .map(|(source, target)| crate::models::CacheVolume { source, target })
             .collect();
@@ -1129,10 +1135,11 @@ fn apply_cache_volumes_to_devcontainer(
         fs::read_to_string(&dev_path).map_err(|e| format!("read {}: {}", dev_path.display(), e))?;
     let mut value: serde_json::Value =
         serde_json::from_str(&raw).map_err(|e| format!("parse {}: {}", dev_path.display(), e))?;
+    let user = remote_user_from_devcontainer(&value);
     let stack = project
         .stack
         .unwrap_or(crate::models::ProjectStack::Unknown);
-    let vols = crate::devcontainer::stack::cache_volumes(stack, &project.repo_name);
+    let vols = crate::devcontainer::stack::cache_volumes(stack, &project.repo_name, &user);
 
     let obj = value
         .as_object_mut()

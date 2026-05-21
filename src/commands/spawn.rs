@@ -260,26 +260,16 @@ pub(crate) fn launch_agent_in_container(ctx: &LaunchContext<'_>) {
         .map(|p| p.to_string_lossy().to_string())
         .unwrap_or_else(|_| pane_log.to_string_lossy().to_string());
 
-    let base_cmd_tokens = launch_command_tokens();
-    let mut quoted = base_cmd_tokens
-        .iter()
-        .map(|t| shell_escape(t))
-        .collect::<Vec<_>>()
-        .join(" ");
+    // Claude Code is a TUI — it needs a real terminal as stdout to render
+    // anything. Piping claude through `tee` (the previous approach) killed
+    // the TUI because stdout becomes a pipe, not a TTY, so claude rendered
+    // blank screens. Solution: claude owns the pane PTY directly. We mirror
+    // the pane's output to the log file via `tmux pipe-pane` AFTER the
+    // session is created, which is exactly what pipe-pane is for.
+    let mut cmd_tokens = launch_command_tokens();
     if let Some(prompt) = ctx.bootstrap_prompt {
-        quoted.push(' ');
-        quoted.push_str(&shell_escape(prompt));
+        cmd_tokens.push(prompt.to_string());
     }
-    let pane_log_quoted = shell_escape(&container_pane_log);
-    // `mkdir -p` for the log dir inside the container; exec wraps so signals
-    // pass through cleanly; pipefail keeps claude's exit code as the session
-    // exit code (not tee's). 2>&1 merges stderr so both streams archive.
-    let inner = format!(
-        "mkdir -p \"$(dirname {pane})\" && set -o pipefail && exec {cmd} 2>&1 | tee -a {pane}",
-        cmd = quoted,
-        pane = pane_log_quoted
-    );
-    let cmd_tokens: Vec<String> = vec!["bash".into(), "-lc".into(), inner];
 
     let spec = SessionSpec {
         name: ctx.agent_name,
@@ -305,6 +295,25 @@ pub(crate) fn launch_agent_in_container(ctx: &LaunchContext<'_>) {
 
     match launch_result {
         Ok(session_name_str) => {
+            // Mirror pane output to <pane_log> via tmux's pipe-pane.
+            // Done AFTER launch so claude already owns the pane's PTY
+            // (required for TUI rendering); piping via `tee` would have
+            // replaced stdout with a pipe and broken the TUI entirely.
+            // Best-effort: if pipe-pane fails the agent still runs; the
+            // operator just won't have a tail-able log.
+            let full_session = crate::session::tmux::session_name(ctx.agent_name);
+            if let Err(e) = crate::session::tmux::pipe_pane_to_log(
+                &full_session,
+                &container_pane_log,
+                Some(ctx.container),
+            ) {
+                eprintln!(
+                    "  {} could not pipe pane to log ({}) — session runs but no archive",
+                    "Warning:".yellow(),
+                    e
+                );
+            }
+
             println!(
                 "{} {} agent {} on {} (tmux {} {}) [in container]",
                 "✓".green(),
@@ -425,19 +434,6 @@ fn summarize_one(tok: &str) -> String {
     } else {
         let head: String = tok.chars().take(80).collect();
         format!("'{}…' ({} chars)", head, tok.len())
-    }
-}
-
-/// Minimal POSIX shell-escape for the inner `bash -c` script. Single-quote
-/// wraps everything except plain identifier-shaped tokens.
-fn shell_escape(s: &str) -> String {
-    if !s.is_empty()
-        && s.chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '/' | '.' | '-' | '_' | '=' | ':'))
-    {
-        s.to_string()
-    } else {
-        format!("'{}'", s.replace('\'', "'\\''"))
     }
 }
 
