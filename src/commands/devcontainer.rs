@@ -139,16 +139,21 @@ pub fn rebuild() {
         log_path.display().to_string().bold()
     );
 
-    // Use bash + tee + pipefail so the operator sees the devcontainer CLI's
-    // live output AND a complete copy lands in the log file. `pipefail` makes
-    // devcontainer's exit code win over tee's. The devcontainer binary path
-    // is hardcoded (same as the other lifecycle subcommands); ditto the bash
-    // dep — grove targets Linux + macOS where both are present.
+    // bash + perl-redact + tee + pipefail.
+    //   - bash for pipefail (devcontainer's exit wins over redact/tee).
+    //   - perl filter strips token-shaped substrings BEFORE they hit
+    //     stdout OR the log file, so neither the operator's terminal
+    //     nor `.grove/logs/...` archives `-e GH_TOKEN=<pat>`. perl is
+    //     line-buffered + autoflushed via $|=1 so streaming stays live.
+    //   - tee fans the redacted output to terminal + file.
+    // grove targets Linux + macOS; bash + perl + tee are guaranteed
+    // present (perl is also in container prereqs for the Stop hook).
     let workspace_arg = format!("{}", root.display());
     let log_arg = format!("{}", log_path.display());
     let script = format!(
-        "set -o pipefail; devcontainer up --workspace-folder {} --remove-existing-container 2>&1 | tee {}",
+        "set -o pipefail; devcontainer up --workspace-folder {} --remove-existing-container 2>&1 | {} | tee {}",
         shell_escape(&workspace_arg),
+        redact_filter_command(),
         shell_escape(&log_arg)
     );
     let status = Command::new("bash").args(["-c", &script]).status();
@@ -174,6 +179,23 @@ pub fn rebuild() {
             std::process::exit(1);
         }
     }
+}
+
+/// Build the `perl -pe '...'` filter command that gets piped between
+/// the devcontainer CLI and tee. Redacts:
+///   - `-e <VAR>=<value>` flag values for known secret-bearing env vars
+///   - GitHub fine-grained PATs (`github_pat_...`)
+///   - GitHub classic PATs (`ghp_...`)
+///   - Anthropic API keys (`sk-ant-...`)
+///
+/// Conservative — only matches well-known token shapes so legitimate
+/// command output isn't garbled. `$|=1` autoflushes per-line so the
+/// terminal stream stays live.
+pub(crate) fn redact_filter_command() -> String {
+    // Single-quoted perl script: no shell escaping needed inside, just
+    // worry about avoiding `'` in the program text.
+    let program = r#"BEGIN{$|=1} s/(-e\s+(GH_TOKEN|GITHUB_TOKEN|ANTHROPIC_API_KEY|OPENAI_API_KEY|AWS_SECRET_ACCESS_KEY)=)\S+/$1<REDACTED>/g; s/(GH_TOKEN|GITHUB_TOKEN|ANTHROPIC_API_KEY|OPENAI_API_KEY|AWS_SECRET_ACCESS_KEY)=[A-Za-z0-9_\-\.]{8,}/$1=<REDACTED>/g; s/github_pat_[A-Za-z0-9_]{20,}/<REDACTED-GITHUB-PAT>/g; s/ghp_[A-Za-z0-9]{20,}/<REDACTED-GITHUB-PAT>/g; s/sk-ant-[A-Za-z0-9_\-]{20,}/<REDACTED-ANTHROPIC-KEY>/g"#;
+    format!("perl -pe '{}'", program)
 }
 
 /// Minimal POSIX shell-arg escaping for a single argument. Same shape as
