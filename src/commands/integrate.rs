@@ -444,6 +444,155 @@ fn branch_exists(project: &Path, name: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Tear down a previous integrate run that left junk on disk. Steps:
+///   1. Kill any live `grove-integrate-*` tmux session in the container.
+///   2. chmod -R u+w on `worktrees/.integration` (the .grove-context/
+///      subtree is RO; without this, fs ops fail with EACCES).
+///   3. `git worktree remove --force worktrees/.integration` to unregister
+///      from git's worktree list AND delete the directory.
+///   4. Delete every `integration/<ts>` local branch.
+///   5. Purge every `.grove/agents/integrate-*` agent dir.
+///
+/// Best-effort throughout — if step N fails, prints a warning and
+/// continues with N+1. Useful when an integrate run died mid-flight and
+/// the next attempt refuses with "worktrees/.integration already exists".
+pub fn abort() {
+    let ctx = match discover_repo() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("{} {}", "Error:".red(), e);
+            std::process::exit(1);
+        }
+    };
+    let project_root_path = project_root(&ctx).to_path_buf();
+    let integration_path = project_root_path.join("worktrees").join(".integration");
+
+    // 1. Kill in-container tmux sessions named grove-integrate-*. If the
+    //    container isn't up, skip silently.
+    if container::is_up(&project_root_path) {
+        if let Some(info) = resolve_container_info(&project_root_path) {
+            if let Ok(sessions) = crate::session::tmux::list_grove_sessions(Some(&info)) {
+                for s in sessions
+                    .iter()
+                    .filter(|s| s.starts_with("grove-integrate-"))
+                {
+                    let _ = crate::session::tmux::kill_session(s, Some(&info));
+                    println!("  {} killed tmux session {}", "·".dimmed(), s);
+                }
+            }
+        }
+    }
+
+    // 2 + 3. chmod -R u+w then worktree remove.
+    if integration_path.exists() {
+        let _ = std::process::Command::new("chmod")
+            .args(["-R", "u+w"])
+            .arg(&integration_path)
+            .status();
+        match git_in(
+            &project_root_path,
+            &[
+                "worktree",
+                "remove",
+                "--force",
+                integration_path.to_string_lossy().as_ref(),
+            ],
+        ) {
+            Ok(_) => println!(
+                "  {} removed worktree {}",
+                "✓".green(),
+                integration_path.display()
+            ),
+            Err(e) => {
+                eprintln!(
+                    "  {} `git worktree remove` failed: {} (continuing)",
+                    "Warning:".yellow(),
+                    e
+                );
+                // Last-resort: just rm -rf. git's bookkeeping below will
+                // resync via `worktree prune`.
+                let _ = std::fs::remove_dir_all(&integration_path);
+            }
+        }
+    }
+    // Clean up any lingering gitdir registration even if worktree was
+    // already gone on disk.
+    let _ = git_in(&project_root_path, &["worktree", "prune"]);
+
+    // 4. Drop integration/* branches. Force-delete in case they're
+    //    unmerged.
+    let branches = list_integration_branches(&project_root_path);
+    for b in &branches {
+        match git_in(&project_root_path, &["branch", "-D", b]) {
+            Ok(_) => println!("  {} deleted branch {}", "✓".green(), b),
+            Err(e) => eprintln!("  {} could not delete {}: {}", "Warning:".yellow(), b, e),
+        }
+    }
+
+    // 5. Purge integrate-* agent dirs.
+    let agents_dir = project_root_path.join(".grove").join("agents");
+    if let Ok(rd) = std::fs::read_dir(&agents_dir) {
+        for entry in rd.flatten() {
+            let name = entry.file_name();
+            let name_str = name.to_string_lossy();
+            if name_str.starts_with("integrate-") {
+                let p = entry.path();
+                match std::fs::remove_dir_all(&p) {
+                    Ok(_) => {
+                        println!("  {} purged {}", "✓".green(), p.display())
+                    }
+                    Err(e) => eprintln!("  {} purge {}: {}", "Warning:".yellow(), p.display(), e),
+                }
+            }
+        }
+    }
+
+    println!("{} integrate abort complete", "✓".green());
+}
+
+/// Build a ContainerInfo from .grove/config.toml. None if config missing.
+/// Caller already confirmed `container::is_up`. Mirrors the helper in
+/// commands::agents.
+fn resolve_container_info(project_root: &Path) -> Option<ContainerInfo> {
+    let cfg_path = project_root.join(".grove").join("config.toml");
+    let raw = std::fs::read_to_string(&cfg_path).ok()?;
+    let cfg: GroveConfig = toml::from_str(&raw).ok()?;
+    let workspace_target = cfg.devcontainer.workspace_target.unwrap_or_else(|| {
+        format!(
+            "/workspaces/{}",
+            project_root
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("workspace")
+        )
+    });
+    Some(ContainerInfo::new(
+        project_root.to_path_buf(),
+        std::path::PathBuf::from(workspace_target),
+        cfg.devcontainer.remote_user,
+    ))
+}
+
+fn list_integration_branches(project: &Path) -> Vec<String> {
+    let out = Command::new("git")
+        .current_dir(project)
+        .args([
+            "branch",
+            "--list",
+            "--format=%(refname:short)",
+            "integration/*",
+        ])
+        .output();
+    let raw = match out {
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).to_string(),
+        _ => return Vec::new(),
+    };
+    raw.lines()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
 fn list_agent_branches(project: &Path) -> Result<Vec<String>, String> {
     let out = Command::new("git")
         .current_dir(project)

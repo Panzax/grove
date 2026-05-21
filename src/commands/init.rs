@@ -1061,6 +1061,12 @@ fn apply_baseline_claude_mounts(project_root: &Path) -> Result<(), String> {
         ".claude/plugins",
         ".claude/.credentials.json",
         ".claude/settings.json",
+        // Without ~/.claude.json the in-container claude sees a "fresh
+        // install" → onboarding + danger-warning prompts block the
+        // bootstrap turn. Mounting the host's onboarded state RO skips
+        // both. RO is intentional: agent's session-state writes don't
+        // leak back to the host's main claude profile.
+        ".claude.json",
     ];
     for sub in baseline_subpaths {
         let source = format!("${{localEnv:HOME}}/{}", sub);
