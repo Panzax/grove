@@ -207,16 +207,7 @@ fn run_clone(git_url: &str, no_agent: bool, assume_yes: bool) {
     run_phase1_and_phase2(&context, &project, no_agent, assume_yes);
 
     println!();
-    println!("{}", "Next steps:".bold());
-    println!("  {} {}", "cd".dimmed(), repo_name);
-    println!(
-        "  {} <name>                  # create a regular worktree",
-        "grove add".dimmed()
-    );
-    println!(
-        "  {} <name> --task \"...\"   # spawn an agent in an isolated worktree",
-        "grove spawn".dimmed()
-    );
+    print_next_steps_with_danger_accept(&repo_name);
 
     if let Some(cwd) = original_cwd {
         let _ = std::env::set_current_dir(cwd);
@@ -286,15 +277,58 @@ fn run_in_place(path: &Path, no_agent: bool, assume_yes: bool) {
     run_phase1_and_phase2(&context, &project, no_agent, assume_yes);
 
     println!();
+    print_next_steps_with_danger_accept("");
+}
+
+/// One-time setup reminder + standard next-steps. Operators MUST run
+/// `claude --dangerously-skip-permissions` once on the host and accept
+/// the warning before their first `grove spawn` — otherwise the
+/// in-container claude blocks on the acknowledgement prompt and the
+/// bootstrap turn hangs forever (no human there to press Y). Easy to
+/// miss; printing it here makes it impossible to miss.
+fn print_next_steps_with_danger_accept(repo_name_for_cd: &str) {
     println!("{}", "Next steps:".bold());
+    println!();
     println!(
-        "  {} <name>                  # create a regular worktree under worktrees/<name>",
-        "grove add".dimmed()
+        "  {} {} {}",
+        "1.".bold(),
+        "(ONE-TIME, on host)".yellow(),
+        "Accept the dangerous-mode warning so spawned agents don't hang:"
     );
     println!(
-        "  {} <name> --task \"...\"   # spawn an agent in an isolated worktree",
-        "grove spawn".dimmed()
+        "     {}",
+        "claude --dangerously-skip-permissions   # accept the prompt, then exit".dimmed()
     );
+    println!(
+        "     {}",
+        "# Persists in ~/.claude.json; grove's baseline mount surfaces it into every container."
+            .dimmed()
+    );
+    println!();
+    if !repo_name_for_cd.is_empty() {
+        println!("  {} {} {}", "2.".bold(), "cd".dimmed(), repo_name_for_cd);
+        println!(
+            "  {} {} <name>                  # create a regular worktree under worktrees/<name>",
+            "3.".bold(),
+            "grove add".dimmed()
+        );
+        println!(
+            "  {} {} <name> --task \"...\"   # spawn an agent in an isolated worktree",
+            "4.".bold(),
+            "grove spawn".dimmed()
+        );
+    } else {
+        println!(
+            "  {} {} <name>                  # create a regular worktree under worktrees/<name>",
+            "2.".bold(),
+            "grove add".dimmed()
+        );
+        println!(
+            "  {} {} <name> --task \"...\"   # spawn an agent in an isolated worktree",
+            "3.".bold(),
+            "grove spawn".dimmed()
+        );
+    }
 }
 
 // =============================================================================
