@@ -135,7 +135,16 @@ pub fn build_devcontainer_skeleton(project: &ProjectContext) -> Value {
         "updateRemoteUserUID": true,
         "workspaceFolder": workspace_folder,
         "postCreateCommand": grove_container_prereqs_command(),
-        "containerEnv": {},
+        // GH_TOKEN piped from the host's GH_TOKEN_RO (operator's existing
+        // token name; despite the misnomer the token has RW perms). gh CLI
+        // reads GH_TOKEN natively so no `gh auth login` is needed inside
+        // the container. Required by the `grove integrate` agent's
+        // `gh pr create` step. Skipped silently if GH_TOKEN_RO is unset
+        // on the host — the integrate agent will roadblock with a clear
+        // message instead of looping.
+        "containerEnv": {
+            "GH_TOKEN": "${localEnv:GH_TOKEN_RO}"
+        },
         "mounts": [],
         "customizations": {
             "vscode": {
@@ -179,6 +188,10 @@ pub fn grove_container_prereqs_command() -> String {
         r#"(command -v tmux >/dev/null || sudo apt-get install -y tmux)"#,
         r#"(command -v jq   >/dev/null || sudo apt-get install -y jq)"#,
         r#"(command -v perl >/dev/null || sudo apt-get install -y perl)"#,
+        // GitHub CLI from the official cli.github.com apt source. Required
+        // for `grove integrate` (agent runs `gh pr create`). Skipped if gh
+        // is already installed (e.g. bundled in a custom base image).
+        r#"(command -v gh >/dev/null || (curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | sudo tee /usr/share/keyrings/githubcli-archive-keyring.gpg >/dev/null && sudo chmod go+r /usr/share/keyrings/githubcli-archive-keyring.gpg && echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" | sudo tee /etc/apt/sources.list.d/github-cli.list >/dev/null && sudo apt-get update && sudo apt-get install -y gh))"#,
         // Claude Code via official npm install. Skipped if claude is already
         // on PATH (user can pre-bake it into a custom image).
         r#"(command -v claude >/dev/null || sudo npm install -g @anthropic-ai/claude-code)"#,
@@ -373,8 +386,24 @@ mod tests {
         assert!(post.contains("command -v jq"));
         assert!(post.contains("command -v perl"));
         assert!(post.contains("command -v claude"));
+        assert!(post.contains("command -v gh"));
         // Claude install path is npm (most portable). Devs can override.
         assert!(post.contains("@anthropic-ai/claude-code"));
+        // gh install path: official cli.github.com apt source.
+        assert!(post.contains("cli.github.com/packages"));
+    }
+
+    #[test]
+    fn skeleton_maps_gh_token_via_container_env() {
+        let project = ProjectContext {
+            stack: Some(ProjectStack::Rust),
+            default_image: ProjectStack::Rust.default_image().to_string(),
+            repo_name: "demo".to_string(),
+            ..Default::default()
+        };
+        let skel = build_devcontainer_skeleton(&project);
+        let env = &skel["containerEnv"];
+        assert_eq!(env["GH_TOKEN"], "${localEnv:GH_TOKEN_RO}");
     }
 
     #[test]
