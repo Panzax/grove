@@ -294,9 +294,19 @@ Messages land in `.grove/bus/`. Direct goes to `inbox/<recipient>/`; broadcast t
 #### Integrate finished work
 
 ```bash
-grove integrate --into main
-grove attach integrate-<ts>        # watch the agent do its thing
+grove integrate --into main                        # merge every agent/* branch
+grove integrate feat-a feat-b --into develop       # merge only the named branches
+grove integrate agent/feat-a feature/x --into main # mix shorthand and full ref names
+grove attach integrate-<ts>                        # watch the agent do its thing
 ```
+
+Positional branch names are optional. With none, the orchestrator merges
+every `agent/*` branch (minus `agent/shared`). With one or more names, only
+those branches are merged. Each name is resolved literally first, then with
+an `agent/` prefix — so `feat-a` resolves to `agent/feat-a` if no literal
+`feat-a` branch exists. Non-`agent/*` branches (like `feature/x`) work too;
+the agent prefix is only a fallback. Unknown names abort the run before any
+worktree side-effects.
 
 `grove integrate` is agent-driven: it sets up an integration worktree on
 `integration/<ts>` (branched off `--into`), snapshots bus + per-branch

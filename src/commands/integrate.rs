@@ -34,7 +34,7 @@ use crate::git::worktree_paths::make_worktree_pointers_relative;
 use crate::models::GroveConfig;
 use crate::session::container::{self, ContainerInfo};
 
-pub fn run(into: Option<&str>, no_test: bool) {
+pub fn run(branch_inputs: &[String], into: Option<&str>, no_test: bool) {
     let ctx = match discover_repo() {
         Ok(c) => c,
         Err(e) => {
@@ -59,16 +59,57 @@ pub fn run(into: Option<&str>, no_test: bool) {
         }
     };
 
-    // List branches BEFORE creating the integration worktree so the agent
-    // never tries to merge itself.
-    let agent_branches = list_agent_branches(&project_root_path).unwrap_or_default();
-    if agent_branches.is_empty() {
-        println!(
-            "{} no agent/* branches found; nothing to integrate",
-            "Note:".yellow()
-        );
-        return;
-    }
+    // Resolve which branches to integrate.
+    //   - No positional args   → every `agent/*` branch (minus `agent/shared`).
+    //   - Positional names     → resolve each via try-literal-then-agent-prefix.
+    //                            Unknown names abort the whole run before any
+    //                            worktree side-effects.
+    let agent_branches = if branch_inputs.is_empty() {
+        let listed = list_agent_branches(&project_root_path).unwrap_or_default();
+        if listed.is_empty() {
+            println!(
+                "{} no agent/* branches found; nothing to integrate",
+                "Note:".yellow()
+            );
+            return;
+        }
+        listed
+    } else {
+        let mut resolved = Vec::with_capacity(branch_inputs.len());
+        let mut errors = Vec::new();
+        for raw in branch_inputs {
+            match resolve_branch_input(&project_root_path, raw) {
+                Some(b) => resolved.push(b),
+                None => errors.push(raw.clone()),
+            }
+        }
+        if !errors.is_empty() {
+            eprintln!(
+                "{} no such branch(es): {}",
+                "Error:".red(),
+                errors.join(", ")
+            );
+            eprintln!(
+                "  hint: each name is tried verbatim first, then with an `agent/` prefix; pass full ref names or fix typos."
+            );
+            std::process::exit(1);
+        }
+        // Dedupe while preserving order; user-given order is the agent's
+        // starting hint (it may re-order during bootstrap anyway).
+        let mut seen = std::collections::HashSet::new();
+        resolved.retain(|b| seen.insert(b.clone()));
+        // Filter out `agent/shared` if the user listed it explicitly — the
+        // hub branch is not for integration.
+        resolved.retain(|b| b != "agent/shared");
+        if resolved.is_empty() {
+            eprintln!(
+                "{} all specified branches filtered out (agent/shared is not integratable)",
+                "Error:".red()
+            );
+            std::process::exit(1);
+        }
+        resolved
+    };
 
     let stamp = Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
     let integration_branch = format!("integration/{}", stamp);
@@ -369,6 +410,40 @@ fn make_readonly(_path: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// Resolve a user-supplied branch name to an existing local branch.
+/// Tries the literal name first (covers users who type `agent/feat-a` OR a
+/// non-agent branch like `feature/x`), then `agent/<name>` (covers the
+/// shorthand `grove integrate feat-a`). Returns the resolved branch name
+/// or None if neither exists.
+pub(crate) fn resolve_branch_input(project: &Path, raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if branch_exists(project, trimmed) {
+        return Some(trimmed.to_string());
+    }
+    let prefixed = format!("agent/{}", trimmed);
+    if branch_exists(project, &prefixed) {
+        return Some(prefixed);
+    }
+    None
+}
+
+fn branch_exists(project: &Path, name: &str) -> bool {
+    Command::new("git")
+        .current_dir(project)
+        .args([
+            "show-ref",
+            "--verify",
+            "--quiet",
+            &format!("refs/heads/{}", name),
+        ])
+        .output()
+        .map(|out| out.status.success())
+        .unwrap_or(false)
+}
+
 fn list_agent_branches(project: &Path) -> Result<Vec<String>, String> {
     let out = Command::new("git")
         .current_dir(project)
@@ -419,4 +494,115 @@ fn git_in(dir: &Path, args: &[&str]) -> Result<String, String> {
         return Err(String::from_utf8_lossy(&out.stderr).trim().to_string());
     }
     Ok(String::from_utf8_lossy(&out.stdout).to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    fn tmp_repo(label: &str) -> std::path::PathBuf {
+        let pid = std::process::id();
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let p = std::env::temp_dir().join(format!(
+            "grove-integrate-resolve-{}-{}-{}",
+            label, pid, nanos
+        ));
+        let _ = fs::remove_dir_all(&p);
+        fs::create_dir_all(&p).unwrap();
+        for args in [
+            vec!["init", "-q", "-b", "main"],
+            vec!["config", "user.email", "t@t"],
+            vec!["config", "user.name", "t"],
+        ] {
+            let out = Command::new("git")
+                .args(&args)
+                .current_dir(&p)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {:?}: {}",
+                args,
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+        fs::write(p.join("README"), "x").unwrap();
+        for args in [vec!["add", "."], vec!["commit", "-q", "-m", "init"]] {
+            let out = Command::new("git")
+                .args(&args)
+                .current_dir(&p)
+                .output()
+                .unwrap();
+            assert!(out.status.success());
+        }
+        p
+    }
+
+    fn create_branch(repo: &std::path::Path, name: &str) {
+        let out = Command::new("git")
+            .args(["branch", name])
+            .current_dir(repo)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "create branch {}: {}",
+            name,
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    #[test]
+    fn resolve_literal_branch_wins() {
+        let repo = tmp_repo("literal");
+        create_branch(&repo, "feature/foo");
+        assert_eq!(
+            resolve_branch_input(&repo, "feature/foo"),
+            Some("feature/foo".to_string())
+        );
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn resolve_falls_back_to_agent_prefix() {
+        let repo = tmp_repo("fallback");
+        create_branch(&repo, "agent/feat-a");
+        assert_eq!(
+            resolve_branch_input(&repo, "feat-a"),
+            Some("agent/feat-a".to_string())
+        );
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn resolve_literal_takes_precedence_over_agent_prefix() {
+        let repo = tmp_repo("precedence");
+        create_branch(&repo, "feat-a");
+        create_branch(&repo, "agent/feat-a");
+        // `feat-a` exists literally → must resolve to that, not agent/feat-a
+        assert_eq!(
+            resolve_branch_input(&repo, "feat-a"),
+            Some("feat-a".to_string())
+        );
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn resolve_unknown_returns_none() {
+        let repo = tmp_repo("unknown");
+        assert_eq!(resolve_branch_input(&repo, "nonexistent-branch-xyz"), None);
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn resolve_empty_input_returns_none() {
+        let repo = tmp_repo("empty");
+        assert_eq!(resolve_branch_input(&repo, ""), None);
+        assert_eq!(resolve_branch_input(&repo, "   "), None);
+        let _ = fs::remove_dir_all(&repo);
+    }
 }

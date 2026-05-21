@@ -42,12 +42,15 @@ If it fails (token missing / revoked / lacks scope), do NOT loop on retries. Mar
 ## Bootstrap protocol (do this turn only)
 
 1. **Read** the four context sources above in this order: branches.json → overlap.txt → bus → agents.
-2. **Decide merge order**. Heuristic (from overlap.txt): merge smaller-overlap branches first so each successive merge has fewer pre-staged conflicts to fight. Re-order the placeholder `[ ] merge agent/<X>` lines in `$GROVE_AGENT_DIR/STATE.md` accordingly. The orchestrator put them in alphabetical order; you decide the real order.
-3. **Tune PROMPT.md** if you want per-iteration emphasis (optional — the default tells you to pick the next workitem).
-4. **Set `loop.md active: true`**. The orchestrator left it false.
-5. **STOP THIS TURN.** Stop hook will fire, re-inject PROMPT.md, loop begins.
+2. **Invoke the plan workflow as a reasoning skill** to decide the merge order. Use the same structured thinking your training uses for plan mode (decompose → reason about dependencies → enumerate steps with success criteria), applied here to ordering the merges. **Do NOT actually call `ExitPlanMode` and do NOT wait for user approval — there is no user.** The plan workflow is the *technique*, not a tool call. If your CLI has a `/plan` slash command, treat it as off-limits in this loop; invoking it would block forever.
+3. **Flatten the merge-order plan** into the placeholder `[ ] merge agent/<X>` lines in `$GROVE_AGENT_DIR/STATE.md`. The orchestrator put them in alphabetical order; you re-order them based on the overlap.txt heuristic (smaller-overlap branches first → fewer pre-staged conflicts) plus any semantic dependencies you spotted in the per-agent STATE.md snapshots. STATE.md is the live, mutable form of your plan — when scope changes mid-loop you re-plan by editing this file.
+4. **Tune PROMPT.md** if you want per-iteration emphasis (optional — the default tells you to pick the next workitem).
+5. **Set `loop.md active: true`**. The orchestrator left it false.
+6. **STOP THIS TURN.** Stop hook will fire, re-inject PROMPT.md, loop begins.
 
 Do not perform any merges in this bootstrap turn. Plan + edit STATE/loop + stop.
+
+**Autonomy rule:** every iteration must complete without waiting on a human. If you can't decide an ordering or resolve a conflict, write your reasoning into STATE.md iteration log, make the most defensible call yourself, and proceed. Roadblock (`[!]`) only for true unsafe-without-input situations: missing `GH_TOKEN`, semantic conflict that requires user judgment to choose between competing intents, or `gh pr create` failure unrelated to auth.
 
 ## Conflict resolution protocol (per merge workitem)
 

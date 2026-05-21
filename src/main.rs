@@ -240,9 +240,17 @@ enum Commands {
         #[arg(long = "contract")]
         contract: Option<String>,
     },
-    /// Merge every agent/* branch into a disposable integration branch
+    /// Spawn an integration agent that merges agent/* branches and opens a PR.
+    /// With no positional args: merges every agent/* branch (the default).
+    /// With positional names: merges only those branches. Each name is tried
+    /// verbatim, then as `agent/<name>` — so `grove integrate feat-a feat-b`
+    /// is equivalent to `grove integrate agent/feat-a agent/feat-b`.
     Integrate {
-        /// Target branch to base the integration on (default: integration/<ts>)
+        /// Branches to integrate (defaults to all agent/* if none specified).
+        /// Each name is resolved literally first, then with an `agent/` prefix.
+        branches: Vec<String>,
+        /// Target branch to base the integration on + open the PR against
+        /// (default: the project's default branch from `git symbolic-ref`)
         #[arg(long = "into")]
         into: Option<String>,
         /// Skip the per-merge verify command
@@ -419,8 +427,12 @@ fn main() {
         }) => {
             commands::msg::run(&to, &text, from.as_deref(), contract.as_deref());
         }
-        Some(Commands::Integrate { into, no_test }) => {
-            commands::integrate::run(into.as_deref(), no_test);
+        Some(Commands::Integrate {
+            branches,
+            into,
+            no_test,
+        }) => {
+            commands::integrate::run(&branches, into.as_deref(), no_test);
         }
         Some(Commands::Devcontainer { command }) => match command {
             DevcontainerCommand::Up => commands::devcontainer::up(),
