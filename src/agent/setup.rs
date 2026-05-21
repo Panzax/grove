@@ -30,6 +30,8 @@ use crate::devcontainer::stack;
 use crate::devcontainer::{read_devcontainer_json, write_devcontainer_json};
 use crate::git::worktree_manager::{project_root, RepoContext};
 use crate::models::{ContainerBackendKind, ExtraMount, GroveConfig, ProjectContext, ProjectStack};
+use crate::session::container::{self, ContainerInfo};
+use crate::session::tmux;
 
 pub fn run_setup_wizard(
     ctx: &RepoContext,
@@ -65,7 +67,28 @@ pub fn run_setup_wizard(
     // `grove init --reconfigure` (both route through this wizard). All grove
     // commands read the result from `.grove/config.toml`, so they stay
     // arg-free.
+    let old_backend = config.container.backend;
     prompt_container_backend(&mut config)?;
+
+    // Reconfigure safety: switching backend on a live project orphans the old
+    // backend's containers/agents. Require teardown first (B7).
+    if is_reconfigure && config.container.backend != old_backend {
+        if !handle_backend_switch(&project_root_path, old_backend, config.container.backend)? {
+            config.container.backend = old_backend;
+            println!(
+                "  {} keeping the {} backend (switch cancelled)",
+                "·".dimmed(),
+                old_backend.as_str().bold()
+            );
+        }
+    }
+
+    // Sandbox mode has a trimmed flow: no devcontainer.json, no VS Code
+    // extensions — just the image/user preset, credentials, and config.
+    if config.container.backend == ContainerBackendKind::Sandbox {
+        return run_sandbox_wizard(project, &project_root_path, config);
+    }
+
     let mut devcontainer = read_devcontainer_json(&project_root_path).unwrap_or_else(|_| {
         json!({
             "name": project.repo_name,
@@ -122,6 +145,201 @@ pub fn run_setup_wizard(
     Ok(())
 }
 
+// ---------- sandbox flow ----------
+
+/// Trimmed setup flow for the sandbox backend. No devcontainer.json, no VS
+/// Code extensions (irrelevant to `docker run`): pick the environment preset
+/// (records image + user into `[sandbox]`), choose claude credential scope and
+/// GitHub auth, and persist `.grove/config.toml`. The sandbox provisions the
+/// preset image at `grove spawn` time.
+fn run_sandbox_wizard(
+    project: &ProjectContext,
+    project_root_path: &Path,
+    mut config: GroveConfig,
+) -> Result<(), String> {
+    use crate::devcontainer::preset;
+
+    println!();
+    println!(
+        "{}",
+        "Sandbox backend selected — code is copied into the container; the only egress is `git push`."
+            .dimmed()
+    );
+
+    // Preset → records the image + user the sandbox runs.
+    let chosen = select_preset(project)?;
+    if chosen.id != preset::PresetId::Custom {
+        config.sandbox.image = Some(chosen.image.to_string());
+        config.sandbox.user = Some(chosen.remote_user.to_string());
+        // Keep the canonical user field consistent across backends.
+        config.devcontainer.remote_user = chosen.remote_user.to_string();
+        println!(
+            "  {} sandbox image: {} (user {})",
+            "·".dimmed(),
+            chosen.image.bold(),
+            chosen.remote_user.bold()
+        );
+    } else {
+        println!(
+            "  {} custom: set `[sandbox] image` in .grove/config.toml manually",
+            "·".dimmed()
+        );
+    }
+
+    // Claude credential scope — applied as container mounts at spawn time.
+    prompt_claude_scope_sandbox(&mut config)?;
+
+    // GitHub auth — the sandbox injects GH_TOKEN from the host's GH_TOKEN_RO.
+    prompt_github_auth_sandbox(&mut config)?;
+
+    write_config(project_root_path, &config)?;
+    println!();
+    println!("{} wrote .grove/config.toml (sandbox backend)", "✓".green());
+    println!(
+        "  {} first `grove spawn` will pull the image and seed the sandbox; this can take a while.",
+        "·".dimmed()
+    );
+    Ok(())
+}
+
+/// Claude credential scope for sandbox mode. Records the preference; the
+/// SandboxBackend turns it into bind mounts (scoped = three RO resources,
+/// full = ~/.claude RW, none = bring-your-own) when the container is created.
+fn prompt_claude_scope_sandbox(config: &mut GroveConfig) -> Result<(), String> {
+    let theme = ColorfulTheme::default();
+    println!();
+    let options = vec![
+        "Scoped (recommended) — mount ~/.claude/{plugins,.credentials.json,settings.json} RO",
+        "Full (RW)            — mount all of ~/.claude read-write; advanced only",
+        "None                 — provision claude auth inside the image yourself",
+    ];
+    let default_idx = match config.mounts.claude_inherit.as_deref() {
+        Some("full") => 1,
+        Some("none") => 2,
+        _ => 0,
+    };
+    let idx = Select::with_theme(&theme)
+        .with_prompt("Claude credentials in the sandbox")
+        .items(&options)
+        .default(default_idx)
+        .interact()
+        .map_err(|e| format!("prompt: {}", e))?;
+    config.mounts.claude_inherit = Some(match idx {
+        1 => "full",
+        2 => "none",
+        _ => "scoped",
+    }
+    .to_string());
+    Ok(())
+}
+
+/// GitHub auth for sandbox mode. The sandbox forwards the host's `GH_TOKEN_RO`
+/// as `GH_TOKEN`; this records whether to do so and prints the setup tip.
+fn prompt_github_auth_sandbox(config: &mut GroveConfig) -> Result<(), String> {
+    let theme = ColorfulTheme::default();
+    println!();
+    let options = vec![
+        "PAT via GH_TOKEN_RO (recommended) — forwarded into the sandbox as GH_TOKEN",
+        "Skip (no GitHub access from inside the sandbox)",
+    ];
+    let default_idx = match config.mounts.gh_auth.as_deref() {
+        Some("none") => 1,
+        _ => 0,
+    };
+    let idx = Select::with_theme(&theme)
+        .with_prompt("GitHub authentication")
+        .items(&options)
+        .default(default_idx)
+        .interact()
+        .map_err(|e| format!("prompt: {}", e))?;
+    if idx == 0 {
+        config.mounts.gh_auth = Some("pat".to_string());
+        println!(
+            "  {} Set GH_TOKEN_RO on your host shell with a fine-grained PAT (Contents: Read-only).",
+            "Tip:".cyan()
+        );
+    } else {
+        config.mounts.gh_auth = Some("none".to_string());
+    }
+    Ok(())
+}
+
+/// B7 — reconfigure safety. When the backend changes, the old backend's
+/// containers/agents would be orphaned. If agents are live on the old backend,
+/// require explicit teardown before switching. Returns Ok(true) to proceed
+/// with the switch, Ok(false) to keep the old backend.
+///
+/// `.grove/config.toml` still holds the OLD backend at this point (the wizard
+/// writes the new value only at the end), so `container::*`/`tmux::*` route to
+/// the old backend here.
+fn handle_backend_switch(
+    project_root_path: &Path,
+    old: ContainerBackendKind,
+    new: ContainerBackendKind,
+) -> Result<bool, String> {
+    let info = backend_container_info(project_root_path, old);
+    let sessions = tmux::list_grove_sessions(Some(&info)).unwrap_or_default();
+
+    if sessions.is_empty() {
+        // No live agents — safe to switch. Best-effort teardown of the old
+        // container so it isn't orphaned.
+        let _ = container::down(project_root_path);
+        return Ok(true);
+    }
+
+    println!();
+    println!(
+        "  {} {} agent session(s) are live on the {} backend: {}",
+        "Warning:".yellow(),
+        sessions.len(),
+        old.as_str(),
+        sessions.join(", ")
+    );
+    let confirm = Confirm::with_theme(&ColorfulTheme::default())
+        .with_prompt(format!(
+            "Tear them down + remove the old {} container to switch to {}?",
+            old.as_str(),
+            new.as_str()
+        ))
+        .default(false)
+        .interact()
+        .map_err(|e| format!("prompt: {}", e))?;
+    if !confirm {
+        return Ok(false);
+    }
+    for s in &sessions {
+        let _ = tmux::kill_session(s, Some(&info));
+    }
+    container::down(project_root_path)?;
+    println!("  {} tore down the old {} backend", "·".dimmed(), old.as_str());
+    Ok(true)
+}
+
+/// Build a `ContainerInfo` addressing the given backend for a project, used to
+/// probe/tear down the *current* (pre-switch) backend during reconfigure.
+fn backend_container_info(project_root_path: &Path, kind: ContainerBackendKind) -> ContainerInfo {
+    match kind {
+        ContainerBackendKind::Sandbox => crate::session::backend::sandbox_info(project_root_path),
+        ContainerBackendKind::Devcontainer => {
+            let cfg = read_or_default_config(project_root_path);
+            let target = cfg.devcontainer.workspace_target.unwrap_or_else(|| {
+                format!(
+                    "/workspaces/{}",
+                    project_root_path
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or("workspace")
+                )
+            });
+            ContainerInfo::new(
+                project_root_path.to_path_buf(),
+                std::path::PathBuf::from(target),
+                cfg.devcontainer.remote_user,
+            )
+        }
+    }
+}
+
 // ---------- prompts ----------
 
 /// Prompt 0: choose the container backend. Defaults to the current config
@@ -162,11 +380,11 @@ fn prompt_container_backend(config: &mut GroveConfig) -> Result<(), String> {
 /// container user, features, and extensions, and records the user in config —
 /// so the container is ready to use with nothing to hand-edit. `custom` leaves
 /// the existing image/devcontainer.json untouched.
-fn prompt_environment_preset(
+/// Run the environment-preset `Select` prompt, pre-selecting the preset that
+/// matches the detected stack. Shared by the devcontainer and sandbox flows.
+fn select_preset(
     project: &ProjectContext,
-    config: &mut GroveConfig,
-    devcontainer: &mut Value,
-) -> Result<(), String> {
+) -> Result<&'static crate::devcontainer::preset::EnvironmentPreset, String> {
     use crate::devcontainer::preset;
     let theme = ColorfulTheme::default();
     let presets = preset::all();
@@ -183,7 +401,16 @@ fn prompt_environment_preset(
         .default(default_idx)
         .interact()
         .map_err(|e| format!("prompt: {}", e))?;
-    let chosen = presets[idx];
+    Ok(presets[idx])
+}
+
+fn prompt_environment_preset(
+    project: &ProjectContext,
+    config: &mut GroveConfig,
+    devcontainer: &mut Value,
+) -> Result<(), String> {
+    use crate::devcontainer::preset;
+    let chosen = select_preset(project)?;
 
     if chosen.id == preset::PresetId::Custom {
         println!(

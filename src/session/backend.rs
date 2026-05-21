@@ -288,10 +288,21 @@ fn host_uid_gid() -> (String, String) {
     )
 }
 
-/// Writable HOME for the sandbox process. Lives under the bind-mounted
-/// `.grove/` so it's host-owned (host uid) and persists across restarts.
-fn sandbox_home(project_root: &Path) -> PathBuf {
-    project_root.join(".grove").join(".sandbox-home")
+/// Container-side HOME for the sandbox process. A plain container-fs path (not
+/// host-identical — HOME needn't be) so claude/git config + caches live in the
+/// copy-in filesystem, isolated from the host. Persists across stop/start;
+/// reset on container removal (re-seeded on recreate).
+const SANDBOX_HOME: &str = "/sbhome";
+
+/// Expand a leading `~` against the host HOME. Used to resolve mount sources
+/// like `~/.claude` declared in config.
+fn expand_home(path: &str) -> String {
+    if let Some(rest) = path.strip_prefix("~/") {
+        if let Ok(home) = std::env::var("HOME") {
+            return format!("{}/{}", home.trim_end_matches('/'), rest);
+        }
+    }
+    path.to_string()
 }
 
 fn sandbox_container_info(canonical_root: &Path) -> ContainerInfo {
@@ -415,8 +426,6 @@ fn create_and_seed(root: &Path, name: &str) -> Result<(), String> {
             grove_dir.display()
         ));
     }
-    let home = sandbox_home(root);
-    std::fs::create_dir_all(&home).map_err(|e| format!("create sandbox HOME {}: {}", home.display(), e))?;
 
     // 1. Bundle the full committed history (all refs) from the host bare clone.
     let bundle = std::env::temp_dir().join(format!("{}.bundle", name));
@@ -444,27 +453,30 @@ fn create_and_seed(root: &Path, name: &str) -> Result<(), String> {
         .unwrap_or_else(|| "grove@localhost".to_string());
 
     // 3. Create the container: long-lived (`sleep infinity`), host uid, GH
-    //    token injected, HOME + the .grove control plane bind-mounted.
+    //    token injected, the .grove control plane bind-mounted, plus any
+    //    claude-credential mounts the config asks for.
+    let extra_mounts = sandbox_extra_mounts(root);
     let create_args = build_create_args(
         name,
         root,
         &sandbox_image(root),
-        &home,
+        SANDBOX_HOME,
         std::env::var("GH_TOKEN_RO").ok().as_deref(),
+        &extra_mounts,
     );
     let refs: Vec<&str> = create_args.iter().map(|s| s.as_str()).collect();
     docker_run_checked(&refs, "docker run").map_err(|e| {
         format!("{}\n  (image: {})", e, sandbox_image(root))
     })?;
 
-    // 4. As root: make the project root writable by the host uid so the
+    // 4. As root: make the project root + HOME writable by the host uid so the
     //    subsequent (unprivileged) git clone + worktree adds can create the
     //    bare repo and worktree dirs. Only the root node is chowned — the
     //    bind-mounted .grove keeps its host ownership.
     let (uid, gid) = host_uid_gid();
     let chown_target = format!("{}:{}", uid, gid);
-    seed_exec(name, root, Some("0"), &["mkdir", "-p", &root.to_string_lossy()])?;
-    seed_exec(name, root, Some("0"), &["chown", &chown_target, &root.to_string_lossy()])?;
+    seed_exec(name, root, Some("0"), &["mkdir", "-p", &root.to_string_lossy(), SANDBOX_HOME])?;
+    seed_exec(name, root, Some("0"), &["chown", &chown_target, &root.to_string_lossy(), SANDBOX_HOME])?;
 
     // 5. Copy the bundle in and clone it as a bare repo at the host bare-clone
     //    path. `docker cp` lands it as root; readable by the clone.
@@ -506,13 +518,46 @@ fn create_and_seed(root: &Path, name: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Mounts to add beyond `.grove/`, derived from config (claude credentials).
+/// Each entry is `(host_source, container_target, readonly)`; only sources that
+/// exist on the host are included so `docker run` never auto-creates empty
+/// root-owned stand-ins.
+fn sandbox_extra_mounts(project_root: &Path) -> Vec<(String, String, bool)> {
+    let claude = read_config(project_root)
+        .and_then(|c| c.mounts.claude_inherit)
+        .unwrap_or_else(|| "scoped".to_string());
+    let mut out = Vec::new();
+    let claude_home = format!("{}/.claude", SANDBOX_HOME);
+    match claude.as_str() {
+        "none" => {}
+        "full" => {
+            let src = expand_home("~/.claude");
+            if Path::new(&src).exists() {
+                out.push((src, claude_home, false));
+            }
+        }
+        // scoped (default): the same three RO resources the devcontainer
+        // baseline mounts, but only when present on the host.
+        _ => {
+            for leaf in ["plugins", ".credentials.json", "settings.json"] {
+                let src = expand_home(&format!("~/.claude/{}", leaf));
+                if Path::new(&src).exists() {
+                    out.push((src, format!("{}/{}", claude_home, leaf), true));
+                }
+            }
+        }
+    }
+    out
+}
+
 /// Build the `docker run` argv for the sandbox container (pure, unit-tested).
 fn build_create_args(
     name: &str,
     root: &Path,
     image: &str,
-    home: &Path,
+    home: &str,
     gh_token: Option<&str>,
+    extra_mounts: &[(String, String, bool)],
 ) -> Vec<String> {
     let (uid, gid) = host_uid_gid();
     let root_str = root.to_string_lossy().to_string();
@@ -527,11 +572,19 @@ fn build_create_args(
         "-w".to_string(),
         root_str.clone(),
         "-e".to_string(),
-        format!("HOME={}", home.to_string_lossy()),
+        format!("HOME={}", home),
         // Bind only the control plane — code is copied in, never mounted.
         "--mount".to_string(),
         format!("type=bind,source={},target={}/.grove", grove_src, root_str),
     ];
+    for (src, target, ro) in extra_mounts {
+        args.push("--mount".to_string());
+        let mut spec = format!("type=bind,source={},target={}", src, target);
+        if *ro {
+            spec.push_str(",readonly");
+        }
+        args.push(spec);
+    }
     if let Some(tok) = gh_token {
         if !tok.trim().is_empty() {
             args.push("-e".to_string());
@@ -660,8 +713,13 @@ mod tests {
             "grove-sb-x",
             Path::new("/home/u/proj"),
             "img:tag",
-            Path::new("/home/u/proj/.grove/.sandbox-home"),
+            "/sbhome",
             Some("ghp_test"),
+            &[(
+                "/host/.claude/settings.json".to_string(),
+                "/sbhome/.claude/settings.json".to_string(),
+                true,
+            )],
         );
         assert_eq!(args[0], "run");
         assert!(args.contains(&"-d".to_string()));
@@ -682,17 +740,15 @@ mod tests {
         assert!(mount.contains("target=/home/u/proj/.grove"));
         // GH token forwarded
         assert!(args.iter().any(|a| a == "GH_TOKEN=ghp_test"));
+        // extra claude mount present + readonly
+        assert!(args
+            .iter()
+            .any(|a| a.contains("/sbhome/.claude/settings.json") && a.contains("readonly")));
     }
 
     #[test]
     fn build_create_args_omits_gh_token_when_absent() {
-        let args = build_create_args(
-            "grove-sb-x",
-            Path::new("/p"),
-            "img",
-            Path::new("/p/.grove/.sandbox-home"),
-            None,
-        );
+        let args = build_create_args("grove-sb-x", Path::new("/p"), "img", "/sbhome", None, &[]);
         assert!(!args.iter().any(|a| a.starts_with("GH_TOKEN=")));
     }
 }
