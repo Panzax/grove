@@ -42,6 +42,23 @@ pub fn run(branch_inputs: &[String], into: Option<&str>, no_test: bool) {
             std::process::exit(1);
         }
     };
+    if ctx.is_sandbox() {
+        eprintln!(
+            "{} `grove integrate` is not yet supported in sandbox mode.",
+            "Error:".red()
+        );
+        eprintln!(
+            "  Sandbox agents merge + open PRs from inside the container; the orchestrated"
+        );
+        eprintln!(
+            "  integrate flow (in-container merges + context snapshot) is the next increment."
+        );
+        eprintln!(
+            "  For now, integrate manually: `grove attach <agent>`, merge the agent/* branches,"
+        );
+        eprintln!("  and `gh pr create` from inside the sandbox.");
+        std::process::exit(1);
+    }
     let project_root_path = project_root(&ctx).to_path_buf();
 
     // Resolve target branch (PR base).
@@ -464,6 +481,13 @@ pub fn abort() {
             std::process::exit(1);
         }
     };
+    if ctx.is_sandbox() {
+        eprintln!(
+            "{} `grove integrate --abort` is not applicable in sandbox mode (no host-side integration worktree).",
+            "Error:".red()
+        );
+        std::process::exit(1);
+    }
     let project_root_path = project_root(&ctx).to_path_buf();
     let integration_path = project_root_path.join("worktrees").join(".integration");
 

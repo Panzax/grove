@@ -12,7 +12,7 @@ use colored::Colorize;
 
 use crate::agent::seed;
 use crate::git::worktree_manager::{
-    add_worktree, branch_exists, discover_repo, layout, project_root,
+    add_worktree, branch_exists, discover_repo, layout, list_worktrees, project_root, RepoContext,
 };
 use crate::git::worktree_paths::make_worktree_pointers_relative;
 use crate::models::{AgentMetadata, ProjectLayout};
@@ -462,7 +462,7 @@ fn fresh_agent(
                 );
                 std::process::exit(1);
             }
-            if let Some(other_wt) = branch_already_checked_out(project_root_path, b) {
+            if let Some(other_wt) = branch_already_checked_out(ctx, b) {
                 eprintln!(
                     "{} --branch {} is already checked out at {} (git allows only one worktree per branch).",
                     "Error:".red(),
@@ -491,30 +491,27 @@ fn fresh_agent(
         target_branch.bold()
     );
 
-    // Rewrite the two .git pointer files (forward + back) to use RELATIVE
-    // paths so the worktree resolves identically on host and inside the
-    // devcontainer (host /home/u/proj vs container /workspaces/proj).
-    if let Err(e) = make_worktree_pointers_relative(worktree_path) {
-        eprintln!(
-            "  {} rewrite worktree pointers to relative: {} (git ops inside the container may fail)",
-            "Warning:".yellow(),
-            e
-        );
+    // Devcontainer mode bind-mounts the worktree at a different container path,
+    // so the .git pointers must be relativized to resolve on both sides.
+    // Sandbox mode mirrors host paths exactly and the worktree is created
+    // INSIDE the container, so the pointers are already correct — skip (the
+    // worktree doesn't even exist on the host to rewrite).
+    if ctx.is_sandbox() {
+        link_grove(ctx, worktree_path, project_root_path);
     } else {
-        println!(
-            "  {} relativized .git pointers (works under host + container)",
-            "·".dimmed()
-        );
-    }
-
-    if let Err(e) = seed::link_grove_into_worktree(worktree_path, project_root_path) {
-        eprintln!("  {} link .grove into worktree: {}", "Warning:".yellow(), e);
-    } else {
-        println!(
-            "  {} linked .grove -> {}/.grove",
-            "·".dimmed(),
-            project_root_path.display()
-        );
+        if let Err(e) = make_worktree_pointers_relative(worktree_path) {
+            eprintln!(
+                "  {} rewrite worktree pointers to relative: {} (git ops inside the container may fail)",
+                "Warning:".yellow(),
+                e
+            );
+        } else {
+            println!(
+                "  {} relativized .git pointers (works under host + container)",
+                "·".dimmed()
+            );
+        }
+        link_grove(ctx, worktree_path, project_root_path);
     }
 
     let agent_dir = match seed::seed_agent(project_root_path, name, task, promise, max_iter) {
@@ -632,19 +629,20 @@ fn resume_agent(
 
     // Always relativize pointers on resume — covers two cases: (1) a fresh
     // re-create above; (2) a worktree from an older grove that wrote absolute
-    // paths. Idempotent when already relative.
-    if let Err(e) = make_worktree_pointers_relative(worktree_path) {
-        eprintln!(
-            "  {} rewrite worktree pointers to relative: {}",
-            "Warning:".yellow(),
-            e
-        );
+    // paths. Idempotent when already relative. Skipped in sandbox mode (paths
+    // are identical and the worktree lives in the container, not on the host).
+    if !ctx.is_sandbox() {
+        if let Err(e) = make_worktree_pointers_relative(worktree_path) {
+            eprintln!(
+                "  {} rewrite worktree pointers to relative: {}",
+                "Warning:".yellow(),
+                e
+            );
+        }
     }
 
     // Re-link .grove (idempotent — Ok if symlink exists).
-    if let Err(e) = seed::link_grove_into_worktree(worktree_path, project_root_path) {
-        eprintln!("  {} link .grove into worktree: {}", "Warning:".yellow(), e);
-    }
+    link_grove(ctx, worktree_path, project_root_path);
 
     // Clear stale session_id in loop.md so the Stop hook's isolation guard
     // doesn't silently reject the new claude session.
@@ -665,31 +663,35 @@ fn resume_agent(
     (agent_dir.to_path_buf(), recorded_branch)
 }
 
-/// Returns the path of the worktree that already has `branch` checked out, if any.
-/// Walks `git worktree list --porcelain` against the project root (works for both
-/// bare and in-place layouts via cwd handling).
-fn branch_already_checked_out(project_root: &Path, branch: &str) -> Option<String> {
-    let out = std::process::Command::new("git")
-        .args(["worktree", "list", "--porcelain"])
-        .current_dir(project_root)
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
+/// Link the project's `.grove/` into the worktree so the Stop hook + framework
+/// docs resolve from the agent's cwd. Routes into the sandbox container in
+/// sandbox mode (the worktree lives there); creates a host symlink otherwise.
+fn link_grove(ctx: &RepoContext, worktree_path: &Path, project_root_path: &Path) {
+    let res = if ctx.is_sandbox() {
+        seed::link_grove_into_worktree_sandbox(worktree_path, project_root_path)
+    } else {
+        seed::link_grove_into_worktree(worktree_path, project_root_path)
+    };
+    match res {
+        Ok(()) => println!(
+            "  {} linked .grove -> {}/.grove",
+            "·".dimmed(),
+            project_root_path.display()
+        ),
+        Err(e) => eprintln!("  {} link .grove into worktree: {}", "Warning:".yellow(), e),
     }
-    let raw = String::from_utf8_lossy(&out.stdout);
-    let mut current_path: Option<String> = None;
-    for line in raw.lines() {
-        if let Some(rest) = line.strip_prefix("worktree ") {
-            current_path = Some(rest.to_string());
-        } else if let Some(rest) = line.strip_prefix("branch ") {
-            let trimmed = rest.trim_start_matches("refs/heads/");
-            if trimmed == branch {
-                return current_path.clone();
-            }
-        }
-    }
-    None
+}
+
+/// Returns the path of the worktree that already has `branch` checked out, if
+/// any. Reuses `list_worktrees`, which routes to the host or the sandbox
+/// container as appropriate — so in sandbox mode it inspects the seeded repo's
+/// worktrees inside the container, not the (worktree-less) host bare clone.
+fn branch_already_checked_out(ctx: &RepoContext, branch: &str) -> Option<String> {
+    list_worktrees(ctx)
+        .ok()?
+        .into_iter()
+        .find(|w| w.branch == branch)
+        .map(|w| w.path)
 }
 
 /// Bring the project's devcontainer up. Hard-errors on failure — grove is an

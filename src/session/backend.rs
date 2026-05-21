@@ -186,6 +186,20 @@ impl ContainerBackend for SandboxBackend {
 // Identity + configuration
 // -----------------------------------------------------------------------------
 
+/// True when the project at `project_root` is configured for the sandbox
+/// backend. Read by the git layer to decide whether worktree/branch ops run on
+/// the host or inside the per-project sandbox container.
+pub fn project_is_sandbox(project_root: &Path) -> bool {
+    matches!(read_backend_kind(project_root), ContainerBackendKind::Sandbox)
+}
+
+/// The identical-path `ContainerInfo` for a sandbox project (workspace_target
+/// == workspace_root). Cheap to build — used to address the sandbox for
+/// `container::exec` from git call sites that only hold a project root.
+pub fn sandbox_info(project_root: &Path) -> ContainerInfo {
+    sandbox_container_info(&canonical(project_root))
+}
+
 /// Canonicalize a path, falling back to the input when it doesn't exist yet.
 fn canonical(p: &Path) -> PathBuf {
     std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf())

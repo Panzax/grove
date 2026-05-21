@@ -191,6 +191,84 @@ pub fn link_grove_into_worktree(_worktree_path: &Path, _project_root: &Path) -> 
     Ok(())
 }
 
+/// Sandbox variant of [`link_grove_into_worktree`]. The worktree lives inside
+/// the sandbox container (not on the host), so the symlink and the per-worktree
+/// `info/exclude` entry are created in the container via the backend exec seam.
+///
+/// `.grove/` is bind-mounted at `<project_root>/.grove` (identical path on both
+/// sides), so the relative `../.grove` target resolves to the shared control
+/// plane exactly as it does for a host worktree.
+pub fn link_grove_into_worktree_sandbox(
+    worktree_path: &Path,
+    project_root: &Path,
+) -> Result<(), String> {
+    let target = relative_path_to_grove_lexical(worktree_path, project_root).ok_or_else(|| {
+        format!(
+            "worktree {} is not under project root {}",
+            worktree_path.display(),
+            project_root.display()
+        )
+    })?;
+    let info = crate::session::backend::sandbox_info(project_root);
+    let link = worktree_path.join(".grove");
+
+    // `ln -sfn` is idempotent: replaces a stale symlink, leaves a correct one.
+    let out = crate::session::container::exec(
+        &info,
+        &[
+            "ln",
+            "-sfn",
+            &target.to_string_lossy(),
+            &link.to_string_lossy(),
+        ],
+    )?;
+    if !out.status.success() {
+        return Err(format!(
+            "ln -s .grove in sandbox: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+
+    // Append `.grove` to the worktree's git info/exclude (idempotently) so
+    // `git status` inside the worktree doesn't flag the symlink as untracked.
+    let wt = worktree_path.to_string_lossy().to_string();
+    let script = format!(
+        "d=$(git -C {wt} rev-parse --git-dir) && mkdir -p \"$d/info\" && \
+         (grep -qxF .grove \"$d/info/exclude\" 2>/dev/null || echo .grove >> \"$d/info/exclude\")",
+        wt = shell_single_quote(&wt)
+    );
+    let _ = crate::session::container::exec(&info, &["sh", "-c", &script]);
+    Ok(())
+}
+
+/// Lexical (no-canonicalize) variant of `relative_path_to_grove` for sandbox
+/// worktrees, whose paths don't exist on the host so `canonicalize` would fail.
+/// Both inputs are already clean absolute paths (`project_root.join(name)`).
+#[cfg(unix)]
+fn relative_path_to_grove_lexical(worktree_path: &Path, project_root: &Path) -> Option<PathBuf> {
+    let relative = worktree_path.strip_prefix(project_root).ok()?;
+    let depth = relative.components().count();
+    if depth == 0 {
+        return None;
+    }
+    let mut up = PathBuf::new();
+    for _ in 0..depth {
+        up.push("..");
+    }
+    up.push(".grove");
+    Some(up)
+}
+
+#[cfg(not(unix))]
+fn relative_path_to_grove_lexical(_worktree_path: &Path, _project_root: &Path) -> Option<PathBuf> {
+    None
+}
+
+/// Minimal single-quote shell escape for embedding a path in an `sh -c` string.
+fn shell_single_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
 /// Compute `../../...../.grove` such that, when used as a symlink target inside
 /// the worktree, it resolves to `<project_root>/.grove`.
 fn relative_path_to_grove(worktree_path: &Path, project_root: &Path) -> Option<PathBuf> {

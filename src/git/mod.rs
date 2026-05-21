@@ -1,3 +1,4 @@
+pub mod git_exec;
 pub mod worktree_manager;
 pub mod worktree_paths;
 
