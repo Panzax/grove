@@ -208,8 +208,14 @@ mod tests {
 
         // Sanity: git writes absolute paths by default.
         let forward = fs::read_to_string(wt.join(".git")).unwrap();
+        let forward_target = forward
+            .lines()
+            .next()
+            .unwrap()
+            .trim_start_matches("gitdir: ")
+            .trim();
         assert!(
-            forward.contains(root.to_str().unwrap()),
+            Path::new(forward_target).is_absolute(),
             "expected absolute path in forward pointer; got {}",
             forward
         );
@@ -218,9 +224,12 @@ mod tests {
         make_worktree_pointers_relative(&wt).unwrap();
 
         // Both files now contain relative paths and git still agrees.
+        // Normalize platform separators (Windows uses `\`) so assertions stay
+        // separator-agnostic.
         let forward = fs::read_to_string(wt.join(".git")).unwrap();
+        let forward_norm = forward.replace('\\', "/");
         assert!(
-            forward.starts_with("gitdir: ../../.git/worktrees/agent-a"),
+            forward_norm.starts_with("gitdir: ../../.git/worktrees/agent-a"),
             "forward not relative: {}",
             forward
         );
@@ -231,8 +240,9 @@ mod tests {
                 .join("gitdir"),
         )
         .unwrap();
+        let back_norm = back.replace('\\', "/");
         assert!(
-            back.starts_with("../../../worktrees/agent-a/.git"),
+            back_norm.starts_with("../../../worktrees/agent-a/.git"),
             "back not relative: {}",
             back
         );
