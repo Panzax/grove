@@ -42,17 +42,28 @@ pub fn make_worktree_pointers_relative(worktree_path: &Path) -> Result<(), Strin
     // Resolve the gitdir worktree subdir (`<main_gitdir>/worktrees/<n>`) as
     // an absolute path. If the existing forward pointer is relative, resolve
     // against `worktree_path`; if absolute, use as-is.
-    let gitdir_subdir_abs = if Path::new(&forward_target_str).is_absolute() {
+    let gitdir_subdir_raw = if Path::new(&forward_target_str).is_absolute() {
         PathBuf::from(&forward_target_str)
     } else {
         worktree_path.join(&forward_target_str)
     };
-    let gitdir_subdir_abs = normalize(&gitdir_subdir_abs);
 
-    // Both pointer rewrites compute a path RELATIVE to a directory:
-    //   forward: from `<worktree_path>` (dir)        → to `<gitdir_subdir>` (dir)
-    //   back:    from `<gitdir_subdir>` (dir)        → to `<worktree_path>/.git` (file)
-    let worktree_abs = normalize(worktree_path);
+    // Canonicalize both sides before component matching so that Windows
+    // short-name (8.3) vs long-name (`RUNNER~1` vs `runneradmin`) or symlink
+    // chains don't produce diverging components for what is actually the
+    // same directory tree. Lexical-only normalization (the previous behavior)
+    // fails on Windows GitHub runners where git canonicalizes worktree paths
+    // to the long form but `std::env::temp_dir()` returns the short form.
+    // Falls back to lexical normalize if canonicalize fails (e.g. file
+    // missing on disk).
+    let gitdir_subdir_abs = gitdir_subdir_raw
+        .canonicalize()
+        .map(|p| normalize(&p))
+        .unwrap_or_else(|_| normalize(&gitdir_subdir_raw));
+    let worktree_abs = worktree_path
+        .canonicalize()
+        .map(|p| normalize(&p))
+        .unwrap_or_else(|_| normalize(worktree_path));
 
     let forward_rel = relative_path(&worktree_abs, &gitdir_subdir_abs);
     let new_forward = format!("gitdir: {}\n", forward_rel.display());

@@ -232,20 +232,23 @@ pub fn read_head_or_empty(ctx: &RepoContext, file: &str) -> String {
 /// Returns the `${localEnv:HOME}/...` source string, or None if no
 /// host config is present (init prints a skip note).
 pub fn detect_host_tmux_conf() -> Option<&'static str> {
-    let home = match std::env::var("HOME") {
-        Ok(h) if !h.is_empty() => h,
-        _ => return None,
-    };
+    let home = std::env::var("HOME").ok().filter(|s| !s.is_empty())?;
+    detect_host_tmux_conf_in(Path::new(&home))
+}
+
+/// Inner helper that takes the home directory as a parameter instead of
+/// reading the env. Tests use this directly so they don't have to mutate
+/// the global `HOME` env var (which races under parallel `cargo test`).
+fn detect_host_tmux_conf_in(home: &Path) -> Option<&'static str> {
     let candidates: [(&str, &str); 2] = [
         (
-            "/.config/tmux/tmux.conf",
+            ".config/tmux/tmux.conf",
             "${localEnv:HOME}/.config/tmux/tmux.conf",
         ),
-        ("/.tmux.conf", "${localEnv:HOME}/.tmux.conf"),
+        (".tmux.conf", "${localEnv:HOME}/.tmux.conf"),
     ];
     for (suffix, mount_source) in candidates {
-        let probe = format!("{}{}", home, suffix);
-        if std::path::Path::new(&probe).is_file() {
+        if home.join(suffix).is_file() {
             return Some(mount_source);
         }
     }
@@ -264,7 +267,16 @@ pub fn detect_host_tmux_conf() -> Option<&'static str> {
 /// Returns Ok(true) if a mount was added, Ok(false) if no host conf was
 /// detected or the mount was already present.
 pub fn apply_baseline_tmux_mount(project_root: &Path) -> Result<bool, String> {
-    let Some(mount_source) = detect_host_tmux_conf() else {
+    apply_baseline_tmux_mount_with(project_root, detect_host_tmux_conf())
+}
+
+/// Inner helper that accepts the pre-detected mount source. Tests call
+/// this directly so they don't have to set `HOME` (parallel-test race).
+fn apply_baseline_tmux_mount_with(
+    project_root: &Path,
+    mount_source: Option<&str>,
+) -> Result<bool, String> {
+    let Some(mount_source) = mount_source else {
         return Ok(false);
     };
     let dev_path = project_root.join(".devcontainer").join("devcontainer.json");
@@ -404,9 +416,7 @@ mod tests {
         let home = tmp_dir("xdg");
         fs::create_dir_all(home.join(".config/tmux")).unwrap();
         fs::write(home.join(".config/tmux/tmux.conf"), "set -g status off").unwrap();
-        std::env::set_var("HOME", &home);
-        let got = detect_host_tmux_conf();
-        std::env::remove_var("HOME");
+        let got = detect_host_tmux_conf_in(&home);
         assert_eq!(got, Some("${localEnv:HOME}/.config/tmux/tmux.conf"));
         let _ = fs::remove_dir_all(&home);
     }
@@ -415,9 +425,7 @@ mod tests {
     fn detect_falls_back_to_legacy() {
         let home = tmp_dir("legacy");
         fs::write(home.join(".tmux.conf"), "set -g status off").unwrap();
-        std::env::set_var("HOME", &home);
-        let got = detect_host_tmux_conf();
-        std::env::remove_var("HOME");
+        let got = detect_host_tmux_conf_in(&home);
         assert_eq!(got, Some("${localEnv:HOME}/.tmux.conf"));
         let _ = fs::remove_dir_all(&home);
     }
@@ -428,9 +436,7 @@ mod tests {
         fs::create_dir_all(home.join(".config/tmux")).unwrap();
         fs::write(home.join(".config/tmux/tmux.conf"), "xdg").unwrap();
         fs::write(home.join(".tmux.conf"), "legacy").unwrap();
-        std::env::set_var("HOME", &home);
-        let got = detect_host_tmux_conf();
-        std::env::remove_var("HOME");
+        let got = detect_host_tmux_conf_in(&home);
         assert_eq!(got, Some("${localEnv:HOME}/.config/tmux/tmux.conf"));
         let _ = fs::remove_dir_all(&home);
     }
@@ -438,65 +444,55 @@ mod tests {
     #[test]
     fn detect_returns_none_when_no_conf() {
         let home = tmp_dir("empty");
-        std::env::set_var("HOME", &home);
-        let got = detect_host_tmux_conf();
-        std::env::remove_var("HOME");
+        let got = detect_host_tmux_conf_in(&home);
         assert_eq!(got, None);
         let _ = fs::remove_dir_all(&home);
     }
 
     #[test]
     fn apply_baseline_tmux_mount_writes_entry() {
-        let home = tmp_dir("apply");
-        fs::write(home.join(".tmux.conf"), "set -g status off").unwrap();
         let project_root = tmp_dir("apply-proj");
         write_devcontainer(&project_root);
-        std::env::set_var("HOME", &home);
-        let added = apply_baseline_tmux_mount(&project_root).unwrap();
-        std::env::remove_var("HOME");
+        let added =
+            apply_baseline_tmux_mount_with(&project_root, Some("${localEnv:HOME}/.tmux.conf"))
+                .unwrap();
         assert!(added);
         let body =
             fs::read_to_string(project_root.join(".devcontainer/devcontainer.json")).unwrap();
         assert!(body.contains("${localEnv:HOME}/.tmux.conf"));
         assert!(body.contains("target=/home/vscode/.tmux.conf"));
         assert!(body.contains("readonly"));
-        let _ = fs::remove_dir_all(&home);
         let _ = fs::remove_dir_all(&project_root);
     }
 
     #[test]
     fn apply_baseline_tmux_mount_idempotent() {
-        let home = tmp_dir("idem");
-        fs::write(home.join(".tmux.conf"), "x").unwrap();
         let project_root = tmp_dir("idem-proj");
         write_devcontainer(&project_root);
-        std::env::set_var("HOME", &home);
-        let first = apply_baseline_tmux_mount(&project_root).unwrap();
-        let second = apply_baseline_tmux_mount(&project_root).unwrap();
-        std::env::remove_var("HOME");
+        let first =
+            apply_baseline_tmux_mount_with(&project_root, Some("${localEnv:HOME}/.tmux.conf"))
+                .unwrap();
+        let second =
+            apply_baseline_tmux_mount_with(&project_root, Some("${localEnv:HOME}/.tmux.conf"))
+                .unwrap();
         assert!(first);
         assert!(!second, "second call should be a no-op");
         let body =
             fs::read_to_string(project_root.join(".devcontainer/devcontainer.json")).unwrap();
         let count = body.matches("target=/home/vscode/.tmux.conf").count();
         assert_eq!(count, 1, "mount must appear exactly once");
-        let _ = fs::remove_dir_all(&home);
         let _ = fs::remove_dir_all(&project_root);
     }
 
     #[test]
     fn apply_baseline_tmux_mount_skips_without_host_conf() {
-        let home = tmp_dir("none");
         let project_root = tmp_dir("none-proj");
         write_devcontainer(&project_root);
-        std::env::set_var("HOME", &home);
-        let added = apply_baseline_tmux_mount(&project_root).unwrap();
-        std::env::remove_var("HOME");
+        let added = apply_baseline_tmux_mount_with(&project_root, None).unwrap();
         assert!(!added);
         let body =
             fs::read_to_string(project_root.join(".devcontainer/devcontainer.json")).unwrap();
         assert!(!body.contains("tmux.conf"));
-        let _ = fs::remove_dir_all(&home);
         let _ = fs::remove_dir_all(&project_root);
     }
 }
