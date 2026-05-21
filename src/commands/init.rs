@@ -358,6 +358,13 @@ fn run_phase1_and_phase2(
     // devcontainer.json bug there is — surface at init time.
     warn_about_tilde_mounts(project_root);
 
+    // Lint: warn if `containerUser` doesn't match `remoteUser`. docker
+    // applies containerUser via `-u`, so if the base image lacks that user
+    // the container can't even start (error: "unable to find user X").
+    // Common failure when grove init scaffolds against a non-vscode base
+    // image (e.g. freqtrade's `ftuser`).
+    warn_about_user_mismatch(project_root);
+
     match crate::agent::hook::install_engine(context) {
         Ok(p) => println!("  {} installed engine at {}", "·".dimmed(), p.display()),
         Err(e) => eprintln!(
@@ -1033,6 +1040,14 @@ fn apply_baseline_claude_mounts(project_root: &Path) -> Result<(), String> {
         fs::read_to_string(&dev_path).map_err(|e| format!("read {}: {}", dev_path.display(), e))?;
     let mut value: serde_json::Value =
         serde_json::from_str(&raw).map_err(|e| format!("parse {}: {}", dev_path.display(), e))?;
+
+    // Detect the container user (`remoteUser` || `containerUser` || vscode
+    // default). Earlier versions hardcoded `vscode` here, which silently
+    // broke when init ran against a project whose base image used a
+    // different user (e.g. freqtrade's `ftuser`). Mount targets now route
+    // to whichever user the existing devcontainer.json declares.
+    let user = remote_user_from_devcontainer(&value);
+
     let obj = value
         .as_object_mut()
         .ok_or_else(|| "devcontainer.json top-level is not a JSON object".to_string())?;
@@ -1042,33 +1057,46 @@ fn apply_baseline_claude_mounts(project_root: &Path) -> Result<(), String> {
         .as_array_mut()
         .ok_or_else(|| "devcontainer.json `mounts` is not an array".to_string())?;
 
-    let baseline = [
-        (
-            "${localEnv:HOME}/.claude/plugins",
-            "/home/vscode/.claude/plugins",
-        ),
-        (
-            "${localEnv:HOME}/.claude/.credentials.json",
-            "/home/vscode/.claude/.credentials.json",
-        ),
-        (
-            "${localEnv:HOME}/.claude/settings.json",
-            "/home/vscode/.claude/settings.json",
-        ),
+    let baseline_subpaths = [
+        ".claude/plugins",
+        ".claude/.credentials.json",
+        ".claude/settings.json",
     ];
-    for (source, target) in baseline {
+    for sub in baseline_subpaths {
+        let source = format!("${{localEnv:HOME}}/{}", sub);
+        let target = format!("/home/{}/{}", user, sub);
         let entry = format!("source={},target={},type=bind,readonly", source, target);
-        if !mounts
-            .iter()
-            .any(|v| v == &serde_json::Value::String(entry.clone()))
-        {
-            mounts.push(serde_json::Value::String(entry));
+        // Skip if a mount with this exact target already exists (matches the
+        // idempotency we use elsewhere — protects user edits and reruns).
+        if mounts.iter().filter_map(|v| v.as_str()).any(|s| {
+            s.contains(&format!("target={}", target)) || s.contains(&format!("target={},", target))
+        }) {
+            continue;
         }
+        mounts.push(serde_json::Value::String(entry));
     }
     let body = serde_json::to_string_pretty(&value)
         .map_err(|e| format!("serialize {}: {}", dev_path.display(), e))?;
     fs::write(&dev_path, body).map_err(|e| format!("write {}: {}", dev_path.display(), e))?;
     Ok(())
+}
+
+/// Pick the user that mount targets should route to. Priority:
+///   1. `remoteUser`    — the user the IDE/tools attach as (and what the
+///                        agent runs as inside the container).
+///   2. `containerUser` — fallback if remoteUser isn't set.
+///   3. `"vscode"`      — last-resort default (matches the Microsoft
+///                        devcontainers base images grove init scaffolds).
+///
+/// Public so devcontainer/mod.rs::apply_baseline_tmux_mount can call it
+/// without duplicating the lookup.
+pub(crate) fn remote_user_from_devcontainer(value: &serde_json::Value) -> String {
+    value
+        .get("remoteUser")
+        .and_then(|v| v.as_str())
+        .or_else(|| value.get("containerUser").and_then(|v| v.as_str()))
+        .unwrap_or("vscode")
+        .to_string()
 }
 
 fn apply_cache_volumes_to_devcontainer(
@@ -1185,6 +1213,46 @@ fn mount_source_with_literal_tilde(mount: &serde_json::Value) -> Option<String> 
         }
     }
     None
+}
+
+/// Warn if `containerUser` is set to a different value than `remoteUser`.
+/// `containerUser` controls `docker run -u`; if it names a user the base
+/// image lacks, container creation fails immediately with "unable to find
+/// user X: no matching entries in passwd file". Common when grove's
+/// scaffold (which defaults both to `vscode`) lands in a project whose
+/// base image only has a different user — the operator changed
+/// `remoteUser` but forgot `containerUser`, or vice versa.
+fn warn_about_user_mismatch(project_root: &Path) {
+    let path = project_root.join(".devcontainer").join("devcontainer.json");
+    let raw = match fs::read_to_string(&path) {
+        Ok(s) => s,
+        Err(_) => return,
+    };
+    let value: serde_json::Value = match serde_json::from_str(&raw) {
+        Ok(v) => v,
+        Err(_) => return,
+    };
+    let remote = value.get("remoteUser").and_then(|v| v.as_str());
+    let container = value.get("containerUser").and_then(|v| v.as_str());
+    if let (Some(r), Some(c)) = (remote, container) {
+        if r != c {
+            eprintln!(
+                "  {} `.devcontainer/devcontainer.json` has containerUser={} but remoteUser={}",
+                "Warning:".yellow(),
+                c.bold(),
+                r.bold()
+            );
+            eprintln!(
+                "    {} docker `run -u {}` will fail if the base image doesn't have that user.",
+                "·".dimmed(),
+                c
+            );
+            eprintln!(
+                "    {} Fix: set both to the same value (usually the user the base image provides).",
+                "·".dimmed()
+            );
+        }
+    }
 }
 
 fn patch_gitignore(project_root: &Path) -> Result<(), String> {
@@ -1609,5 +1677,62 @@ mod tests {
     fn mount_without_source_clause_not_flagged() {
         let v = serde_json::json!("type=tmpfs,target=/tmp");
         assert_eq!(mount_source_with_literal_tilde(&v), None);
+    }
+
+    #[test]
+    fn remote_user_prefers_remote_user_field() {
+        let v = serde_json::json!({
+            "remoteUser": "ftuser",
+            "containerUser": "vscode"
+        });
+        assert_eq!(remote_user_from_devcontainer(&v), "ftuser");
+    }
+
+    #[test]
+    fn remote_user_falls_back_to_container_user() {
+        let v = serde_json::json!({"containerUser": "ubuntu"});
+        assert_eq!(remote_user_from_devcontainer(&v), "ubuntu");
+    }
+
+    #[test]
+    fn remote_user_default_is_vscode() {
+        let v = serde_json::json!({});
+        assert_eq!(remote_user_from_devcontainer(&v), "vscode");
+    }
+
+    #[test]
+    fn baseline_claude_mounts_route_to_detected_user() {
+        let root = tmp("baseline-user");
+        let dc = root.join(".devcontainer");
+        fs::create_dir_all(&dc).unwrap();
+        fs::write(
+            dc.join("devcontainer.json"),
+            r#"{"name":"x","image":"y","remoteUser":"ftuser","containerUser":"ftuser","mounts":[]}"#,
+        )
+        .unwrap();
+        apply_baseline_claude_mounts(&root).unwrap();
+        let body = fs::read_to_string(dc.join("devcontainer.json")).unwrap();
+        assert!(body.contains("target=/home/ftuser/.claude/plugins"));
+        assert!(body.contains("target=/home/ftuser/.claude/.credentials.json"));
+        assert!(body.contains("target=/home/ftuser/.claude/settings.json"));
+        assert!(!body.contains("/home/vscode/"));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn baseline_claude_mounts_default_user_is_vscode() {
+        let root = tmp("baseline-default-user");
+        let dc = root.join(".devcontainer");
+        fs::create_dir_all(&dc).unwrap();
+        // No remoteUser / containerUser declared → fallback "vscode".
+        fs::write(
+            dc.join("devcontainer.json"),
+            r#"{"name":"x","image":"y","mounts":[]}"#,
+        )
+        .unwrap();
+        apply_baseline_claude_mounts(&root).unwrap();
+        let body = fs::read_to_string(dc.join("devcontainer.json")).unwrap();
+        assert!(body.contains("target=/home/vscode/.claude/plugins"));
+        let _ = fs::remove_dir_all(&root);
     }
 }

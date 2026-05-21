@@ -272,9 +272,10 @@ fn detect_host_tmux_conf_in(home: &Path) -> Option<&'static str> {
 /// devcontainer.json `mounts` array, so the in-container tmux inherits
 /// the host user's keybinds, theme, etc.
 ///
-/// Container target is always `/home/vscode/.tmux.conf` (legacy path);
-/// tmux reads both legacy and XDG locations but the legacy form is
-/// honored by every tmux version we ship against.
+/// Container target uses the legacy `~/.tmux.conf` path under the user
+/// declared in devcontainer.json (`remoteUser` || `containerUser` ||
+/// `vscode`). tmux reads both legacy and XDG locations but the legacy
+/// form is honored by every tmux version we ship against.
 ///
 /// Idempotent: skips if a mount already targets the legacy path.
 /// Returns Ok(true) if a mount was added, Ok(false) if no host conf was
@@ -300,6 +301,10 @@ fn apply_baseline_tmux_mount_with(
         fs::read_to_string(&dev_path).map_err(|e| format!("read {}: {}", dev_path.display(), e))?;
     let mut value: Value =
         serde_json::from_str(&raw).map_err(|e| format!("parse {}: {}", dev_path.display(), e))?;
+    // Route the mount target at whichever user devcontainer.json declares;
+    // hardcoding `vscode` broke projects with non-vscode base images
+    // (freqtrade uses `ftuser`).
+    let user = container_remote_user(&value);
     let obj = value
         .as_object_mut()
         .ok_or_else(|| "devcontainer.json top-level is not a JSON object".to_string())?;
@@ -308,7 +313,7 @@ fn apply_baseline_tmux_mount_with(
         .or_insert_with(|| json!([]))
         .as_array_mut()
         .ok_or_else(|| "devcontainer.json `mounts` is not an array".to_string())?;
-    let target = "/home/vscode/.tmux.conf";
+    let target = format!("/home/{}/.tmux.conf", user);
     if mounts
         .iter()
         .filter_map(|v| v.as_str())
@@ -325,6 +330,18 @@ fn apply_baseline_tmux_mount_with(
         .map_err(|e| format!("serialize {}: {}", dev_path.display(), e))?;
     fs::write(&dev_path, body).map_err(|e| format!("write {}: {}", dev_path.display(), e))?;
     Ok(true)
+}
+
+/// Same priority order as `commands::init::remote_user_from_devcontainer`:
+/// `remoteUser` → `containerUser` → "vscode". Duplicated here to avoid a
+/// cross-module dep; both helpers tested independently.
+fn container_remote_user(value: &Value) -> String {
+    value
+        .get("remoteUser")
+        .and_then(|v| v.as_str())
+        .or_else(|| value.get("containerUser").and_then(|v| v.as_str()))
+        .unwrap_or("vscode")
+        .to_string()
 }
 
 /// Extract `(workspaceFolder, remoteUser)` from a parsed devcontainer.json.
@@ -510,6 +527,26 @@ mod tests {
             fs::read_to_string(project_root.join(".devcontainer/devcontainer.json")).unwrap();
         let count = body.matches("target=/home/vscode/.tmux.conf").count();
         assert_eq!(count, 1, "mount must appear exactly once");
+        let _ = fs::remove_dir_all(&project_root);
+    }
+
+    #[test]
+    fn tmux_mount_routes_to_remote_user() {
+        let project_root = tmp_dir("tmux-user");
+        let dc = project_root.join(".devcontainer");
+        fs::create_dir_all(&dc).unwrap();
+        fs::write(
+            dc.join("devcontainer.json"),
+            r#"{"name":"x","image":"y","remoteUser":"ftuser","containerUser":"ftuser","mounts":[]}"#,
+        )
+        .unwrap();
+        let added =
+            apply_baseline_tmux_mount_with(&project_root, Some("${localEnv:HOME}/.tmux.conf"))
+                .unwrap();
+        assert!(added);
+        let body = fs::read_to_string(dc.join("devcontainer.json")).unwrap();
+        assert!(body.contains("target=/home/ftuser/.tmux.conf"));
+        assert!(!body.contains("target=/home/vscode/.tmux.conf"));
         let _ = fs::remove_dir_all(&project_root);
     }
 

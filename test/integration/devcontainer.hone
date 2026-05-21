@@ -51,6 +51,30 @@ ASSERT init.stderr contains "~/.config/foo"
 ASSERT init.stderr contains "localEnv:HOME"
 RUN cleanup: rm -rf $TEST_DIR
 
+TEST "grove init warns on container user mismatch"
+
+ENV TEST_DIR=/tmp/grove-init-user-mismatch
+RUN setup: rm -rf $TEST_DIR && mkdir -p $TEST_DIR/.devcontainer && cd $TEST_DIR && git init -q -b main && git -c user.email=t@t -c user.name=t commit --allow-empty -q -m init && echo '{"name":"x","image":"y","remoteUser":"ftuser","containerUser":"vscode"}' > $TEST_DIR/.devcontainer/devcontainer.json
+RUN init: cd $TEST_DIR && grove init --no-agent
+ASSERT init.exit_code == 0
+ASSERT init.stderr contains "containerUser=vscode"
+ASSERT init.stderr contains "remoteUser=ftuser"
+ASSERT init.stderr contains "will fail if the base image"
+RUN cleanup: rm -rf $TEST_DIR
+
+TEST "grove init routes baseline mounts to detected remoteUser"
+
+ENV TEST_DIR=/tmp/grove-init-user-route
+RUN setup: rm -rf $TEST_DIR && mkdir -p $TEST_DIR/.devcontainer && cd $TEST_DIR && git init -q -b main && git -c user.email=t@t -c user.name=t commit --allow-empty -q -m init && echo '{"name":"x","image":"y","remoteUser":"ftuser","containerUser":"ftuser","mounts":[]}' > $TEST_DIR/.devcontainer/devcontainer.json
+RUN init: cd $TEST_DIR && grove init --no-agent
+ASSERT init.exit_code == 0
+RUN check: cat $TEST_DIR/.devcontainer/devcontainer.json
+ASSERT check.stdout contains "/home/ftuser/.claude/plugins"
+ASSERT check.stdout contains "/home/ftuser/.claude/.credentials.json"
+ASSERT check.stdout contains "/home/ftuser/.claude/settings.json"
+ASSERT check.stdout not contains "/home/vscode/"
+RUN cleanup: rm -rf $TEST_DIR
+
 TEST "grove init does not warn when mounts use localEnv:HOME"
 
 ENV TEST_DIR=/tmp/grove-init-tilde-clean

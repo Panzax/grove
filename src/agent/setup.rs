@@ -69,17 +69,28 @@ pub fn run_setup_wizard(
         })
     });
 
+    // Auto-detect the container user (`remoteUser` → `containerUser` →
+    // "vscode" fallback). The wizard's mount targets follow whichever user
+    // the existing devcontainer.json declares; hardcoding `vscode` broke
+    // projects with non-vscode base images (e.g. freqtrade's `ftuser`).
+    let user = container_user_for_targets(&devcontainer);
+    println!(
+        "  {} container user (mount targets route to): {}",
+        "·".dimmed(),
+        user.bold()
+    );
+
     // ----- Prompt 1: project secrets mount -----
-    prompt_secrets_mount(project, &mut config, &mut devcontainer)?;
+    prompt_secrets_mount(project, &mut config, &mut devcontainer, &user)?;
 
     // ----- Prompt 2: .claude scope + auth -----
-    prompt_claude_scope(&mut config, &mut devcontainer)?;
+    prompt_claude_scope(&mut config, &mut devcontainer, &user)?;
 
     // ----- Prompt 3: GitHub auth -----
-    prompt_github_auth(&mut config, &mut devcontainer)?;
+    prompt_github_auth(&mut config, &mut devcontainer, &user)?;
 
     // ----- Prompt 4: agent-inferred extra mounts -----
-    prompt_inferred_mounts(ctx, project, &mut config, &mut devcontainer)?;
+    prompt_inferred_mounts(ctx, project, &mut config, &mut devcontainer, &user)?;
 
     // ----- Prompt 5: extensions + container packages -----
     prompt_extensions_and_packages(project, &mut config, &mut devcontainer)?;
@@ -101,10 +112,23 @@ pub fn run_setup_wizard(
 
 // ---------- prompts ----------
 
+/// Pick the user that wizard-written mount targets should route to.
+/// Mirrors `commands::init::remote_user_from_devcontainer`:
+/// `remoteUser` → `containerUser` → "vscode".
+fn container_user_for_targets(value: &Value) -> String {
+    value
+        .get("remoteUser")
+        .and_then(|v| v.as_str())
+        .or_else(|| value.get("containerUser").and_then(|v| v.as_str()))
+        .unwrap_or("vscode")
+        .to_string()
+}
+
 fn prompt_secrets_mount(
     project: &ProjectContext,
     config: &mut GroveConfig,
     devcontainer: &mut Value,
+    user: &str,
 ) -> Result<(), String> {
     let theme = ColorfulTheme::default();
     let default_path = config
@@ -150,7 +174,7 @@ fn prompt_secrets_mount(
         .interact_text()
         .map_err(|e| format!("prompt: {}", e))?;
 
-    let target = format!("/home/vscode/.config/{}", project.repo_name);
+    let target = format!("/home/{}/.config/{}", user, project.repo_name);
     add_mount(devcontainer, &path, &target, mode);
     set_container_env(devcontainer, &env_name, &target);
 
@@ -176,7 +200,11 @@ fn prompt_secrets_mount(
 ///                            (interactive `claude login` won't work in a
 ///                            detached tmux; mostly useful for custom
 ///                            container images that bake in auth + hooks).
-fn prompt_claude_scope(config: &mut GroveConfig, devcontainer: &mut Value) -> Result<(), String> {
+fn prompt_claude_scope(
+    config: &mut GroveConfig,
+    devcontainer: &mut Value,
+    user: &str,
+) -> Result<(), String> {
     let theme = ColorfulTheme::default();
     println!();
     println!(
@@ -217,10 +245,11 @@ fn prompt_claude_scope(config: &mut GroveConfig, devcontainer: &mut Value) -> Re
         "full" => {
             // Remove the three RO mounts, add one RW. Adjusts Phase 1's choice.
             remove_claude_mounts(devcontainer);
+            let claude_target = format!("/home/{}/.claude", user);
             add_mount(
                 devcontainer,
                 "${localEnv:HOME}/.claude",
-                "/home/vscode/.claude",
+                &claude_target,
                 "rw",
             );
             println!(
@@ -259,7 +288,11 @@ fn remove_claude_mounts(devcontainer: &mut Value) {
     });
 }
 
-fn prompt_github_auth(config: &mut GroveConfig, devcontainer: &mut Value) -> Result<(), String> {
+fn prompt_github_auth(
+    config: &mut GroveConfig,
+    devcontainer: &mut Value,
+    user: &str,
+) -> Result<(), String> {
     let theme = ColorfulTheme::default();
     println!();
     let options = vec![
@@ -296,18 +329,20 @@ fn prompt_github_auth(config: &mut GroveConfig, devcontainer: &mut Value) -> Res
             );
         }
         "ro-mount" => {
+            let gh_target = format!("/home/{}/.config/gh", user);
             add_mount(
                 devcontainer,
                 "${localEnv:HOME}/.config/gh",
-                "/home/vscode/.config/gh",
+                &gh_target,
                 "ro",
             );
         }
         "rw-mount" => {
+            let gh_target = format!("/home/{}/.config/gh", user);
             add_mount(
                 devcontainer,
                 "${localEnv:HOME}/.config/gh",
-                "/home/vscode/.config/gh",
+                &gh_target,
                 "rw",
             );
         }
@@ -321,9 +356,10 @@ fn prompt_inferred_mounts(
     project: &ProjectContext,
     config: &mut GroveConfig,
     devcontainer: &mut Value,
+    user: &str,
 ) -> Result<(), String> {
     println!();
-    let candidates = infer_extra_mount_candidates(ctx, project);
+    let candidates = infer_extra_mount_candidates(ctx, project, user);
     if candidates.is_empty() {
         println!(
             "  {} no extra mount candidates found in this repo",
@@ -516,9 +552,16 @@ fn apply_post_create(project: &ProjectContext, devcontainer: &mut Value) {
 
 // ---------- inferred-mount scan ----------
 
-fn infer_extra_mount_candidates(ctx: &RepoContext, project: &ProjectContext) -> Vec<ExtraMount> {
+fn infer_extra_mount_candidates(
+    ctx: &RepoContext,
+    project: &ProjectContext,
+    user: &str,
+) -> Vec<ExtraMount> {
     let mut out: Vec<ExtraMount> = Vec::new();
 
+    let hf_home = format!("/home/{}/.cache/huggingface", user);
+    let torch_home = format!("/home/{}/.cache/torch", user);
+    let xdg_data_home = format!("/home/{}/.local/share", user);
     let well_known_env_vars: &[(&str, &str, &str)] = &[
         (
             "MARKET_DATA_DIR",
@@ -529,17 +572,9 @@ fn infer_extra_mount_candidates(ctx: &RepoContext, project: &ProjectContext) -> 
         ("DATASET_PATH", "/mnt/datasets", "generic dataset directory"),
         ("MODEL_DIR", "/mnt/models", "ML model directory"),
         ("CACHE_DIR", "/mnt/cache", "shared cache directory"),
-        (
-            "HF_HOME",
-            "/home/vscode/.cache/huggingface",
-            "HuggingFace cache",
-        ),
-        ("TORCH_HOME", "/home/vscode/.cache/torch", "PyTorch cache"),
-        (
-            "XDG_DATA_HOME",
-            "/home/vscode/.local/share",
-            "XDG data home",
-        ),
+        ("HF_HOME", &hf_home, "HuggingFace cache"),
+        ("TORCH_HOME", &torch_home, "PyTorch cache"),
+        ("XDG_DATA_HOME", &xdg_data_home, "XDG data home"),
     ];
 
     // Sweep root files looking for env var references in code / README.
