@@ -74,16 +74,40 @@ pub fn make_worktree_pointers_relative(worktree_path: &Path) -> Result<(), Strin
     let new_back = format!("{}\n", back_rel.display());
     write_if_changed(&back_file, &new_back)?;
 
-    // Note: we deliberately do NOT set `extensions.relativeWorktrees=true`
-    // on the main gitdir. That extension requires
-    // `core.repositoryFormatVersion=1`, which silently breaks every git
-    // version below 2.42. Host operators with older git would lose
-    // access to the entire repo. The relative-path rewrite alone is
-    // enough for the container (newer git) to work; older host-side
-    // git will reject `worktree remove` on these worktrees — operators
-    // should upgrade git (via `ppa:git-core/ppa` on Ubuntu) or do
-    // git ops through the container (`grove devcontainer exec git ...`
-    // / `grove integrate --abort` for cleanup).
+    // Tell git the relative worktree pointers are intentional.
+    //
+    // `extensions.relativeWorktrees` was added in git 2.46. The extension
+    // requires `core.repositoryFormatVersion=1`, which old git (<2.42)
+    // can't read. Grove's minimum git version is 2.46 (documented in
+    // README); operators on older git should upgrade (Ubuntu:
+    // `ppa:git-core/ppa`).
+    //
+    // Why this matters: with the extension set, git natively accepts
+    // relative pointers during `worktree remove` / `worktree repair` /
+    // etc. Without it, git rejects with "file does not contain absolute
+    // path to the working tree location" even though our rewrite is
+    // correct.
+    //
+    // We set the config on the LOCAL gitdir only; this never travels
+    // with `git push` so collaborators on older git aren't affected by
+    // their clone's format.
+    let main_gitdir = gitdir_subdir_abs
+        .parent()
+        .and_then(|p| p.parent())
+        .map(|p| p.to_path_buf());
+    if let Some(gd) = main_gitdir {
+        // Order matters: version must be 1 BEFORE the extension key is
+        // read, otherwise git complains "extension found in repository
+        // format version 0".
+        let _ = std::process::Command::new("git")
+            .arg(format!("--git-dir={}", gd.display()))
+            .args(["config", "core.repositoryFormatVersion", "1"])
+            .status();
+        let _ = std::process::Command::new("git")
+            .arg(format!("--git-dir={}", gd.display()))
+            .args(["config", "extensions.relativeWorktrees", "true"])
+            .status();
+    }
 
     Ok(())
 }

@@ -28,6 +28,18 @@ enum ConflictAction {
 /// 3. `grove init --reconfigure` — Phase 2 wizard only, against an already-initialized
 ///                                 project; no clone, no scaffold.
 pub fn run(target: Option<&str>, no_agent: bool, reconfigure: bool, assume_yes: bool) {
+    // Hard-require git ≥ 2.46. Grove writes relative worktree pointers so
+    // host and devcontainer see the worktree at the same logical path;
+    // native git acceptance of relative worktree pointers landed in 2.46
+    // (gated by `extensions.relativeWorktrees`, which itself requires
+    // `core.repositoryFormatVersion=1`). Older git rejects either the
+    // pointers or the format. Fail fast so the operator can upgrade
+    // before scaffolding anything.
+    if let Err(e) = require_git_supports_relative_worktrees() {
+        eprintln!("{} {}", "Error:".red(), e);
+        std::process::exit(1);
+    }
+
     if reconfigure {
         run_reconfigure();
         return;
@@ -1221,6 +1233,65 @@ fn mount_source_with_literal_tilde(mount: &serde_json::Value) -> Option<String> 
     None
 }
 
+/// Minimum git version grove requires: 2.46 (when
+/// `extensions.relativeWorktrees` landed). Returns Err with an actionable
+/// upgrade hint if `git --version` is older or unparseable.
+fn require_git_supports_relative_worktrees() -> Result<(), String> {
+    const MIN_MAJOR: u32 = 2;
+    const MIN_MINOR: u32 = 46;
+    let out = std::process::Command::new("git")
+        .arg("--version")
+        .output()
+        .map_err(|e| {
+            format!(
+                "could not run `git --version`: {} (grove needs git ≥ {}.{} on PATH)",
+                e, MIN_MAJOR, MIN_MINOR
+            )
+        })?;
+    if !out.status.success() {
+        return Err(format!(
+            "`git --version` exited non-zero (grove needs git ≥ {}.{} on PATH)",
+            MIN_MAJOR, MIN_MINOR
+        ));
+    }
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let (major, minor) = parse_git_version(&stdout).ok_or_else(|| {
+        format!(
+            "could not parse `git --version` output: {} (grove needs git ≥ {}.{} on PATH)",
+            stdout.trim(),
+            MIN_MAJOR,
+            MIN_MINOR
+        )
+    })?;
+    if (major, minor) < (MIN_MAJOR, MIN_MINOR) {
+        return Err(format!(
+            "git {}.{} is too old; grove needs git ≥ {}.{} for relative worktree support \
+             (host ↔ devcontainer path parity). Upgrade via your package manager — on \
+             Ubuntu/Debian: `sudo add-apt-repository ppa:git-core/ppa && sudo apt-get \
+             update && sudo apt-get install --only-upgrade git`. macOS Homebrew: `brew \
+             upgrade git`.",
+            major, minor, MIN_MAJOR, MIN_MINOR
+        ));
+    }
+    Ok(())
+}
+
+/// Parse "git version 2.54.0" / "git version 2.49.0.windows.1" → (2, 54).
+/// Returns None on malformed input.
+fn parse_git_version(s: &str) -> Option<(u32, u32)> {
+    let rest = s.trim().strip_prefix("git version ")?;
+    let mut parts = rest.split('.');
+    let major: u32 = parts.next()?.parse().ok()?;
+    let minor_raw = parts.next()?;
+    // Strip non-digit suffix (e.g. "49-rc1" → 49) so unusual builds parse.
+    let minor_digits: String = minor_raw
+        .chars()
+        .take_while(|c| c.is_ascii_digit())
+        .collect();
+    let minor: u32 = minor_digits.parse().ok()?;
+    Some((major, minor))
+}
+
 /// Warn if `containerUser` is set to a different value than `remoteUser`.
 /// `containerUser` controls `docker run -u`; if it names a user the base
 /// image lacks, container creation fails immediately with "unable to find
@@ -1698,6 +1769,32 @@ mod tests {
     fn remote_user_falls_back_to_container_user() {
         let v = serde_json::json!({"containerUser": "ubuntu"});
         assert_eq!(remote_user_from_devcontainer(&v), "ubuntu");
+    }
+
+    #[test]
+    fn parse_git_version_modern() {
+        assert_eq!(parse_git_version("git version 2.54.0\n"), Some((2, 54)));
+        assert_eq!(parse_git_version("git version 2.46.1"), Some((2, 46)));
+        assert_eq!(parse_git_version("git version 3.0.0"), Some((3, 0)));
+    }
+
+    #[test]
+    fn parse_git_version_handles_suffixes() {
+        assert_eq!(
+            parse_git_version("git version 2.49.0.windows.1\n"),
+            Some((2, 49))
+        );
+        assert_eq!(
+            parse_git_version("git version 2.34.1-1ubuntu1.17"),
+            Some((2, 34))
+        );
+    }
+
+    #[test]
+    fn parse_git_version_rejects_garbage() {
+        assert_eq!(parse_git_version("not a git version"), None);
+        assert_eq!(parse_git_version(""), None);
+        assert_eq!(parse_git_version("git version weird"), None);
     }
 
     #[test]
