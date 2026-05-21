@@ -213,7 +213,36 @@ pub(crate) struct LaunchContext<'a> {
 /// `launch_detached` inside the project's devcontainer. Prints success or
 /// fallback-manual-launch instructions. Reused by `grove spawn` and
 /// `grove integrate`.
+///
+/// Side effects beyond launch:
+///   - Writes a launch summary to `.grove/logs/launch-<agent>-<ts>.log`
+///     (host path; works because `.grove/` is in the workspace bind-mount).
+///     Captures: container info, env vars, the rendered claude command,
+///     tmux launch exit status, attach instructions. Diagnostic record
+///     for when "agent didn't start" or "agent died immediately" — past
+///     versions provided no trace.
+///   - Wraps claude in `bash -c "exec claude ... 2>&1 | tee <pane.log>"`
+///     so claude's stdout + stderr ALSO get archived to
+///     `.grove/logs/pane-<agent>-<ts>.log`. Lets the operator (and
+///     agents grepping their own log) see WHY a session exited even
+///     after tmux killed the session.
 pub(crate) fn launch_agent_in_container(ctx: &LaunchContext<'_>) {
+    // Logs live under the project root (host side); workspace bind-mount
+    // makes them visible inside the container too. agent_dir's parent
+    // walks back to `<project_root>/.grove/agents/<name>` → up two →
+    // `<project_root>/.grove`.
+    let stamp = chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
+    let grove_dir = ctx
+        .agent_dir
+        .parent()
+        .and_then(|p| p.parent())
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| ctx.agent_dir.to_path_buf());
+    let log_dir = grove_dir.join("logs");
+    let _ = std::fs::create_dir_all(&log_dir);
+    let launch_log = log_dir.join(format!("launch-{}-{}.log", ctx.agent_name, stamp));
+    let pane_log = log_dir.join(format!("pane-{}-{}.log", ctx.agent_name, stamp));
+
     let mut env: HashMap<String, String> = HashMap::new();
     env.insert(
         "GROVE_AGENT_DIR".into(),
@@ -221,20 +250,60 @@ pub(crate) fn launch_agent_in_container(ctx: &LaunchContext<'_>) {
     );
     env.insert("GROVE_AGENT_NAME".into(), ctx.agent_name.to_string());
 
-    let mut cmd_tokens = launch_command_tokens();
+    // Wrap claude in a bash + tee pipeline so claude's stdout/stderr land
+    // in pane-<agent>-<ts>.log inside the container (path is the
+    // container-side workspace, which the bind-mount surfaces back to host
+    // disk). Translation: agent_dir is on host → grove_dir parent → log_dir
+    // on host. Inside the container we re-build the same path with the
+    // workspace_target prefix.
+    let container_pane_log = container::host_to_container_path(ctx.container, &pane_log)
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_else(|_| pane_log.to_string_lossy().to_string());
+
+    let base_cmd_tokens = launch_command_tokens();
+    let mut quoted = base_cmd_tokens
+        .iter()
+        .map(|t| shell_escape(t))
+        .collect::<Vec<_>>()
+        .join(" ");
     if let Some(prompt) = ctx.bootstrap_prompt {
-        cmd_tokens.push(prompt.to_string());
+        quoted.push(' ');
+        quoted.push_str(&shell_escape(prompt));
     }
+    let pane_log_quoted = shell_escape(&container_pane_log);
+    // `mkdir -p` for the log dir inside the container; exec wraps so signals
+    // pass through cleanly; pipefail keeps claude's exit code as the session
+    // exit code (not tee's). 2>&1 merges stderr so both streams archive.
+    let inner = format!(
+        "mkdir -p \"$(dirname {pane})\" && set -o pipefail && exec {cmd} 2>&1 | tee -a {pane}",
+        cmd = quoted,
+        pane = pane_log_quoted
+    );
+    let cmd_tokens: Vec<String> = vec!["bash".into(), "-lc".into(), inner];
 
     let spec = SessionSpec {
         name: ctx.agent_name,
         workdir: ctx.worktree_path,
-        env,
+        env: env.clone(),
         command: cmd_tokens.clone(),
     };
 
     let cmd_summary = summarize_command(&cmd_tokens);
-    match launch_detached(&spec, Some(ctx.container)) {
+    let launch_result = launch_detached(&spec, Some(ctx.container));
+
+    // Always write the launch log regardless of outcome — diagnosis of a
+    // failed launch is exactly when the log matters most.
+    write_launch_log(
+        &launch_log,
+        ctx,
+        &env,
+        &cmd_tokens,
+        &pane_log,
+        &container_pane_log,
+        &launch_result,
+    );
+
+    match launch_result {
         Ok(session_name_str) => {
             println!(
                 "{} {} agent {} on {} (tmux {} {}) [in container]",
@@ -244,6 +313,16 @@ pub(crate) fn launch_agent_in_container(ctx: &LaunchContext<'_>) {
                 ctx.display_branch.bold(),
                 session_name_str.bold(),
                 cmd_summary.dimmed()
+            );
+            println!(
+                "  {} launch log: {}",
+                "·".dimmed(),
+                launch_log.display().to_string().bold()
+            );
+            println!(
+                "  {} session output: {}",
+                "·".dimmed(),
+                pane_log.display().to_string().bold()
             );
             println!(
                 "  attach: {}",
@@ -256,6 +335,11 @@ pub(crate) fn launch_agent_in_container(ctx: &LaunchContext<'_>) {
                 "Warning:".yellow(),
                 e
             );
+            eprintln!(
+                "  {} launch log (with full context): {}",
+                "·".dimmed(),
+                launch_log.display()
+            );
             println!(
                 "  the worktree + agent dir are still in place; you can launch claude manually:"
             );
@@ -266,6 +350,94 @@ pub(crate) fn launch_agent_in_container(ctx: &LaunchContext<'_>) {
                 cmd_summary
             );
         }
+    }
+}
+
+/// Emit the launch-time diagnostic log. Captures the rendered command (with
+/// the bootstrap prompt truncated to keep the log readable), all env vars,
+/// container info, and the tmux launch outcome.
+fn write_launch_log(
+    log_path: &Path,
+    ctx: &LaunchContext<'_>,
+    env: &HashMap<String, String>,
+    cmd_tokens: &[String],
+    pane_log: &Path,
+    container_pane_log: &str,
+    result: &Result<String, String>,
+) {
+    let mut body = String::new();
+    body.push_str(&format!(
+        "grove launch log\nagent: {}\nworktree (host): {}\nagent_dir (host): {}\nstamp: {}\ncontainer workspace_root: {}\ncontainer workspace_target: {}\ncontainer remote_user: {}\ndisplay_branch: {}\nverb: {}\nbootstrap_prompt: {}\n\n",
+        ctx.agent_name,
+        ctx.worktree_path.display(),
+        ctx.agent_dir.display(),
+        chrono::Utc::now().to_rfc3339(),
+        ctx.container.workspace_root.display(),
+        ctx.container.workspace_target.display(),
+        ctx.container.remote_user,
+        ctx.display_branch,
+        ctx.verb_past,
+        if ctx.bootstrap_prompt.is_some() { "yes" } else { "no" },
+    ));
+    body.push_str("environment passed to tmux session:\n");
+    let mut keys: Vec<&String> = env.keys().collect();
+    keys.sort();
+    for k in keys {
+        body.push_str(&format!("  {}={}\n", k, env.get(k).unwrap()));
+    }
+    body.push_str("\n");
+    body.push_str(&format!(
+        "pane log (host): {}\npane log (container path): {}\n\n",
+        pane_log.display(),
+        container_pane_log,
+    ));
+    body.push_str("rendered tmux command tokens:\n");
+    for tok in cmd_tokens {
+        body.push_str(&format!("  {}\n", summarize_one(tok)));
+    }
+    body.push_str("\n");
+    match result {
+        Ok(session) => body.push_str(&format!("tmux launch: OK (session={})\n", session)),
+        Err(e) => body.push_str(&format!("tmux launch: FAILED ({})\n", e)),
+    }
+    body.push_str("\nattach: ");
+    body.push_str(&crate::session::tmux::attach_instructions(
+        ctx.agent_name,
+        Some(ctx.container),
+    ));
+    body.push('\n');
+    if let Err(e) = std::fs::write(log_path, body) {
+        eprintln!(
+            "  {} could not write launch log {}: {}",
+            "Warning:".yellow(),
+            log_path.display(),
+            e
+        );
+    }
+}
+
+/// Render a single token for log display: abbreviate long ones (the
+/// bootstrap prompt is multi-KB; full text is in PROMPT.md / STATE.md
+/// already).
+fn summarize_one(tok: &str) -> String {
+    if tok.len() <= 200 {
+        tok.to_string()
+    } else {
+        let head: String = tok.chars().take(80).collect();
+        format!("'{}…' ({} chars)", head, tok.len())
+    }
+}
+
+/// Minimal POSIX shell-escape for the inner `bash -c` script. Single-quote
+/// wraps everything except plain identifier-shaped tokens.
+fn shell_escape(s: &str) -> String {
+    if !s.is_empty()
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '/' | '.' | '-' | '_' | '=' | ':'))
+    {
+        s.to_string()
+    } else {
+        format!("'{}'", s.replace('\'', "'\\''"))
     }
 }
 
