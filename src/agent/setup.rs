@@ -29,7 +29,7 @@ use serde_json::{json, Value};
 use crate::devcontainer::stack;
 use crate::devcontainer::{read_devcontainer_json, write_devcontainer_json};
 use crate::git::worktree_manager::{project_root, RepoContext};
-use crate::models::{ExtraMount, GroveConfig, ProjectContext, ProjectStack};
+use crate::models::{ContainerBackendKind, ExtraMount, GroveConfig, ProjectContext, ProjectStack};
 
 pub fn run_setup_wizard(
     ctx: &RepoContext,
@@ -54,11 +54,18 @@ pub fn run_setup_wizard(
         if is_reconfigure {
             "Re-running setup wizard with current config as defaults."
         } else {
-            "Setup wizard — answering 5 short prompts; you can re-run anytime via `grove init --reconfigure`."
+            "Setup wizard — answering a few short prompts; you can re-run anytime via `grove init --reconfigure`."
         }
     );
 
     let mut config = read_or_default_config(&project_root_path);
+
+    // ----- Prompt 0: container backend (devcontainer vs sandbox) -----
+    // Chosen here so it's available at `grove init` and re-promptable via
+    // `grove init --reconfigure` (both route through this wizard). All grove
+    // commands read the result from `.grove/config.toml`, so they stay
+    // arg-free.
+    prompt_container_backend(&mut config)?;
     let mut devcontainer = read_devcontainer_json(&project_root_path).unwrap_or_else(|_| {
         json!({
             "name": project.repo_name,
@@ -69,10 +76,15 @@ pub fn run_setup_wizard(
         })
     });
 
-    // Auto-detect the container user (`remoteUser` → `containerUser` →
-    // "vscode" fallback). The wizard's mount targets follow whichever user
-    // the existing devcontainer.json declares; hardcoding `vscode` broke
-    // projects with non-vscode base images (e.g. freqtrade's `ftuser`).
+    // ----- Prompt 0.5: environment preset (image + agentic toolchain) -----
+    // Picking a preset sets the image, the container user, the devcontainer
+    // features (Node/git/gh/claude-code), and the extensions in one shot —
+    // nothing for the operator to hand-fix afterward.
+    prompt_environment_preset(project, &mut config, &mut devcontainer)?;
+
+    // The container user follows whatever the (possibly preset-updated)
+    // devcontainer.json declares — never a hardcoded literal. Mount targets
+    // below route to this user.
     let user = container_user_for_targets(&devcontainer);
     println!(
         "  {} container user (mount targets route to): {}",
@@ -112,16 +124,98 @@ pub fn run_setup_wizard(
 
 // ---------- prompts ----------
 
-/// Pick the user that wizard-written mount targets should route to.
-/// Mirrors `commands::init::remote_user_from_devcontainer`:
-/// `remoteUser` → `containerUser` → "vscode".
+/// Prompt 0: choose the container backend. Defaults to the current config
+/// value so `grove init --reconfigure` re-prompts with the existing choice
+/// pre-selected.
+fn prompt_container_backend(config: &mut GroveConfig) -> Result<(), String> {
+    let theme = ColorfulTheme::default();
+    let items = [
+        "devcontainer — bind-mounted; edits land on the host live (default)",
+        "sandbox — copy-in isolation; the only way edits escape is `git push`",
+    ];
+    let default_idx = match config.container.backend {
+        ContainerBackendKind::Devcontainer => 0,
+        ContainerBackendKind::Sandbox => 1,
+    };
+    println!();
+    let idx = Select::with_theme(&theme)
+        .with_prompt("Container backend")
+        .items(&items)
+        .default(default_idx)
+        .interact()
+        .map_err(|e| format!("prompt: {}", e))?;
+    config.container.backend = if idx == 1 {
+        ContainerBackendKind::Sandbox
+    } else {
+        ContainerBackendKind::Devcontainer
+    };
+    println!(
+        "  {} backend: {}",
+        "·".dimmed(),
+        config.container.backend.as_str().bold()
+    );
+    Ok(())
+}
+
+/// Prompt 0.5: choose the environment preset. Pre-selects the preset matching
+/// the detected stack. A non-custom choice rewrites the devcontainer.json image,
+/// container user, features, and extensions, and records the user in config —
+/// so the container is ready to use with nothing to hand-edit. `custom` leaves
+/// the existing image/devcontainer.json untouched.
+fn prompt_environment_preset(
+    project: &ProjectContext,
+    config: &mut GroveConfig,
+    devcontainer: &mut Value,
+) -> Result<(), String> {
+    use crate::devcontainer::preset;
+    let theme = ColorfulTheme::default();
+    let presets = preset::all();
+    let labels: Vec<&str> = presets.iter().map(|p| p.label).collect();
+    let detected = preset::for_stack(project.stack.unwrap_or(ProjectStack::Unknown));
+    let default_idx = presets
+        .iter()
+        .position(|p| p.id == detected.id)
+        .unwrap_or(0);
+    println!();
+    let idx = Select::with_theme(&theme)
+        .with_prompt("Environment preset (image + agentic toolchain)")
+        .items(&labels)
+        .default(default_idx)
+        .interact()
+        .map_err(|e| format!("prompt: {}", e))?;
+    let chosen = presets[idx];
+
+    if chosen.id == preset::PresetId::Custom {
+        println!(
+            "  {} keeping existing image / devcontainer.json",
+            "·".dimmed()
+        );
+        return Ok(());
+    }
+
+    if let Some(obj) = devcontainer.as_object_mut() {
+        obj.insert("image".to_string(), json!(chosen.image));
+        obj.insert("remoteUser".to_string(), json!(chosen.remote_user));
+        obj.insert("containerUser".to_string(), json!(chosen.remote_user));
+        obj.insert("features".to_string(), preset::features_object(chosen));
+    }
+    let exts: Vec<String> = chosen.extensions.iter().map(|s| s.to_string()).collect();
+    set_extensions(devcontainer, &exts);
+    config.devcontainer.remote_user = chosen.remote_user.to_string();
+
+    println!(
+        "  {} preset: {} (user {})",
+        "·".dimmed(),
+        chosen.label.bold(),
+        chosen.remote_user.bold()
+    );
+    Ok(())
+}
+
+/// Pick the user that wizard-written mount targets should route to. Delegates
+/// to the canonical `devcontainer::remote_user_from_value`.
 fn container_user_for_targets(value: &Value) -> String {
-    value
-        .get("remoteUser")
-        .and_then(|v| v.as_str())
-        .or_else(|| value.get("containerUser").and_then(|v| v.as_str()))
-        .unwrap_or("vscode")
-        .to_string()
+    crate::devcontainer::remote_user_from_value(value)
 }
 
 fn prompt_secrets_mount(

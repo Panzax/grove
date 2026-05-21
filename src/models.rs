@@ -91,18 +91,6 @@ impl ProjectStack {
         }
     }
 
-    /// Default base image for the detected stack. The setup-agent's Phase 2 can
-    /// refine this; this is the conservative deterministic Phase 1 choice.
-    pub fn default_image(self) -> &'static str {
-        match self {
-            ProjectStack::Python => "mcr.microsoft.com/devcontainers/python:3.12",
-            ProjectStack::Rust => "mcr.microsoft.com/devcontainers/rust:latest",
-            ProjectStack::Node => "mcr.microsoft.com/devcontainers/javascript-node:22",
-            ProjectStack::Go => "mcr.microsoft.com/devcontainers/go:latest",
-            ProjectStack::DotNet => "mcr.microsoft.com/devcontainers/dotnet:8.0",
-            ProjectStack::Unknown => "mcr.microsoft.com/devcontainers/base:ubuntu",
-        }
-    }
 }
 
 /// The output of `devcontainer::detect_project_context`. Captures everything Phase 1
@@ -118,6 +106,11 @@ pub struct ProjectContext {
     pub root_files: Vec<String>,
     #[serde(default)]
     pub default_image: String,
+    /// Non-root container user the chosen environment preset's image ships
+    /// (e.g. `vscode`, `node`, `codespace`). Single source of truth for the
+    /// container user; derived from the preset, never hardcoded.
+    #[serde(default)]
+    pub default_user: String,
     #[serde(default)]
     pub has_tests: bool,
     #[serde(default)]
@@ -264,6 +257,10 @@ pub struct GroveConfig {
     #[serde(default)]
     pub devcontainer: DevcontainerSection,
     #[serde(default)]
+    pub container: ContainerSection,
+    #[serde(default)]
+    pub sandbox: SandboxSection,
+    #[serde(default)]
     pub bus: BusSection,
     #[serde(default)]
     pub hook: HookSection,
@@ -365,8 +362,60 @@ impl Default for DevcontainerSection {
     }
 }
 
-fn default_remote_user() -> String {
+/// Last-resort container user when neither the devcontainer.json nor config
+/// declares one. Single source of this default — derivation helpers
+/// (`devcontainer::remote_user_from_value`) fall back to it rather than
+/// repeating the literal. Matches the Microsoft devcontainer base images.
+pub(crate) fn default_remote_user() -> String {
     "vscode".to_string()
+}
+
+/// Container runtime backend. `Devcontainer` = the current bind-mounted
+/// devcontainer model (default). `Sandbox` = copy-in isolation via plain
+/// `docker run` + `docker exec`, where the only egress is `git push`.
+/// Chosen at `grove init` and switchable via `grove init --reconfigure`;
+/// all `grove` commands read this from `.grove/config.toml` so they stay
+/// arg-free. Unknown/missing deserializes to `Devcontainer`, so existing
+/// projects are unaffected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum ContainerBackendKind {
+    #[default]
+    Devcontainer,
+    Sandbox,
+}
+
+impl ContainerBackendKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ContainerBackendKind::Devcontainer => "devcontainer",
+            ContainerBackendKind::Sandbox => "sandbox",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ContainerSection {
+    #[serde(default)]
+    pub backend: ContainerBackendKind,
+}
+
+/// Sandbox-backend settings. Only meaningful when `[container] backend =
+/// "sandbox"`. Written by the setup wizard from the chosen environment preset;
+/// the runtime `GROVE_SANDBOX_IMAGE` env var overrides `image` (used by tests
+/// and the e2e harness). Empty `image` falls back to a built-in default.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SandboxSection {
+    /// Docker image the per-project sandbox container runs. Derived from the
+    /// preset; e.g. `mcr.microsoft.com/devcontainers/universal:noble`.
+    #[serde(default)]
+    pub image: Option<String>,
+    /// The preset image's non-root user. Informational — the sandbox runs as
+    /// the host uid/gid so the bind-mounted `.grove/` control plane stays
+    /// readable/writable on both sides; this records the image's intended
+    /// user for tooling/HOME purposes.
+    #[serde(default)]
+    pub user: Option<String>,
 }
 
 fn default_true() -> bool {

@@ -41,6 +41,42 @@ impl ContainerInfo {
     }
 }
 
+// =============================================================================
+// Public API — delegates to the configured ContainerBackend.
+//
+// Call sites (spawn/attach/integrate/agents) use these free functions
+// unchanged. Backend selection (devcontainer vs sandbox) happens in
+// `backend_for`, keyed on the project's `.grove/config.toml`. The devcontainer
+// implementation lives in the `dc_*` functions below and is invoked by
+// `DevcontainerBackend`.
+// =============================================================================
+
+use super::backend::backend_for;
+
+pub fn ensure_up(project_root: &Path) -> Result<ContainerInfo, String> {
+    backend_for(project_root).ensure_up(project_root)
+}
+
+pub fn down(project_root: &Path) -> Result<(), String> {
+    backend_for(project_root).down(project_root)
+}
+
+pub fn is_up(project_root: &Path) -> bool {
+    backend_for(project_root).is_up(project_root)
+}
+
+pub fn exec(info: &ContainerInfo, argv: &[&str]) -> Result<Output, String> {
+    backend_for(&info.workspace_root).exec(info, argv)
+}
+
+pub fn exec_streaming(info: &ContainerInfo, argv: &[&str]) -> Result<ExitStatus, String> {
+    backend_for(&info.workspace_root).exec_streaming(info, argv)
+}
+
+pub fn attach_instructions(info: &ContainerInfo, session_name: &str) -> String {
+    backend_for(&info.workspace_root).attach_instructions(info, session_name)
+}
+
 /// Bring the project's devcontainer up. Idempotent — calling twice returns
 /// Ok without re-creating. Reads `workspace_target` and `remote_user` from
 /// the project's `.grove/config.toml` first, then falls back to whatever the
@@ -48,7 +84,7 @@ impl ContainerInfo {
 ///
 /// On success, exports `GROVE_CONTAINER_UP=1` so subsequent calls in the
 /// same process can skip the up-probe entirely.
-pub fn ensure_up(project_root: &Path) -> Result<ContainerInfo, String> {
+pub(crate) fn dc_ensure_up(project_root: &Path) -> Result<ContainerInfo, String> {
     let (workspace_target_hint, remote_user_hint) = read_config_hints(project_root);
 
     let argv = base_argv();
@@ -104,7 +140,7 @@ pub fn ensure_up(project_root: &Path) -> Result<ContainerInfo, String> {
 }
 
 /// Stop and remove the project's devcontainer.
-pub fn down(project_root: &Path) -> Result<(), String> {
+pub(crate) fn dc_down(project_root: &Path) -> Result<(), String> {
     let argv = base_argv();
     let cmd = argv.first().cloned().unwrap_or_else(default_command);
     let extra_args = argv.iter().skip(1).cloned().collect::<Vec<_>>();
@@ -129,7 +165,7 @@ pub fn down(project_root: &Path) -> Result<(), String> {
 /// Best-effort check that the container is currently up. Returns false on
 /// any error (including "devcontainer CLI not installed") so callers can
 /// gracefully degrade.
-pub fn is_up(project_root: &Path) -> bool {
+pub(crate) fn dc_is_up(project_root: &Path) -> bool {
     is_up_with(
         project_root,
         std::env::var("GROVE_DEVCONTAINER_COMMAND").ok().as_deref(),
@@ -161,7 +197,7 @@ fn is_up_with(project_root: &Path, override_value: Option<&str>) -> bool {
 }
 
 /// Run a command in the project's devcontainer. Captures output.
-pub fn exec(info: &ContainerInfo, argv: &[&str]) -> Result<Output, String> {
+pub(crate) fn dc_exec(info: &ContainerInfo, argv: &[&str]) -> Result<Output, String> {
     let dc_argv = base_argv();
     let cmd = dc_argv.first().cloned().unwrap_or_else(default_command);
     let extra_args = dc_argv.iter().skip(1).cloned().collect::<Vec<_>>();
@@ -179,7 +215,7 @@ pub fn exec(info: &ContainerInfo, argv: &[&str]) -> Result<Output, String> {
 }
 
 /// Run a command in the container with stdio inherited (no capture).
-pub fn exec_streaming(info: &ContainerInfo, argv: &[&str]) -> Result<ExitStatus, String> {
+pub(crate) fn dc_exec_streaming(info: &ContainerInfo, argv: &[&str]) -> Result<ExitStatus, String> {
     let dc_argv = base_argv();
     let cmd = dc_argv.first().cloned().unwrap_or_else(default_command);
     let extra_args = dc_argv.iter().skip(1).cloned().collect::<Vec<_>>();
@@ -222,7 +258,7 @@ pub fn host_to_container_path(info: &ContainerInfo, host_path: &Path) -> Result<
 }
 
 /// Print attach instructions for a session inside the container.
-pub fn attach_instructions(info: &ContainerInfo, session_name: &str) -> String {
+pub(crate) fn dc_attach_instructions(info: &ContainerInfo, session_name: &str) -> String {
     format!(
         "{} {} -- tmux attach -t {}",
         default_command(),

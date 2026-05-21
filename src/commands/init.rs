@@ -804,13 +804,18 @@ fn build_grove_config(
     };
 
     // build_grove_config runs BEFORE devcontainer.json may be on disk
-    // (clone mode) or alongside an existing one (in-place). We don't
-    // need a perfect user here — the actual devcontainer mounts come
-    // from apply_cache_volumes_to_devcontainer which re-reads
-    // devcontainer.json. This is .grove/config.toml metadata only;
-    // "vscode" is the safe scaffold default.
+    // (clone mode) or alongside an existing one (in-place). The actual
+    // devcontainer mounts come from apply_cache_volumes_to_devcontainer
+    // which re-reads devcontainer.json; this is .grove/config.toml metadata
+    // only. Seed the cache paths under the preset's user (detection set
+    // project.default_user) rather than a hardcoded "vscode".
+    let cache_user = if project.default_user.is_empty() {
+        crate::models::default_remote_user()
+    } else {
+        project.default_user.clone()
+    };
     config.caches.volumes =
-        crate::devcontainer::stack::cache_volumes(stack_enum, &project.repo_name, "vscode")
+        crate::devcontainer::stack::cache_volumes(stack_enum, &project.repo_name, &cache_user)
             .into_iter()
             .map(|(source, target)| crate::models::CacheVolume { source, target })
             .collect();
@@ -1164,15 +1169,11 @@ fn apply_baseline_claude_mounts(project_root: &Path) -> Result<(), String> {
 ///   3. `"vscode"`      — last-resort default (matches the Microsoft
 ///                        devcontainers base images grove init scaffolds).
 ///
-/// Public so devcontainer/mod.rs::apply_baseline_tmux_mount can call it
-/// without duplicating the lookup.
+/// Thin alias for the canonical lookup in `devcontainer::remote_user_from_value`.
+/// Kept so existing call sites here read naturally; the rule + fallback live in
+/// one place.
 pub(crate) fn remote_user_from_devcontainer(value: &serde_json::Value) -> String {
-    value
-        .get("remoteUser")
-        .and_then(|v| v.as_str())
-        .or_else(|| value.get("containerUser").and_then(|v| v.as_str()))
-        .unwrap_or("vscode")
-        .to_string()
+    crate::devcontainer::remote_user_from_value(value)
 }
 
 fn apply_cache_volumes_to_devcontainer(
@@ -1761,8 +1762,8 @@ mod tests {
         .unwrap();
         let project = ProjectContext {
             stack: Some(crate::models::ProjectStack::Rust),
-            default_image: crate::models::ProjectStack::Rust
-                .default_image()
+            default_image: crate::devcontainer::preset::for_stack(crate::models::ProjectStack::Rust)
+                .image
                 .to_string(),
             repo_name: "demo".into(),
             ..Default::default()
@@ -1794,8 +1795,8 @@ mod tests {
         .unwrap();
         let project = ProjectContext {
             stack: Some(crate::models::ProjectStack::Rust),
-            default_image: crate::models::ProjectStack::Rust
-                .default_image()
+            default_image: crate::devcontainer::preset::for_stack(crate::models::ProjectStack::Rust)
+                .image
                 .to_string(),
             repo_name: "demo".into(),
             ..Default::default()

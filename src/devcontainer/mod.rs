@@ -7,6 +7,7 @@
 // per-stack tooling.
 
 pub mod ci_scrape;
+pub mod preset;
 pub mod stack;
 
 use std::fs;
@@ -67,6 +68,10 @@ pub fn detect_project_context(ctx: &RepoContext, repo_name: &str) -> ProjectCont
     // Default branch detection lives in worktree_manager; we don't fail init if it's missing.
     let default_branch = crate::git::worktree_manager::get_default_branch(ctx).ok();
 
+    // Pre-select the environment preset for the detected stack. The preset is
+    // the single source of both the base image and the container user.
+    let preset = preset::for_stack(primary);
+
     ProjectContext {
         stack: Some(primary),
         stacks_detected,
@@ -75,7 +80,8 @@ pub fn detect_project_context(ctx: &RepoContext, repo_name: &str) -> ProjectCont
             .filter(|p| !p.contains('/'))
             .cloned()
             .collect(),
-        default_image: primary.default_image().to_string(),
+        default_image: preset.image.to_string(),
+        default_user: preset.remote_user.to_string(),
         has_tests,
         has_dockerfile,
         has_pre_commit,
@@ -121,17 +127,31 @@ pub fn scaffold_devcontainer(ctx: &RepoContext, project: &ProjectContext) -> Res
 /// images. `container::host_to_container_path` derives container paths from
 /// this, so the skeleton stays the source of truth.
 ///
-/// `postCreateCommand` is seeded with grove's container prereqs (tmux, jq,
-/// perl, claude). Phase 2's `apply_post_create` APPENDS project-stack installs
-/// (uv sync, npm ci, pre-commit install) so even `grove init --no-agent`
-/// users get a usable container.
+/// Image, container user, features, and extensions all come from the
+/// environment preset pre-selected for the detected stack (see
+/// `preset::for_stack`). The agentic toolchain (Node, git, GitHub CLI, Claude
+/// Code) is provisioned by maintained devcontainer features rather than a
+/// hand-rolled install; `postCreateCommand` only seeds the few tools grove
+/// itself needs (tmux/jq/perl). Phase 2's `apply_post_create` APPENDS
+/// project-stack installs (uv sync, npm ci, pre-commit install).
 pub fn build_devcontainer_skeleton(project: &ProjectContext) -> Value {
     let workspace_folder = format!("/workspaces/{}", project.repo_name);
-    let mut root = json!({
+    let stack = project.stack.unwrap_or(ProjectStack::Unknown);
+    let preset = preset::for_stack(stack);
+
+    // Container user: prefer the value detection derived from the preset; fall
+    // back to the preset's declared user. Never a hardcoded literal.
+    let user = if project.default_user.is_empty() {
+        preset.remote_user
+    } else {
+        project.default_user.as_str()
+    };
+
+    json!({
         "name": project.repo_name,
         "image": project.default_image,
-        "remoteUser": "vscode",
-        "containerUser": "vscode",
+        "remoteUser": user,
+        "containerUser": user,
         "updateRemoteUserUID": true,
         "workspaceFolder": workspace_folder,
         "postCreateCommand": grove_container_prereqs_command(),
@@ -145,33 +165,18 @@ pub fn build_devcontainer_skeleton(project: &ProjectContext) -> Value {
         "containerEnv": {
             "GH_TOKEN": "${localEnv:GH_TOKEN_RO}"
         },
-        // Pin git ≥ 2.46 so the container can parse the relative worktree
-        // pointers grove writes. Ubuntu 22.04 / Debian 12 base images
-        // ship 2.34 / 2.39 respectively; the devcontainer git feature
-        // with `ppa: true` adds git-core/ppa and installs latest.
-        "features": {
-            "ghcr.io/devcontainers/features/git:1": { "ppa": true, "version": "latest" }
-        },
+        // Preset features install the agentic toolchain: the git feature
+        // (`ppa:true`) pins git ≥ 2.46 so the container parses grove's
+        // relative worktree pointers; node + github-cli + the official
+        // anthropics/claude-code feature provide the rest.
+        "features": preset::features_object(preset),
         "mounts": [],
         "customizations": {
             "vscode": {
-                "extensions": []
+                "extensions": preset.extensions
             }
         }
-    });
-
-    // Per-stack default extensions (Phase 1 — wizard will overwrite/refine).
-    let stack = project.stack.unwrap_or(ProjectStack::Unknown);
-    let exts = stack::default_extensions(stack);
-    if let Some(obj) = root
-        .get_mut("customizations")
-        .and_then(|c| c.get_mut("vscode"))
-        .and_then(|v| v.get_mut("extensions"))
-    {
-        *obj = json!(exts);
-    }
-
-    root
+    })
 }
 
 /// Idempotent install line for grove's container prereqs. Runs as part of
@@ -186,8 +191,13 @@ pub fn build_devcontainer_skeleton(project: &ProjectContext) -> Value {
 /// this in README.
 ///
 /// `sudo` is included because the postCreateCommand sometimes runs as the
-/// remoteUser (vscode), which lacks root by default. devcontainer base
-/// images include passwordless sudo for the default user.
+/// remoteUser, which lacks root by default. devcontainer base images include
+/// passwordless sudo for the default user.
+///
+/// Only the tools grove itself needs are installed here (tmux for the agent
+/// session multiplexer, jq + perl for the hook/bus plumbing). The agentic
+/// toolchain — Node, git, GitHub CLI, and Claude Code — is provisioned by the
+/// preset's devcontainer features (see `preset.rs`), not by this shell.
 pub fn grove_container_prereqs_command() -> String {
     [
         // Apt step bundled so we don't repeat update for each tool.
@@ -195,13 +205,6 @@ pub fn grove_container_prereqs_command() -> String {
         r#"(command -v tmux >/dev/null || sudo apt-get install -y tmux)"#,
         r#"(command -v jq   >/dev/null || sudo apt-get install -y jq)"#,
         r#"(command -v perl >/dev/null || sudo apt-get install -y perl)"#,
-        // GitHub CLI from the official cli.github.com apt source. Required
-        // for `grove integrate` (agent runs `gh pr create`). Skipped if gh
-        // is already installed (e.g. bundled in a custom base image).
-        r#"(command -v gh >/dev/null || (curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | sudo tee /usr/share/keyrings/githubcli-archive-keyring.gpg >/dev/null && sudo chmod go+r /usr/share/keyrings/githubcli-archive-keyring.gpg && echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" | sudo tee /etc/apt/sources.list.d/github-cli.list >/dev/null && sudo apt-get update && sudo apt-get install -y gh))"#,
-        // Claude Code via official npm install. Skipped if claude is already
-        // on PATH (user can pre-bake it into a custom image).
-        r#"(command -v claude >/dev/null || sudo npm install -g @anthropic-ai/claude-code)"#,
     ]
     .join(" && ")
 }
@@ -311,7 +314,7 @@ fn apply_baseline_tmux_mount_with(
     // Route the mount target at whichever user devcontainer.json declares;
     // hardcoding `vscode` broke projects with non-vscode base images
     // (freqtrade uses `ftuser`).
-    let user = container_remote_user(&value);
+    let user = remote_user_from_value(&value);
     let obj = value
         .as_object_mut()
         .ok_or_else(|| "devcontainer.json top-level is not a JSON object".to_string())?;
@@ -339,16 +342,18 @@ fn apply_baseline_tmux_mount_with(
     Ok(true)
 }
 
-/// Same priority order as `commands::init::remote_user_from_devcontainer`:
-/// `remoteUser` → `containerUser` → "vscode". Duplicated here to avoid a
-/// cross-module dep; both helpers tested independently.
-fn container_remote_user(value: &Value) -> String {
+/// Canonical container-user lookup. Priority: `remoteUser` → `containerUser` →
+/// the single last-resort default (`models::default_remote_user`). This is the
+/// one place the lookup lives; `commands::init::remote_user_from_devcontainer`
+/// and `agent::setup::container_user_for_targets` delegate here so the rule —
+/// and its fallback — never drift apart.
+pub(crate) fn remote_user_from_value(value: &Value) -> String {
     value
         .get("remoteUser")
         .and_then(|v| v.as_str())
         .or_else(|| value.get("containerUser").and_then(|v| v.as_str()))
-        .unwrap_or("vscode")
-        .to_string()
+        .map(|s| s.to_string())
+        .unwrap_or_else(crate::models::default_remote_user)
 }
 
 /// Extract `(workspaceFolder, remoteUser)` from a parsed devcontainer.json.
@@ -378,13 +383,13 @@ mod tests {
     fn skeleton_carries_repo_name_and_image() {
         let project = ProjectContext {
             stack: Some(ProjectStack::Rust),
-            default_image: ProjectStack::Rust.default_image().to_string(),
+            default_image: preset::for_stack(ProjectStack::Rust).image.to_string(),
             repo_name: "demo".to_string(),
             ..Default::default()
         };
         let skel = build_devcontainer_skeleton(&project);
         assert_eq!(skel["name"], "demo");
-        assert_eq!(skel["image"], ProjectStack::Rust.default_image());
+        assert_eq!(skel["image"], preset::for_stack(ProjectStack::Rust).image);
         assert_eq!(skel["remoteUser"], "vscode");
         // rust default ext present
         let exts = skel["customizations"]["vscode"]["extensions"]
@@ -398,30 +403,46 @@ mod tests {
     fn skeleton_seeds_grove_prereqs_in_post_create() {
         let project = ProjectContext {
             stack: Some(ProjectStack::Rust),
-            default_image: ProjectStack::Rust.default_image().to_string(),
+            default_image: preset::for_stack(ProjectStack::Rust).image.to_string(),
             repo_name: "demo".to_string(),
             ..Default::default()
         };
         let skel = build_devcontainer_skeleton(&project);
         let post = skel["postCreateCommand"].as_str().unwrap();
-        // Each prereq is gated on `command -v` first; idempotent on images
-        // that already have them.
+        // postCreate only installs the tools grove itself needs; each is gated
+        // on `command -v` so it's idempotent on images that already have them.
         assert!(post.contains("command -v tmux"));
         assert!(post.contains("command -v jq"));
         assert!(post.contains("command -v perl"));
-        assert!(post.contains("command -v claude"));
-        assert!(post.contains("command -v gh"));
-        // Claude install path is npm (most portable). Devs can override.
-        assert!(post.contains("@anthropic-ai/claude-code"));
-        // gh install path: official cli.github.com apt source.
-        assert!(post.contains("cli.github.com/packages"));
+        // The agentic toolchain (gh, claude) is no longer hand-installed in
+        // postCreate — it comes from the preset's devcontainer features.
+        assert!(!post.contains("@anthropic-ai/claude-code"));
+        assert!(!post.contains("cli.github.com/packages"));
+    }
+
+    #[test]
+    fn skeleton_features_install_agentic_toolchain() {
+        let project = ProjectContext {
+            stack: Some(ProjectStack::Rust),
+            default_image: preset::for_stack(ProjectStack::Rust).image.to_string(),
+            repo_name: "demo".to_string(),
+            ..Default::default()
+        };
+        let skel = build_devcontainer_skeleton(&project);
+        let feats = &skel["features"];
+        assert!(feats
+            .get("ghcr.io/anthropics/devcontainer-features/claude-code:1")
+            .is_some());
+        assert!(feats
+            .get("ghcr.io/devcontainers/features/github-cli:1")
+            .is_some());
     }
 
     #[test]
     fn skeleton_maps_gh_token_via_container_env() {
         let project = ProjectContext {
             stack: Some(ProjectStack::Rust),
-            default_image: ProjectStack::Rust.default_image().to_string(),
+            default_image: preset::for_stack(ProjectStack::Rust).image.to_string(),
             repo_name: "demo".to_string(),
             ..Default::default()
         };
@@ -434,7 +455,7 @@ mod tests {
     fn skeleton_pins_git_feature_for_relative_worktrees() {
         let project = ProjectContext {
             stack: Some(ProjectStack::Rust),
-            default_image: ProjectStack::Rust.default_image().to_string(),
+            default_image: preset::for_stack(ProjectStack::Rust).image.to_string(),
             repo_name: "demo".to_string(),
             ..Default::default()
         };
@@ -448,12 +469,12 @@ mod tests {
     fn skeleton_unknown_stack_still_valid() {
         let project = ProjectContext {
             stack: Some(ProjectStack::Unknown),
-            default_image: ProjectStack::Unknown.default_image().to_string(),
+            default_image: preset::for_stack(ProjectStack::Unknown).image.to_string(),
             repo_name: "demo".to_string(),
             ..Default::default()
         };
         let skel = build_devcontainer_skeleton(&project);
-        assert_eq!(skel["image"], ProjectStack::Unknown.default_image());
+        assert_eq!(skel["image"], preset::for_stack(ProjectStack::Unknown).image);
     }
 
     fn tmp_dir(label: &str) -> std::path::PathBuf {
