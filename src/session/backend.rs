@@ -443,7 +443,11 @@ fn create_and_seed(root: &Path, name: &str) -> Result<(), String> {
     }
 
     // 2. Capture the true origin URL + committer identity from the host repo so
-    //    pushes from inside the sandbox reach the real remote.
+    //    pushes from inside the sandbox reach the real remote. Also capture the
+    //    symbolic HEAD (`git bundle --all` carries branch refs but NOT the
+    //    symbolic HEAD, so a bundle clone otherwise defaults HEAD to a
+    //    nonexistent `master` and `git worktree add` fails).
+    let head_ref = resolve_seed_head(&bare);
     let origin_url = git_config_get(&bare, "remote.origin.url");
     let user_name = git_config_get(&bare, "user.name")
         .or_else(|| git_global_config_get("user.name"))
@@ -491,6 +495,12 @@ fn create_and_seed(root: &Path, name: &str) -> Result<(), String> {
     )?;
     let bare_str = bare.to_string_lossy().to_string();
     seed_exec(name, root, None, &["git", "clone", "--bare", bundle_in, &bare_str])?;
+
+    // 5b. Point HEAD at the real default branch so worktree creation has a
+    //     valid base ref.
+    if let Some(head) = head_ref {
+        seed_exec(name, root, None, &["git", "-C", &bare_str, "symbolic-ref", "HEAD", &head])?;
+    }
 
     // 6. Restore origin + fetch refspec; configure committer identity + mark
     //    the seeded paths safe (uid owns them, but belt-and-suspenders).
@@ -616,6 +626,76 @@ fn git_config_get(repo: &Path, key: &str) -> Option<String> {
     } else {
         Some(s)
     }
+}
+
+/// Resolve the `refs/heads/<branch>` the seeded clone's HEAD should point at.
+/// `git bundle --all` doesn't carry the symbolic HEAD, and the host bare
+/// clone's HEAD may itself be invalid (e.g. an upstream whose HEAD points at a
+/// branch that no longer exists), so we pick a branch that actually exists:
+/// the symbolic-HEAD target if valid, else main, else master, else the first
+/// local branch.
+fn resolve_seed_head(repo: &Path) -> Option<String> {
+    if let Some(sym) = git_symbolic_head(repo) {
+        let branch = sym.trim_start_matches("refs/heads/");
+        if local_branch_exists(repo, branch) {
+            return Some(sym);
+        }
+    }
+    for cand in ["main", "master"] {
+        if local_branch_exists(repo, cand) {
+            return Some(format!("refs/heads/{}", cand));
+        }
+    }
+    first_local_branch(repo).map(|b| format!("refs/heads/{}", b))
+}
+
+/// The repo's symbolic HEAD (e.g. `refs/heads/main`), or None if detached/unset.
+fn git_symbolic_head(repo: &Path) -> Option<String> {
+    let out = Command::new("git")
+        .current_dir(repo)
+        .args(["symbolic-ref", "HEAD"])
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if s.is_empty() {
+        None
+    } else {
+        Some(s)
+    }
+}
+
+fn local_branch_exists(repo: &Path, branch: &str) -> bool {
+    Command::new("git")
+        .current_dir(repo)
+        .args([
+            "show-ref",
+            "--verify",
+            "--quiet",
+            &format!("refs/heads/{}", branch),
+        ])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+fn first_local_branch(repo: &Path) -> Option<String> {
+    let out = Command::new("git")
+        .current_dir(repo)
+        .args(["branch", "--format=%(refname:short)"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .map(|l| l.trim())
+        .find(|l| !l.is_empty())
+        .map(|s| s.to_string())
 }
 
 fn git_global_config_get(key: &str) -> Option<String> {
