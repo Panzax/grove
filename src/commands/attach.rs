@@ -35,21 +35,32 @@ pub fn run(name: &str) {
 
     // Refuse to auto-up. Attach must be cheap.
     if !container::is_up(&project_root_path) {
-        eprintln!(
-            "{} devcontainer is not running. Run `grove devcontainer up` first.",
-            "Error:".red()
-        );
+        if ctx.is_sandbox() {
+            eprintln!(
+                "{} the sandbox is not running. Run `grove spawn <agent>` to start it.",
+                "Error:".red()
+            );
+        } else {
+            eprintln!(
+                "{} devcontainer is not running. Run `grove devcontainer up` first.",
+                "Error:".red()
+            );
+        }
         std::process::exit(1);
     }
 
-    let info = match container_info_from_config(&project_root_path) {
-        Some(i) => i,
-        None => {
-            eprintln!(
-                "{} could not resolve container info from .grove/config.toml. Run `grove devcontainer doctor` to diagnose.",
-                "Error:".red()
-            );
-            std::process::exit(1);
+    let info = if ctx.is_sandbox() {
+        crate::session::backend::sandbox_info(&project_root_path)
+    } else {
+        match container_info_from_config(&project_root_path) {
+            Some(i) => i,
+            None => {
+                eprintln!(
+                    "{} could not resolve container info from .grove/config.toml. Run `grove devcontainer doctor` to diagnose.",
+                    "Error:".red()
+                );
+                std::process::exit(1);
+            }
         }
     };
 

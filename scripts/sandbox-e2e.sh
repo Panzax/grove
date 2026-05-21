@@ -99,6 +99,10 @@ note "tmux session live in the container"
 docker exec -u "$(id -u):$(id -g)" "$CN" tmux has-session -t grove-feat-a || fail "tmux session missing"
 echo "  grove-feat-a alive"
 
+note "read command routes to the sandbox: grove agents list"
+AGENTS="$("$GROVE_BIN" agents list 2>&1)"; printf '%s\n' "$AGENTS" | sed 's/^/  /'
+has "$AGENTS" "feat-a" || fail "grove agents list did not show feat-a"
+
 note "REUSE: second spawn reuses the SAME container (no re-seed)"
 CID1="$(docker inspect -f '{{.Id}}' "$CN")"
 "$GROVE_BIN" spawn feat-b --no-bootstrap >/dev/null 2>&1
