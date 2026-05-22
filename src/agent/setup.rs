@@ -224,12 +224,14 @@ fn prompt_claude_scope_sandbox(config: &mut GroveConfig) -> Result<(), String> {
         .default(default_idx)
         .interact()
         .map_err(|e| format!("prompt: {}", e))?;
-    config.mounts.claude_inherit = Some(match idx {
-        1 => "full",
-        2 => "none",
-        _ => "scoped",
-    }
-    .to_string());
+    config.mounts.claude_inherit = Some(
+        match idx {
+            1 => "full",
+            2 => "none",
+            _ => "scoped",
+        }
+        .to_string(),
+    );
     Ok(())
 }
 
@@ -311,7 +313,11 @@ fn handle_backend_switch(
         let _ = tmux::kill_session(s, Some(&info));
     }
     container::down(project_root_path)?;
-    println!("  {} tore down the old {} backend", "·".dimmed(), old.as_str());
+    println!(
+        "  {} tore down the old {} backend",
+        "·".dimmed(),
+        old.as_str()
+    );
     Ok(true)
 }
 

@@ -190,7 +190,10 @@ impl ContainerBackend for SandboxBackend {
 /// backend. Read by the git layer to decide whether worktree/branch ops run on
 /// the host or inside the per-project sandbox container.
 pub fn project_is_sandbox(project_root: &Path) -> bool {
-    matches!(read_backend_kind(project_root), ContainerBackendKind::Sandbox)
+    matches!(
+        read_backend_kind(project_root),
+        ContainerBackendKind::Sandbox
+    )
 }
 
 /// The identical-path `ContainerInfo` for a sandbox project (workspace_target
@@ -410,14 +413,13 @@ fn seed_exec(name: &str, root: &Path, user: Option<&str>, argv: &[&str]) -> Resu
 fn create_and_seed(root: &Path, name: &str) -> Result<(), String> {
     // The host bare clone is the bundle source. Its path is reused verbatim as
     // the in-container repo path (identical-path model).
-    let bare = crate::utils::discover_bare_clone(Some(root))
-        .map_err(|e| {
-            format!(
-                "sandbox seeding needs a bare clone under {} (run `grove init <url>`): {}",
-                root.display(),
-                e.message
-            )
-        })?;
+    let bare = crate::utils::discover_bare_clone(Some(root)).map_err(|e| {
+        format!(
+            "sandbox seeding needs a bare clone under {} (run `grove init <url>`): {}",
+            root.display(),
+            e.message
+        )
+    })?;
 
     let grove_dir = root.join(".grove");
     if !grove_dir.exists() {
@@ -469,9 +471,8 @@ fn create_and_seed(root: &Path, name: &str) -> Result<(), String> {
         &extra_mounts,
     );
     let refs: Vec<&str> = create_args.iter().map(|s| s.as_str()).collect();
-    docker_run_checked(&refs, "docker run").map_err(|e| {
-        format!("{}\n  (image: {})", e, sandbox_image(root))
-    })?;
+    docker_run_checked(&refs, "docker run")
+        .map_err(|e| format!("{}\n  (image: {})", e, sandbox_image(root)))?;
 
     // 4. As root: make the project root + HOME writable by the host uid so the
     //    subsequent (unprivileged) git clone + worktree adds can create the
@@ -479,8 +480,23 @@ fn create_and_seed(root: &Path, name: &str) -> Result<(), String> {
     //    bind-mounted .grove keeps its host ownership.
     let (uid, gid) = host_uid_gid();
     let chown_target = format!("{}:{}", uid, gid);
-    seed_exec(name, root, Some("0"), &["mkdir", "-p", &root.to_string_lossy(), SANDBOX_HOME])?;
-    seed_exec(name, root, Some("0"), &["chown", &chown_target, &root.to_string_lossy(), SANDBOX_HOME])?;
+    seed_exec(
+        name,
+        root,
+        Some("0"),
+        &["mkdir", "-p", &root.to_string_lossy(), SANDBOX_HOME],
+    )?;
+    seed_exec(
+        name,
+        root,
+        Some("0"),
+        &[
+            "chown",
+            &chown_target,
+            &root.to_string_lossy(),
+            SANDBOX_HOME,
+        ],
+    )?;
 
     // 5. Copy the bundle in and clone it as a bare repo at the host bare-clone
     //    path. `docker cp` lands it as root; readable by the clone.
@@ -494,18 +510,33 @@ fn create_and_seed(root: &Path, name: &str) -> Result<(), String> {
         "docker cp seed bundle",
     )?;
     let bare_str = bare.to_string_lossy().to_string();
-    seed_exec(name, root, None, &["git", "clone", "--bare", bundle_in, &bare_str])?;
+    seed_exec(
+        name,
+        root,
+        None,
+        &["git", "clone", "--bare", bundle_in, &bare_str],
+    )?;
 
     // 5b. Point HEAD at the real default branch so worktree creation has a
     //     valid base ref.
     if let Some(head) = head_ref {
-        seed_exec(name, root, None, &["git", "-C", &bare_str, "symbolic-ref", "HEAD", &head])?;
+        seed_exec(
+            name,
+            root,
+            None,
+            &["git", "-C", &bare_str, "symbolic-ref", "HEAD", &head],
+        )?;
     }
 
     // 6. Restore origin + fetch refspec; configure committer identity + mark
     //    the seeded paths safe (uid owns them, but belt-and-suspenders).
     if let Some(url) = origin_url {
-        seed_exec(name, root, None, &["git", "-C", &bare_str, "remote", "set-url", "origin", &url])?;
+        seed_exec(
+            name,
+            root,
+            None,
+            &["git", "-C", &bare_str, "remote", "set-url", "origin", &url],
+        )?;
         seed_exec(
             name,
             root,
@@ -520,9 +551,24 @@ fn create_and_seed(root: &Path, name: &str) -> Result<(), String> {
             ],
         )?;
     }
-    seed_exec(name, root, None, &["git", "config", "--global", "user.name", &user_name])?;
-    seed_exec(name, root, None, &["git", "config", "--global", "user.email", &user_email])?;
-    seed_exec(name, root, None, &["git", "config", "--global", "--add", "safe.directory", "*"])?;
+    seed_exec(
+        name,
+        root,
+        None,
+        &["git", "config", "--global", "user.name", &user_name],
+    )?;
+    seed_exec(
+        name,
+        root,
+        None,
+        &["git", "config", "--global", "user.email", &user_email],
+    )?;
+    seed_exec(
+        name,
+        root,
+        None,
+        &["git", "config", "--global", "--add", "safe.directory", "*"],
+    )?;
 
     let _ = std::fs::remove_file(&bundle);
     Ok(())
@@ -736,7 +782,8 @@ mod tests {
     fn unknown_section_keys_do_not_break_default() {
         // A config that predates the [container] section still loads with the
         // devcontainer default, so existing projects are unaffected.
-        let cfg: GroveConfig = toml::from_str("[devcontainer]\nremote_user = \"vscode\"\n").unwrap();
+        let cfg: GroveConfig =
+            toml::from_str("[devcontainer]\nremote_user = \"vscode\"\n").unwrap();
         assert_eq!(cfg.container.backend, ContainerBackendKind::Devcontainer);
     }
 

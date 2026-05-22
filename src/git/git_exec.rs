@@ -37,4 +37,3 @@ pub fn run(project_root: &Path, cwd: &Path, args: &[&str]) -> Result<Output, Str
             .map_err(|e| format!("Failed to execute git: {}", e))
     }
 }
-

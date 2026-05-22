@@ -1762,9 +1762,11 @@ mod tests {
         .unwrap();
         let project = ProjectContext {
             stack: Some(crate::models::ProjectStack::Rust),
-            default_image: crate::devcontainer::preset::for_stack(crate::models::ProjectStack::Rust)
-                .image
-                .to_string(),
+            default_image: crate::devcontainer::preset::for_stack(
+                crate::models::ProjectStack::Rust,
+            )
+            .image
+            .to_string(),
             repo_name: "demo".into(),
             ..Default::default()
         };
@@ -1795,9 +1797,11 @@ mod tests {
         .unwrap();
         let project = ProjectContext {
             stack: Some(crate::models::ProjectStack::Rust),
-            default_image: crate::devcontainer::preset::for_stack(crate::models::ProjectStack::Rust)
-                .image
-                .to_string(),
+            default_image: crate::devcontainer::preset::for_stack(
+                crate::models::ProjectStack::Rust,
+            )
+            .image
+            .to_string(),
             repo_name: "demo".into(),
             ..Default::default()
         };

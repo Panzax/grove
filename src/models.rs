@@ -90,7 +90,6 @@ impl ProjectStack {
             ProjectStack::Unknown => "unknown",
         }
     }
-
 }
 
 /// The output of `devcontainer::detect_project_context`. Captures everything Phase 1

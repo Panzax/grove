@@ -474,7 +474,10 @@ mod tests {
             ..Default::default()
         };
         let skel = build_devcontainer_skeleton(&project);
-        assert_eq!(skel["image"], preset::for_stack(ProjectStack::Unknown).image);
+        assert_eq!(
+            skel["image"],
+            preset::for_stack(ProjectStack::Unknown).image
+        );
     }
 
     fn tmp_dir(label: &str) -> std::path::PathBuf {

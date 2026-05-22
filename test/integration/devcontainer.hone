@@ -23,20 +23,21 @@ ASSERT stdout contains "rebuild"
 ASSERT stdout contains "logs"
 ASSERT stdout contains "doctor"
 
-TEST "grove init writes grove prereqs into postCreateCommand"
+TEST "grove init seeds prereqs in postCreateCommand + agentic toolchain via features"
 
 ENV TEST_DIR=/tmp/grove-init-postcreate-prereqs
 RUN setup: rm -rf $TEST_DIR && mkdir -p $TEST_DIR && cd $TEST_DIR && git init -q && git -c user.email=t@t -c user.name=t commit --allow-empty -q -m init
 RUN init: cd $TEST_DIR && grove init --no-agent
 ASSERT init.exit_code == 0
 RUN read-config: cat $TEST_DIR/.devcontainer/devcontainer.json
+# postCreateCommand only seeds the small utils not covered by a feature.
 ASSERT read-config.stdout contains "command -v tmux"
 ASSERT read-config.stdout contains "command -v jq"
 ASSERT read-config.stdout contains "command -v perl"
-ASSERT read-config.stdout contains "command -v claude"
-ASSERT read-config.stdout contains "command -v gh"
-ASSERT read-config.stdout contains "@anthropic-ai/claude-code"
-ASSERT read-config.stdout contains "cli.github.com/packages"
+# The agentic toolchain (Claude Code CLI, gh, git) comes from maintained
+# devcontainer features, not a hand-rolled npm/apt install.
+ASSERT read-config.stdout contains "ghcr.io/anthropics/devcontainer-features/claude-code:1"
+ASSERT read-config.stdout contains "ghcr.io/devcontainers/features/github-cli:1"
 ASSERT read-config.stdout contains "ghcr.io/devcontainers/features/git:1"
 ASSERT read-config.stdout contains "\"ppa\": true"
 RUN cleanup: rm -rf $TEST_DIR
