@@ -98,20 +98,22 @@ pub fn run(
     }
 
     // Two flows from here: RESUME if the agent dir already exists, FRESH otherwise.
+    // Resume may relocate the worktree to the path recorded in agent.toml (e.g.
+    // `grove integrate`'s `worktrees/.integration`, which is not name-derived),
+    // so it returns the worktree path it actually targeted.
     let resume = agent_dir.exists();
-    let (final_agent_dir, target_branch) = if resume {
+    let (final_agent_dir, worktree_path, target_branch) = if resume {
         resume_agent(
             &ctx,
             &project_root_path,
             &worktree_path,
-            &worktree_path_str,
             &agent_dir,
             name,
             branch,
             task,
         )
     } else {
-        fresh_agent(
+        let (ad, br) = fresh_agent(
             &ctx,
             &project_root_path,
             &worktree_path,
@@ -121,7 +123,8 @@ pub fn run(
             task,
             promise.unwrap_or(DEFAULT_PROMISE),
             max_iter.unwrap_or(DEFAULT_MAX_ITERATIONS),
-        )
+        );
+        (ad, worktree_path, br)
     };
     let agent_dir = final_agent_dir;
 
@@ -560,10 +563,26 @@ fn fresh_agent(
     (agent_dir, target_branch)
 }
 
+/// Pick the worktree path a resume should target: the path recorded in
+/// agent.toml when present and non-empty, else the name-derived default. The
+/// two diverge for `grove integrate` (recorded as `worktrees/.integration`),
+/// so resuming an integrate agent must use the recorded path or it would try
+/// to recreate a worktree on a branch git already has checked out elsewhere.
+fn resume_worktree_path(recorded: Option<&AgentMetadata>, default_worktree_path: &Path) -> PathBuf {
+    recorded
+        .map(|m| m.worktree.trim())
+        .filter(|w| !w.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| default_worktree_path.to_path_buf())
+}
+
 /// Resume agent path. Re-uses the existing .grove/agents/<n>/ state.
 ///
 /// Repair semantics (handles crashes / partial state):
-/// - Re-create the worktree if it was removed by `grove remove`.
+/// - Target the worktree recorded in agent.toml (not the name-derived path) so
+///   integrate agents resume into `worktrees/.integration`.
+/// - Re-create the worktree if it was removed by `grove remove`; if the branch
+///   is still checked out elsewhere, reuse that checkout instead of failing.
 /// - Re-create the .grove symlink if it's gone.
 /// - Clear loop.md `session_id` so the Stop hook accepts the new session.
 /// - Preserve PROMPT.md, STATE.md, agent.toml — user / agent edits survive.
@@ -575,25 +594,28 @@ fn fresh_agent(
 fn resume_agent(
     ctx: &crate::git::worktree_manager::RepoContext,
     project_root_path: &Path,
-    worktree_path: &Path,
-    worktree_path_str: &str,
+    default_worktree_path: &Path,
     agent_dir: &Path,
     name: &str,
     branch_override: Option<&str>,
     task_override: Option<&str>,
-) -> (PathBuf, String) {
+) -> (PathBuf, PathBuf, String) {
     // Read recorded agent.toml for branch + worktree. If agent.toml is
     // missing (older grove version, partial state), fall back to defaults.
     let agent_toml = agent_dir.join("agent.toml");
-    let recorded_branch = if agent_toml.exists() {
-        std::fs::read_to_string(&agent_toml)
-            .ok()
-            .and_then(|raw| toml::from_str::<AgentMetadata>(&raw).ok())
-            .map(|m| m.branch)
-            .unwrap_or_else(|| format!("agent/{}", name))
-    } else {
-        format!("agent/{}", name)
-    };
+    let recorded = std::fs::read_to_string(&agent_toml)
+        .ok()
+        .and_then(|raw| toml::from_str::<AgentMetadata>(&raw).ok());
+    let recorded_branch = recorded
+        .as_ref()
+        .map(|m| m.branch.clone())
+        .unwrap_or_else(|| format!("agent/{}", name));
+    // Prefer the worktree path recorded in agent.toml over the name-derived
+    // default. They diverge for `grove integrate` (which records
+    // `worktrees/.integration`), so resuming an integrate agent — e.g. after
+    // its tmux session was killed — must target the worktree git already
+    // tracks, not a fresh name-derived path.
+    let mut worktree_path = resume_worktree_path(recorded.as_ref(), default_worktree_path);
 
     if branch_override.is_some() && branch_override != Some(recorded_branch.as_str()) {
         eprintln!(
@@ -614,17 +636,34 @@ fn resume_agent(
     // `grove spawn` to resume). add_worktree refuses if the worktree already
     // exists, so we only call it when the dir is missing.
     if !worktree_path.exists() {
-        let create_new = !branch_exists(ctx, &recorded_branch);
-        if let Err(e) = add_worktree(ctx, worktree_path_str, &recorded_branch, create_new, None) {
-            eprintln!("{} recreate worktree on resume: {}", "Error:".red(), e);
-            std::process::exit(1);
+        // The branch may still be checked out at a worktree git tracks even
+        // though our recorded path is gone (e.g. the dir was moved, or the
+        // recorded path drifted). Recreating would fail with "already used by
+        // worktree at ...", so recover by reusing the existing checkout.
+        if let Some(existing) = branch_already_checked_out(ctx, &recorded_branch) {
+            println!(
+                "  {} branch {} already checked out at {} — resuming there",
+                "·".dimmed(),
+                recorded_branch.bold(),
+                existing
+            );
+            worktree_path = PathBuf::from(existing);
+        } else {
+            let create_new = !branch_exists(ctx, &recorded_branch);
+            let worktree_path_str = worktree_path.to_string_lossy().to_string();
+            if let Err(e) =
+                add_worktree(ctx, &worktree_path_str, &recorded_branch, create_new, None)
+            {
+                eprintln!("{} recreate worktree on resume: {}", "Error:".red(), e);
+                std::process::exit(1);
+            }
+            println!(
+                "  {} re-created worktree at {} on {}",
+                "·".dimmed(),
+                worktree_path.display(),
+                recorded_branch.bold()
+            );
         }
-        println!(
-            "  {} re-created worktree at {} on {}",
-            "·".dimmed(),
-            worktree_path.display(),
-            recorded_branch.bold()
-        );
     }
 
     // Always relativize pointers on resume — covers two cases: (1) a fresh
@@ -632,7 +671,7 @@ fn resume_agent(
     // paths. Idempotent when already relative. Skipped in sandbox mode (paths
     // are identical and the worktree lives in the container, not on the host).
     if !ctx.is_sandbox() {
-        if let Err(e) = make_worktree_pointers_relative(worktree_path) {
+        if let Err(e) = make_worktree_pointers_relative(&worktree_path) {
             eprintln!(
                 "  {} rewrite worktree pointers to relative: {}",
                 "Warning:".yellow(),
@@ -642,7 +681,7 @@ fn resume_agent(
     }
 
     // Re-link .grove (idempotent — Ok if symlink exists).
-    link_grove(ctx, worktree_path, project_root_path);
+    link_grove(ctx, &worktree_path, project_root_path);
 
     // Clear stale session_id in loop.md so the Stop hook's isolation guard
     // doesn't silently reject the new claude session.
@@ -660,7 +699,7 @@ fn resume_agent(
         );
     }
 
-    (agent_dir.to_path_buf(), recorded_branch)
+    (agent_dir.to_path_buf(), worktree_path, recorded_branch)
 }
 
 /// Link the project's `.grove/` into the worktree so the Stop hook + framework
@@ -778,5 +817,43 @@ mod tests {
     fn empty_override_falls_back_to_default() {
         let tokens = launch_command_tokens_with(Some("   "));
         assert_eq!(tokens[0], "claude");
+    }
+
+    fn meta_with_worktree(worktree: &str) -> AgentMetadata {
+        AgentMetadata {
+            id: "id".into(),
+            name: "integrate-20260521T050815Z".into(),
+            worktree: worktree.into(),
+            branch: "integration/20260521T050815Z".into(),
+            task: None,
+            tmux_session: None,
+            spawned_at: chrono::Utc::now(),
+            provider: "claude-code".into(),
+        }
+    }
+
+    #[test]
+    fn resume_prefers_recorded_worktree_over_name_derived_default() {
+        // The bug: resuming an integrate agent used the name-derived default
+        // (`worktrees/integrate-<ts>`) instead of the recorded
+        // `worktrees/.integration`, then tried to recreate a worktree on a
+        // branch git already had checked out → fatal.
+        let default = Path::new("/proj/worktrees/integrate-20260521T050815Z");
+        let meta = meta_with_worktree("/proj/worktrees/.integration");
+        assert_eq!(
+            resume_worktree_path(Some(&meta), default),
+            PathBuf::from("/proj/worktrees/.integration")
+        );
+    }
+
+    #[test]
+    fn resume_falls_back_to_default_when_no_metadata_or_empty() {
+        let default = Path::new("/proj/worktrees/feat-a");
+        assert_eq!(resume_worktree_path(None, default), default.to_path_buf());
+        let meta = meta_with_worktree("   ");
+        assert_eq!(
+            resume_worktree_path(Some(&meta), default),
+            default.to_path_buf()
+        );
     }
 }
