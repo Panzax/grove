@@ -16,7 +16,7 @@
 
 ## What you must NOT do
 
-- Do not edit `.grove-context/` (read-only by design; chmod-enforced).
+- Do not edit `$GROVE_AGENT_DIR/context/` (read-only by design; chmod-enforced).
 - Do not skip workitems silently — flip to `[!]` with a roadblock note if you can't proceed.
 - Do not run `gh pr create` until every `[ ] merge` and `[ ] verify` workitem is `[x]`.
 - Do not loop on auth failures — roadblock per the bootstrap protocol.
@@ -27,7 +27,7 @@
 | Need | Command |
 |---|---|
 | List remaining conflicts | `git diff --name-only --diff-filter=U` |
-| Show which agent owned a branch | `cat .grove-context/agents/<n>/STATE.md \| head -20` |
+| Show which agent owned a branch | `cat $GROVE_AGENT_DIR/context/agents/<n>/STATE.md \| head -20` |
 | Check gh auth | `gh auth status` |
 | Verify head matches expected sha | `git rev-parse HEAD` |
 | Cancel a borked merge | `git merge --abort` |

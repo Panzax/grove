@@ -666,7 +666,7 @@ fn resume_agent(
 /// Link the project's `.grove/` into the worktree so the Stop hook + framework
 /// docs resolve from the agent's cwd. Routes into the sandbox container in
 /// sandbox mode (the worktree lives there); creates a host symlink otherwise.
-fn link_grove(ctx: &RepoContext, worktree_path: &Path, project_root_path: &Path) {
+pub(crate) fn link_grove(ctx: &RepoContext, worktree_path: &Path, project_root_path: &Path) {
     let res = if ctx.is_sandbox() {
         seed::link_grove_into_worktree_sandbox(worktree_path, project_root_path)
     } else {

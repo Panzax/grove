@@ -13,12 +13,12 @@ Mission: merge every `agent/*` branch into the current integration branch (`<INT
 
 ## Context snapshot (read-only)
 
-The orchestrator has staged a read-only context tree at `<CONTAINER_WORKTREE_PATH>/.grove-context/`:
+The orchestrator has staged a read-only context tree at `$GROVE_AGENT_DIR/context/` (under your bind-mounted state directory, not in the worktree):
 
-- `.grove-context/branches.json` — per-branch metadata: head sha, files changed vs base, commit count, last 5 commit subjects.
-- `.grove-context/overlap.txt` — pairwise file-overlap matrix (which branches conflict-risk together).
-- `.grove-context/bus/` — full bus snapshot (broadcasts, inboxes, contracts) from before integration started.
-- `.grove-context/agents/<n>/STATE.md` — each agent's workitem checklist + iteration log at the moment integrate started.
+- `$GROVE_AGENT_DIR/context/branches.json` — per-branch metadata: head sha, files changed vs base, commit count, last 5 commit subjects.
+- `$GROVE_AGENT_DIR/context/overlap.txt` — pairwise file-overlap matrix (which branches conflict-risk together).
+- `$GROVE_AGENT_DIR/context/bus/` — full bus snapshot (broadcasts, inboxes, contracts) from before integration started.
+- `$GROVE_AGENT_DIR/context/agents/<n>/STATE.md` — each agent's workitem checklist + iteration log at the moment integrate started.
 
 These files are chmod 0444 / 0555. Do not try to mutate them; treat as your source of truth for per-branch intent.
 
@@ -60,7 +60,7 @@ For each `[ ] merge agent/<X>` workitem:
 2. **Clean merge**: nothing to resolve. Continue to step 4.
 3. **Conflict**:
    - `git diff --name-only --diff-filter=U` to list conflicted files.
-   - For each conflicted file, read the merging branch's intent from `.grove-context/agents/<n>/STATE.md` (which agent owned this branch? what were they shipping?). Cross-reference `.grove-context/bus/` for inter-agent contracts.
+   - For each conflicted file, read the merging branch's intent from `$GROVE_AGENT_DIR/context/agents/<n>/STATE.md` (which agent owned this branch? what were they shipping?). Cross-reference `$GROVE_AGENT_DIR/context/bus/` for inter-agent contracts.
    - Resolve to match BOTH branches' intent where possible. When intents conflict, prefer the one whose STATE.md shows the change is essential to a `[x]` workitem.
    - `git add <resolved files>`.
    - `git commit -m "Merge agent/<X> into integration/<ts>"` (you commit; orchestrator does NOT).
@@ -93,7 +93,7 @@ Integrates <N> agent branches into <base>.
 
 ## Per-branch deliverables
 
-- `agent/<a>` — <headline pulled from .grove-context/agents/<a>/STATE.md>
+- `agent/<a>` — <headline pulled from $GROVE_AGENT_DIR/context/agents/<a>/STATE.md>
 - `agent/<b>` — ...
 
 ## Conflict resolutions
