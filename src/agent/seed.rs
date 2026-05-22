@@ -231,10 +231,14 @@ pub fn link_grove_into_worktree_sandbox(
 
     // Append `.grove` to the worktree's git info/exclude (idempotently) so
     // `git status` inside the worktree doesn't flag the symlink as untracked.
+    // Resolve the exclude file git actually reads. For a worktree this is the
+    // COMMON dir's info/exclude (`--git-path info/exclude`), NOT the
+    // per-worktree gitdir — writing to the latter has no effect, so `git add`
+    // would happily stage the `.grove` symlink.
     let wt = worktree_path.to_string_lossy().to_string();
     let script = format!(
-        "d=$(git -C {wt} rev-parse --git-dir) && mkdir -p \"$d/info\" && \
-         (grep -qxF .grove \"$d/info/exclude\" 2>/dev/null || echo .grove >> \"$d/info/exclude\")",
+        "cd {wt} && f=$(git rev-parse --git-path info/exclude) && mkdir -p \"$(dirname \"$f\")\" && \
+         (grep -qxF .grove \"$f\" 2>/dev/null || echo .grove >> \"$f\")",
         wt = shell_single_quote(&wt)
     );
     let _ = crate::session::container::exec(&info, &["sh", "-c", &script]);
@@ -291,13 +295,16 @@ fn relative_path_to_grove(worktree_path: &Path, project_root: &Path) -> Option<P
     Some(up)
 }
 
-/// Find the per-worktree gitdir and append `.grove` to its `info/exclude`.
+/// Append `.grove` to the worktree's effective `info/exclude`.
 ///
-/// For linked worktrees, `git rev-parse --git-dir` returns `<main_gitdir>/worktrees/<wt_name>`.
-/// Each linked worktree has its own `info/exclude` there.
+/// Resolve it via `git rev-parse --git-path info/exclude` — for a linked
+/// worktree this is the COMMON gitdir's `info/exclude`, which is the file git
+/// actually consults. (The per-worktree `--git-dir`/info/exclude is NOT read
+/// for excludes, so writing there silently fails to hide the `.grove` symlink
+/// and `git add` would stage it.)
 fn add_grove_to_worktree_exclude(worktree_path: &Path) -> Result<(), String> {
     let out = std::process::Command::new("git")
-        .args(["rev-parse", "--git-dir"])
+        .args(["rev-parse", "--git-path", "info/exclude"])
         .current_dir(worktree_path)
         .output()
         .map_err(|e| format!("git rev-parse: {}", e))?;
@@ -307,13 +314,12 @@ fn add_grove_to_worktree_exclude(worktree_path: &Path) -> Result<(), String> {
             String::from_utf8_lossy(&out.stderr).trim()
         ));
     }
-    let gitdir_raw = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    let gitdir = if gitdir_raw.starts_with('/') {
-        PathBuf::from(gitdir_raw)
+    let exclude_raw = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    let exclude = if exclude_raw.starts_with('/') {
+        PathBuf::from(exclude_raw)
     } else {
-        worktree_path.join(gitdir_raw)
+        worktree_path.join(exclude_raw)
     };
-    let exclude = gitdir.join("info").join("exclude");
     if let Some(parent) = exclude.parent() {
         fs::create_dir_all(parent).map_err(|e| format!("create {}: {}", parent.display(), e))?;
     }
@@ -435,5 +441,72 @@ mod tests {
         assert!(!is_valid_agent_name("feat/a"));
         assert!(!is_valid_agent_name(""));
         assert!(!is_valid_agent_name("feat a"));
+    }
+
+    // The `.grove` symlink linked into each worktree must be excluded from git
+    // so an agent's `git add -A` never stages it (a tracked `.grove` later
+    // collides with the integration worktree's own symlink and breaks merges).
+    // Regression guard: the exclude must land in the file git actually reads
+    // (`--git-path info/exclude` = the common dir for a linked worktree), not
+    // the per-worktree gitdir.
+    #[cfg(unix)]
+    #[test]
+    fn link_grove_excludes_dotgrove_in_linked_worktree() {
+        use std::process::Command;
+        fn git(dir: &Path, args: &[&str]) {
+            let out = Command::new("git")
+                .args(args)
+                .current_dir(dir)
+                .output()
+                .expect("git");
+            assert!(
+                out.status.success(),
+                "git {:?}: {}",
+                args,
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+        let root = tmp("link-exclude");
+        git(&root, &["init", "-q", "-b", "main"]);
+        git(&root, &["config", "user.email", "t@t"]);
+        git(&root, &["config", "user.name", "t"]);
+        fs::write(root.join("README"), "x").unwrap();
+        git(&root, &["add", "."]);
+        git(&root, &["commit", "-q", "-m", "init"]);
+        // Linked worktree under <root>/worktrees/feat-a (its .grove → ../../.grove).
+        let wt = root.join("worktrees").join("feat-a");
+        git(
+            &root,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "agent/feat-a",
+                &wt.to_string_lossy(),
+            ],
+        );
+        link_grove_into_worktree(&wt, &root).unwrap();
+        // git must treat `.grove` as ignored in the worktree…
+        let ignored = Command::new("git")
+            .args(["check-ignore", "-q", ".grove"])
+            .current_dir(&wt)
+            .status()
+            .expect("git check-ignore");
+        assert!(ignored.success(), ".grove is not excluded in the worktree");
+        // …and `git add -A` must not stage it.
+        git(&wt, &["add", "-A"]);
+        let staged = Command::new("git")
+            .args(["diff", "--cached", "--name-only"])
+            .current_dir(&wt)
+            .output()
+            .expect("git diff --cached");
+        let names = String::from_utf8_lossy(&staged.stdout);
+        assert!(
+            !names.lines().any(|l| l == ".grove"),
+            "`.grove` got staged: {:?}",
+            names
+        );
+        let _ = fs::remove_dir_all(&root);
     }
 }
