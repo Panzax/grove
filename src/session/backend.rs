@@ -617,7 +617,10 @@ fn build_create_args(
 ) -> Vec<String> {
     let (uid, gid) = host_uid_gid();
     let root_str = root.to_string_lossy().to_string();
-    let grove_src = root.join(".grove").to_string_lossy().to_string();
+    // Build with an explicit `/` (not Path::join) so it matches the container
+    // target below on every host platform — these are docker mount paths under
+    // the Linux identical-path model, never native Windows paths.
+    let grove_src = format!("{}/.grove", root_str);
     let mut args = vec![
         "run".to_string(),
         "-d".to_string(),

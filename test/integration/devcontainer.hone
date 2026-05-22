@@ -122,7 +122,7 @@ ASSERT init.exit_code == 0
 ASSERT init.stdout contains "bound host tmux conf"
 RUN read-mounts: cat $TEST_DIR/.devcontainer/devcontainer.json
 ASSERT read-mounts.stdout contains "${localEnv:HOME}/.tmux.conf"
-ASSERT read-mounts.stdout contains "target=/home/vscode/.tmux.conf"
+ASSERT read-mounts.stdout contains "target=/home/codespace/.tmux.conf"
 RUN cleanup: rm -rf $TEST_DIR $FAKE_HOME
 
 TEST "grove init binds host tmux.conf when present (XDG path)"
@@ -134,7 +134,7 @@ RUN init: cd $TEST_DIR && HOME=$FAKE_HOME grove init --no-agent
 ASSERT init.exit_code == 0
 RUN read-mounts: cat $TEST_DIR/.devcontainer/devcontainer.json
 ASSERT read-mounts.stdout contains "${localEnv:HOME}/.config/tmux/tmux.conf"
-ASSERT read-mounts.stdout contains "target=/home/vscode/.tmux.conf"
+ASSERT read-mounts.stdout contains "target=/home/codespace/.tmux.conf"
 RUN cleanup: rm -rf $TEST_DIR $FAKE_HOME
 
 TEST "grove init skips tmux mount when host has no conf"
