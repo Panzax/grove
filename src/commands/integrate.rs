@@ -548,9 +548,16 @@ pub fn abort() {
             let name_str = name.to_string_lossy();
             if name_str.starts_with("integrate-") {
                 let p = entry.path();
+                // Best-effort: relax the RO context tree so remove_dir_all can
+                // unlink it. Suppress stderr — in devcontainer mode the agent
+                // may run as a different uid and leave files this host user
+                // can't chmod, but remove_dir_all still works (the agent dir
+                // itself is host-owned). A noisy "Operation not permitted" here
+                // would be misleading.
                 let _ = std::process::Command::new("chmod")
                     .args(["-R", "u+w"])
                     .arg(&p)
+                    .stderr(std::process::Stdio::null())
                     .status();
                 match std::fs::remove_dir_all(&p) {
                     Ok(_) => {
