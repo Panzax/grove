@@ -18,7 +18,6 @@
 
 use std::collections::BTreeSet;
 use std::path::Path;
-use std::process::Command;
 
 use serde::Serialize;
 use serde_json::Value;
@@ -51,18 +50,24 @@ impl IntegrationContext {
     }
 }
 
-/// Compute per-branch metadata. Shells `git` against `project_root`; works
-/// in both bare and in-place layouts because git resolves the repo from
-/// cwd.
+/// Compute per-branch metadata. Routes `git` through the backend dispatcher:
+/// `project_root` selects host vs sandbox container, `repo_path` is the cwd
+/// (the bare clone in bare layout, the working-tree root in-place). Works in
+/// both layouts and both backends.
 pub fn compute_branch_metadata(
     project_root: &Path,
+    repo_path: &Path,
     branches: &[String],
     base: &str,
 ) -> Result<Vec<BranchMeta>, String> {
     let mut out = Vec::with_capacity(branches.len());
     for name in branches {
-        let head_sha = git_oneline(project_root, &["rev-parse", name])?;
-        let files_raw = git_oneline_multi(project_root, &["diff", "--name-only", base, name])?;
+        let head_sha = git_oneline(project_root, repo_path, &["rev-parse", name])?;
+        let files_raw = git_oneline_multi(
+            project_root,
+            repo_path,
+            &["diff", "--name-only", base, name],
+        )?;
         let files_changed: Vec<String> = files_raw
             .lines()
             .filter(|l| !l.is_empty())
@@ -70,11 +75,13 @@ pub fn compute_branch_metadata(
             .collect();
         let commit_count_raw = git_oneline(
             project_root,
+            repo_path,
             &["rev-list", "--count", &format!("{}..{}", base, name)],
         )?;
         let commit_count: u32 = commit_count_raw.trim().parse().unwrap_or(0);
         let tip_log_raw = git_oneline_multi(
             project_root,
+            repo_path,
             &[
                 "log",
                 "--pretty=%s",
@@ -146,13 +153,10 @@ pub fn pairwise_overlap(branches: &[BranchMeta]) -> String {
     lines
 }
 
-/// Wrap `git -C <project_root> <args>`; returns stdout on success.
-fn git_oneline(project_root: &Path, args: &[&str]) -> Result<String, String> {
-    let out = Command::new("git")
-        .current_dir(project_root)
-        .args(args)
-        .output()
-        .map_err(|e| format!("git {}: {}", args.join(" "), e))?;
+/// Run `git -C <repo_path> <args>` via the backend dispatcher (host or
+/// sandbox container, selected by `project_root`); returns stdout on success.
+fn git_oneline(project_root: &Path, repo_path: &Path, args: &[&str]) -> Result<String, String> {
+    let out = crate::git::git_exec::run(project_root, repo_path, args)?;
     if !out.status.success() {
         return Err(format!(
             "git {} failed: {}",
@@ -163,15 +167,23 @@ fn git_oneline(project_root: &Path, args: &[&str]) -> Result<String, String> {
     Ok(String::from_utf8_lossy(&out.stdout).to_string())
 }
 
-fn git_oneline_multi(project_root: &Path, args: &[&str]) -> Result<String, String> {
-    git_oneline(project_root, args)
+fn git_oneline_multi(
+    project_root: &Path,
+    repo_path: &Path,
+    args: &[&str],
+) -> Result<String, String> {
+    git_oneline(project_root, repo_path, args)
 }
 
 /// Resolve the absolute SHA of the base branch so it gets recorded into
 /// branches.json (auditability — if main moves between integrate runs we
 /// know what we tried to merge against).
-pub fn resolve_base_sha(project_root: &Path, base: &str) -> Result<String, String> {
-    Ok(git_oneline(project_root, &["rev-parse", base])?
+pub fn resolve_base_sha(
+    project_root: &Path,
+    repo_path: &Path,
+    base: &str,
+) -> Result<String, String> {
+    Ok(git_oneline(project_root, repo_path, &["rev-parse", base])?
         .trim()
         .to_string())
 }
@@ -202,6 +214,7 @@ mod tests {
     use super::*;
     use std::fs;
     use std::path::PathBuf;
+    use std::process::Command;
 
     fn tmp_repo(label: &str) -> PathBuf {
         let pid = std::process::id();
@@ -255,7 +268,7 @@ mod tests {
     fn branch_metadata_records_files_and_commit_count() {
         let repo = tmp_repo("meta");
         make_branch(&repo, "agent/feat-a", &[("a.rs", "fn a(){}")]);
-        let meta = compute_branch_metadata(&repo, &["agent/feat-a".into()], "main").unwrap();
+        let meta = compute_branch_metadata(&repo, &repo, &["agent/feat-a".into()], "main").unwrap();
         assert_eq!(meta.len(), 1);
         assert_eq!(meta[0].name, "agent/feat-a");
         assert_eq!(meta[0].files_changed, vec!["a.rs"]);
@@ -273,7 +286,8 @@ mod tests {
         make_branch(&repo, "agent/a", &[("shared.rs", "a"), ("a.rs", "a")]);
         make_branch(&repo, "agent/b", &[("shared.rs", "b"), ("b.rs", "b")]);
         let meta =
-            compute_branch_metadata(&repo, &["agent/a".into(), "agent/b".into()], "main").unwrap();
+            compute_branch_metadata(&repo, &repo, &["agent/a".into(), "agent/b".into()], "main")
+                .unwrap();
         let text = pairwise_overlap(&meta);
         assert!(text.contains("agent/a vs agent/b: 1 shared file"));
         assert!(text.contains("  shared.rs"));
@@ -291,6 +305,7 @@ mod tests {
         make_branch(&repo, "agent/b", &[("x.rs", "b"), ("y.rs", "b")]); // overlap 2 with a
         make_branch(&repo, "agent/c", &[("x.rs", "c")]); // overlap 1 with a, 1 with b
         let meta = compute_branch_metadata(
+            &repo,
             &repo,
             &["agent/a".into(), "agent/b".into(), "agent/c".into()],
             "main",

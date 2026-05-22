@@ -14,6 +14,18 @@ pub struct RepoContext {
     repo_path: PathBuf,
     project_root: PathBuf,
     layout: ProjectLayout,
+    /// When true, the project is sandbox-backed: worktree/branch/merge git ops
+    /// run INSIDE the per-project sandbox container (against the seeded repo at
+    /// the same path), not on the host. Set from `.grove/config.toml`
+    /// (`[container] backend = "sandbox"`) at discovery time.
+    sandbox: bool,
+}
+
+impl RepoContext {
+    /// Whether git for this project routes into the sandbox container.
+    pub fn is_sandbox(&self) -> bool {
+        self.sandbox
+    }
 }
 
 /// Discover the grove repository and return the repo context.
@@ -29,10 +41,12 @@ pub fn discover_repo() -> Result<RepoContext, String> {
     if let Ok(bare_clone_path) = discover_bare_clone(None).map_err(|e| e.message) {
         let project_root = get_project_root(&bare_clone_path);
         env::set_var("GROVE_REPO", &bare_clone_path);
+        let sandbox = crate::session::backend::project_is_sandbox(&project_root);
         return Ok(RepoContext {
             repo_path: bare_clone_path,
             project_root,
             layout: ProjectLayout::Bare,
+            sandbox,
         });
     }
     // In-place fallback: only adopt the discovered git checkout if it has been
@@ -87,10 +101,12 @@ pub fn discover_in_place(start: Option<&Path>) -> Result<RepoContext, String> {
                 .map_err(|e| format!("git rev-parse: {}", e))?;
             if probe.status.success() {
                 env::set_var("GROVE_REPO", &cursor);
+                let sandbox = crate::session::backend::project_is_sandbox(&cursor);
                 return Ok(RepoContext {
                     repo_path: cursor.clone(),
                     project_root: cursor,
                     layout: ProjectLayout::InPlace,
+                    sandbox,
                 });
             }
         }
@@ -127,15 +143,15 @@ pub fn make_context(
         repo_path,
         project_root,
         layout,
+        sandbox: false,
     }
 }
 
 fn git_raw(context: &RepoContext, args: &[&str]) -> Result<String, String> {
-    let output = Command::new("git")
-        .args(args)
-        .current_dir(&context.repo_path)
-        .output()
-        .map_err(|e| format!("Failed to execute git: {}", e))?;
+    // Routes to the host or the sandbox container based on the project's
+    // backend; `repo_path` is valid on both sides under the identical-path
+    // model, so the same args work either way.
+    let output = crate::git::git_exec::run(&context.project_root, &context.repo_path, args)?;
 
     if output.status.success() {
         Ok(String::from_utf8_lossy(&output.stdout).to_string())
@@ -152,7 +168,7 @@ pub fn list_worktrees(context: &RepoContext) -> Result<Vec<Worktree>, String> {
     let partials = parse_worktree_lines(&result);
     let mut worktrees = Vec::new();
     for partial in partials {
-        worktrees.push(complete_worktree_info(partial));
+        worktrees.push(complete_worktree_info(context, partial));
     }
     Ok(worktrees)
 }
@@ -608,22 +624,27 @@ fn parse_worktree_lines(output: &str) -> Vec<PartialWorktree> {
     worktrees
 }
 
-fn complete_worktree_info(partial: PartialWorktree) -> Worktree {
+fn complete_worktree_info(context: &RepoContext, partial: PartialWorktree) -> Worktree {
     let path = partial.path.unwrap_or_default();
     let branch = partial.branch.unwrap_or_default();
     let head = partial.head.unwrap_or_default();
 
     let is_main = MAIN_BRANCHES.contains(&branch.as_str());
 
-    // Check if worktree is dirty
-    let is_dirty = Command::new("git")
-        .args(["status", "--porcelain"])
-        .current_dir(&path)
-        .output()
-        .map(|output| !output.stdout.is_empty())
-        .unwrap_or(false);
+    // Check if worktree is dirty. In sandbox mode the worktree lives inside the
+    // container, so the probe routes there too (the path is identical on both
+    // sides).
+    let is_dirty = crate::git::git_exec::run(
+        &context.project_root,
+        Path::new(&path),
+        &["status", "--porcelain"],
+    )
+    .map(|output| !output.stdout.is_empty())
+    .unwrap_or(false);
 
-    // Try to get creation time from filesystem with Unix fallbacks.
+    // Try to get creation time from filesystem with Unix fallbacks. In sandbox
+    // mode the worktree path doesn't exist on the host, so this falls back to
+    // the epoch (created_at is cosmetic for listing).
     let created_at = fs::metadata(&path)
         .ok()
         .and_then(|meta| metadata_created_at(&meta))

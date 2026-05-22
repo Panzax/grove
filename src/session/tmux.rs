@@ -188,11 +188,9 @@ pub fn attach_instructions(agent: &str, container: Option<&ContainerInfo>) -> St
     let name = session_name(agent);
     match container {
         None => format!("tmux attach -t {}", name),
-        Some(info) => format!(
-            "devcontainer exec --workspace-folder {} -- tmux attach -t {}",
-            info.workspace_root.display(),
-            name
-        ),
+        // Delegate to the backend so the form matches the runtime (devcontainer
+        // `devcontainer exec …` vs sandbox `docker exec …`).
+        Some(info) => container::attach_instructions(info, &name),
     }
 }
 

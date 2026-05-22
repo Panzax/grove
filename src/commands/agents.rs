@@ -428,6 +428,11 @@ fn resolve_container_for_query(project_root: &Path) -> Option<ContainerInfo> {
     if !container::is_up(project_root) {
         return None;
     }
+    // Sandbox addresses its container by the (identical) project root path; the
+    // devcontainer reads its mount target from config.
+    if crate::session::backend::project_is_sandbox(project_root) {
+        return Some(crate::session::backend::sandbox_info(project_root));
+    }
     let cfg_path = project_root.join(".grove").join("config.toml");
     let raw = std::fs::read_to_string(&cfg_path).ok()?;
     let cfg: GroveConfig = toml::from_str(&raw).ok()?;

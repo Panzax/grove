@@ -17,7 +17,6 @@
 // context snapshot (RO), agent state seed, agent spawn. Nothing more.
 
 use std::path::Path;
-use std::process::Command;
 
 use chrono::Utc;
 use colored::Colorize;
@@ -27,9 +26,10 @@ use crate::agent::integrate_deps::{
     IntegrationContext,
 };
 use crate::agent::integrate_seed::{build_integrate_bootstrap_prompt, seed_integrate_agent};
-use crate::agent::seed;
 use crate::commands::spawn::{launch_agent_in_container, LaunchContext};
-use crate::git::worktree_manager::{add_worktree, discover_repo, get_default_branch, project_root};
+use crate::git::worktree_manager::{
+    add_worktree, discover_repo, get_default_branch, project_root, repo_path, RepoContext,
+};
 use crate::git::worktree_paths::make_worktree_pointers_relative;
 use crate::models::GroveConfig;
 use crate::session::container::{self, ContainerInfo};
@@ -43,6 +43,10 @@ pub fn run(branch_inputs: &[String], into: Option<&str>, no_test: bool) {
         }
     };
     let project_root_path = project_root(&ctx).to_path_buf();
+    // The git repo cwd: the bare clone in bare layout, the working-tree root
+    // in-place. All integration git ops run here (project_root is NOT a git
+    // dir in bare layout) and route to the sandbox container when applicable.
+    let repo_path_buf = repo_path(&ctx).to_path_buf();
 
     // Resolve target branch (PR base).
     let base = match into
@@ -65,7 +69,7 @@ pub fn run(branch_inputs: &[String], into: Option<&str>, no_test: bool) {
     //                            Unknown names abort the whole run before any
     //                            worktree side-effects.
     let agent_branches = if branch_inputs.is_empty() {
-        let listed = list_agent_branches(&project_root_path).unwrap_or_default();
+        let listed = list_agent_branches(&ctx).unwrap_or_default();
         if listed.is_empty() {
             println!(
                 "{} no agent/* branches found; nothing to integrate",
@@ -78,7 +82,7 @@ pub fn run(branch_inputs: &[String], into: Option<&str>, no_test: bool) {
         let mut resolved = Vec::with_capacity(branch_inputs.len());
         let mut errors = Vec::new();
         for raw in branch_inputs {
-            match resolve_branch_input(&project_root_path, raw) {
+            match resolve_branch_input(&ctx, raw) {
                 Some(b) => resolved.push(b),
                 None => errors.push(raw.clone()),
             }
@@ -142,7 +146,7 @@ pub fn run(branch_inputs: &[String], into: Option<&str>, no_test: bool) {
     );
 
     // Branch the integration off `base`, then add the worktree on it.
-    if let Err(e) = git_in(&project_root_path, &["branch", &integration_branch, &base]) {
+    if let Err(e) = git_in(&ctx, &["branch", &integration_branch, &base]) {
         eprintln!(
             "{} could not create integration branch off {}: {}",
             "Error:".red(),
@@ -153,7 +157,7 @@ pub fn run(branch_inputs: &[String], into: Option<&str>, no_test: bool) {
     }
     if let Err(e) = add_worktree(&ctx, &integration_str, &integration_branch, false, None) {
         // Roll back the freshly-created branch ref.
-        let _ = git_in(&project_root_path, &["branch", "-D", &integration_branch]);
+        let _ = git_in(&ctx, &["branch", "-D", &integration_branch]);
         eprintln!(
             "{} create integration worktree on branch {}: {}",
             "Error:".red(),
@@ -169,63 +173,54 @@ pub fn run(branch_inputs: &[String], into: Option<&str>, no_test: bool) {
         integration_branch.bold()
     );
 
-    // Relativize the worktree's .git pointers (same reason as spawn: container
-    // bind-mount path differs from host path).
-    if let Err(e) = make_worktree_pointers_relative(&integration_path) {
-        eprintln!(
-            "  {} rewrite worktree pointers to relative: {}",
-            "Warning:".yellow(),
-            e
-        );
+    // Worktree .git pointers: in devcontainer mode the bind-mount path differs
+    // from the host path, so rewrite them relative. In sandbox mode the worktree
+    // lives at an identical path inside the container, so the pointers are
+    // already correct — skip (mirror spawn).
+    if !ctx.is_sandbox() {
+        if let Err(e) = make_worktree_pointers_relative(&integration_path) {
+            eprintln!(
+                "  {} rewrite worktree pointers to relative: {}",
+                "Warning:".yellow(),
+                e
+            );
+        }
     }
 
     // Symlink .grove into the worktree so Stop hook + framework docs resolve.
-    if let Err(e) = seed::link_grove_into_worktree(&integration_path, &project_root_path) {
-        eprintln!("  {} link .grove into worktree: {}", "Warning:".yellow(), e);
-    }
+    // Backend-aware: sandbox creates the symlink inside the container (the
+    // worktree lives there); devcontainer creates a host symlink.
+    crate::commands::spawn::link_grove(&ctx, &integration_path, &project_root_path);
 
-    // Snapshot context (existing helper, RO chmod).
-    if let Err(e) = snapshot_context(&project_root_path, &integration_path) {
-        eprintln!(
-            "{} snapshot bus/STATE: {} (continuing without context)",
-            "Warning:".yellow(),
-            e
-        );
-    } else {
-        println!(
-            "  {} snapshotted bus + STATE.md into {}",
-            "·".dimmed(),
-            integration_path.join(".grove-context").display()
-        );
-    }
-
-    // Build branches.json + overlap.txt.
-    let base_sha = resolve_base_sha(&project_root_path, &base).unwrap_or_default();
+    // Build the integration context. All git/file reads — no fs writes yet, so
+    // this must precede seeding (the agent dir is where the context tree lands).
+    let base_sha = resolve_base_sha(&project_root_path, &repo_path_buf, &base).unwrap_or_default();
     let verify_cmd = if no_test {
         Vec::new()
     } else {
         read_verify_command(&project_root_path)
     };
-    let branches = match compute_branch_metadata(&project_root_path, &agent_branches, &base) {
-        Ok(b) => b,
-        Err(e) => {
-            eprintln!(
-                "{} compute branch metadata: {} (continuing with names only)",
-                "Warning:".yellow(),
-                e
-            );
-            agent_branches
-                .iter()
-                .map(|name| crate::agent::integrate_deps::BranchMeta {
-                    name: name.clone(),
-                    head_sha: String::new(),
-                    files_changed: Vec::new(),
-                    commit_count: 0,
-                    tip_log: Vec::new(),
-                })
-                .collect()
-        }
-    };
+    let branches =
+        match compute_branch_metadata(&project_root_path, &repo_path_buf, &agent_branches, &base) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!(
+                    "{} compute branch metadata: {} (continuing with names only)",
+                    "Warning:".yellow(),
+                    e
+                );
+                agent_branches
+                    .iter()
+                    .map(|name| crate::agent::integrate_deps::BranchMeta {
+                        name: name.clone(),
+                        head_sha: String::new(),
+                        files_changed: Vec::new(),
+                        commit_count: 0,
+                        tip_log: Vec::new(),
+                    })
+                    .collect()
+            }
+        };
     let integration_ctx = IntegrationContext {
         base: base.clone(),
         base_sha,
@@ -235,7 +230,35 @@ pub fn run(branch_inputs: &[String], into: Option<&str>, no_test: bool) {
         branches,
     };
 
-    let context_dir = integration_path.join(".grove-context");
+    // Seed the integrate-agent state FIRST — this creates the agent dir, which
+    // is the parent of the context tree we stage next.
+    let agent_dir = match seed_integrate_agent(&project_root_path, &agent_name, &integration_ctx) {
+        Ok(p) => {
+            println!("  {} seeded {}", "·".dimmed(), p.display());
+            p
+        }
+        Err(e) => {
+            eprintln!(
+                "{} seed integrate agent: {} (worktree still in place; remove with `git worktree remove`)",
+                "Error:".red(),
+                e
+            );
+            std::process::exit(1);
+        }
+    };
+
+    // Stage the read-only context tree under the agent dir (NOT the worktree):
+    // `.grove/agents/<name>/context/`. `.grove/` is bind-mounted, so these host
+    // `fs::write`s are visible in-container at the identical path
+    // ($GROVE_AGENT_DIR/context/) in both backends — no container routing.
+    let context_dir = agent_dir.join("context");
+    if let Err(e) = snapshot_context(&project_root_path, &context_dir) {
+        eprintln!(
+            "{} snapshot bus/STATE: {} (continuing without context)",
+            "Warning:".yellow(),
+            e
+        );
+    }
     let _ = std::fs::create_dir_all(&context_dir);
     let json = integration_ctx.to_json().unwrap_or_default();
     if let Err(e) = std::fs::write(context_dir.join("branches.json"), json) {
@@ -253,29 +276,15 @@ pub fn run(branch_inputs: &[String], into: Option<&str>, no_test: bool) {
             e
         );
     }
-    // Chmod the new files RO to match the rest of the context tree.
+    // Chmod the context tree RO (agent reads but must not mutate it). Scoped to
+    // `context/` only — the agent dir's PROMPT/STATE/loop must stay writable.
     let _ = make_context_readonly(&context_dir);
     println!(
-        "  {} wrote branches.json + overlap.txt ({} branches)",
+        "  {} staged read-only context ({} branches) in {}",
         "·".dimmed(),
-        integration_ctx.branches.len()
+        integration_ctx.branches.len(),
+        context_dir.display()
     );
-
-    // Seed the integrate-agent state.
-    let agent_dir = match seed_integrate_agent(&project_root_path, &agent_name, &integration_ctx) {
-        Ok(p) => {
-            println!("  {} seeded {}", "·".dimmed(), p.display());
-            p
-        }
-        Err(e) => {
-            eprintln!(
-                "{} seed integrate agent: {} (worktree still in place; remove with `git worktree remove`)",
-                "Error:".red(),
-                e
-            );
-            std::process::exit(1);
-        }
-    };
 
     // Build the bootstrap prompt with container-side paths.
     let container_worktree_path = container::host_to_container_path(&container, &integration_path)
@@ -320,9 +329,8 @@ pub fn run(branch_inputs: &[String], into: Option<&str>, no_test: bool) {
     );
 }
 
-fn snapshot_context(project: &Path, integration: &Path) -> Result<(), String> {
-    let target = integration.join(".grove-context");
-    std::fs::create_dir_all(&target).map_err(|e| format!("mkdir {}: {}", target.display(), e))?;
+fn snapshot_context(project: &Path, target: &Path) -> Result<(), String> {
+    std::fs::create_dir_all(target).map_err(|e| format!("mkdir {}: {}", target.display(), e))?;
     let bus_src = project.join(".grove").join("bus");
     let bus_dst = target.join("bus");
     if bus_src.exists() {
@@ -415,43 +423,40 @@ fn make_readonly(_path: &Path) -> Result<(), String> {
 /// non-agent branch like `feature/x`), then `agent/<name>` (covers the
 /// shorthand `grove integrate feat-a`). Returns the resolved branch name
 /// or None if neither exists.
-pub(crate) fn resolve_branch_input(project: &Path, raw: &str) -> Option<String> {
+pub(crate) fn resolve_branch_input(ctx: &RepoContext, raw: &str) -> Option<String> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
         return None;
     }
-    if branch_exists(project, trimmed) {
+    if branch_exists(ctx, trimmed) {
         return Some(trimmed.to_string());
     }
     let prefixed = format!("agent/{}", trimmed);
-    if branch_exists(project, &prefixed) {
+    if branch_exists(ctx, &prefixed) {
         return Some(prefixed);
     }
     None
 }
 
-fn branch_exists(project: &Path, name: &str) -> bool {
-    Command::new("git")
-        .current_dir(project)
-        .args([
-            "show-ref",
-            "--verify",
-            "--quiet",
-            &format!("refs/heads/{}", name),
-        ])
-        .output()
-        .map(|out| out.status.success())
-        .unwrap_or(false)
+fn branch_exists(ctx: &RepoContext, name: &str) -> bool {
+    // `show-ref --verify --quiet` exits 0 iff the ref exists; git_in maps any
+    // non-zero exit to Err, so `.is_ok()` is the existence test. Routes to the
+    // sandbox container when applicable.
+    let refname = format!("refs/heads/{}", name);
+    git_in(ctx, &["show-ref", "--verify", "--quiet", &refname]).is_ok()
 }
 
-/// Tear down a previous integrate run that left junk on disk. Steps:
-///   1. Kill any live `grove-integrate-*` tmux session in the container.
-///   2. chmod -R u+w on `worktrees/.integration` (the .grove-context/
-///      subtree is RO; without this, fs ops fail with EACCES).
-///   3. `git worktree remove --force worktrees/.integration` to unregister
-///      from git's worktree list AND delete the directory.
-///   4. Delete every `integration/<ts>` local branch.
-///   5. Purge every `.grove/agents/integrate-*` agent dir.
+/// Tear down a previous integrate run, leaving the container and every other
+/// agent untouched — only integration artifacts are removed. Steps:
+///   1. Kill any live `grove-integrate-*` tmux session (only those).
+///   2. `git worktree remove --force worktrees/.integration` to unregister
+///      from git's worktree list AND delete the directory. Routed into the
+///      sandbox container in sandbox mode (the worktree lives there); on the
+///      host otherwise.
+///   3. `git worktree prune` to clear lingering gitdir registrations.
+///   4. Delete every `integration/<ts>` local branch (routed).
+///   5. Purge every `.grove/agents/integrate-*` agent dir. Its `context/`
+///      subtree is chmod RO, so relax it first or `remove_dir_all` hits EACCES.
 ///
 /// Best-effort throughout — if step N fails, prints a warning and
 /// continues with N+1. Useful when an integrate run died mid-flight and
@@ -467,8 +472,8 @@ pub fn abort() {
     let project_root_path = project_root(&ctx).to_path_buf();
     let integration_path = project_root_path.join("worktrees").join(".integration");
 
-    // 1. Kill in-container tmux sessions named grove-integrate-*. If the
-    //    container isn't up, skip silently.
+    // 1. Kill live grove-integrate-* tmux sessions ONLY (never other agents).
+    //    If the container/sandbox isn't up, skip silently.
     if container::is_up(&project_root_path) {
         if let Some(info) = resolve_container_info(&project_root_path) {
             if let Ok(sessions) = crate::session::tmux::list_grove_sessions(Some(&info)) {
@@ -483,21 +488,25 @@ pub fn abort() {
         }
     }
 
-    // 2 + 3. chmod -R u+w then worktree remove.
-    if integration_path.exists() {
-        let _ = std::process::Command::new("chmod")
-            .args(["-R", "u+w"])
-            .arg(&integration_path)
-            .status();
-        match git_in(
-            &project_root_path,
-            &[
-                "worktree",
-                "remove",
-                "--force",
-                integration_path.to_string_lossy().as_ref(),
-            ],
-        ) {
+    // 2. Remove the integration worktree. `git worktree remove` routes through
+    //    the dispatcher: in sandbox mode it runs in-container (the worktree
+    //    lives there and never appears on the host); otherwise on the host.
+    let remove_target = integration_path.to_string_lossy().to_string();
+    if ctx.is_sandbox() {
+        match git_in(&ctx, &["worktree", "remove", "--force", &remove_target]) {
+            Ok(_) => println!(
+                "  {} removed worktree {} (in sandbox)",
+                "✓".green(),
+                integration_path.display()
+            ),
+            Err(e) => eprintln!(
+                "  {} `git worktree remove` failed: {} (continuing)",
+                "Warning:".yellow(),
+                e
+            ),
+        }
+    } else if integration_path.exists() {
+        match git_in(&ctx, &["worktree", "remove", "--force", &remove_target]) {
             Ok(_) => println!(
                 "  {} removed worktree {}",
                 "✓".green(),
@@ -509,27 +518,29 @@ pub fn abort() {
                     "Warning:".yellow(),
                     e
                 );
-                // Last-resort: just rm -rf. git's bookkeeping below will
-                // resync via `worktree prune`.
+                // Last-resort: just rm -rf. The prune below resyncs git's
+                // bookkeeping.
                 let _ = std::fs::remove_dir_all(&integration_path);
             }
         }
     }
-    // Clean up any lingering gitdir registration even if worktree was
-    // already gone on disk.
-    let _ = git_in(&project_root_path, &["worktree", "prune"]);
+    // 3. Clean up any lingering gitdir registration even if the worktree was
+    //    already gone.
+    let _ = git_in(&ctx, &["worktree", "prune"]);
 
-    // 4. Drop integration/* branches. Force-delete in case they're
-    //    unmerged.
-    let branches = list_integration_branches(&project_root_path);
+    // 4. Drop integration/* branches. Force-delete in case they're unmerged.
+    let branches = list_integration_branches(&ctx);
     for b in &branches {
-        match git_in(&project_root_path, &["branch", "-D", b]) {
+        match git_in(&ctx, &["branch", "-D", b]) {
             Ok(_) => println!("  {} deleted branch {}", "✓".green(), b),
             Err(e) => eprintln!("  {} could not delete {}: {}", "Warning:".yellow(), b, e),
         }
     }
 
-    // 5. Purge integrate-* agent dirs.
+    // 5. Purge integrate-* agent dirs. The `context/` subtree was chmod RO
+    //    (0o555/0o444), so `remove_dir_all` would hit EACCES — relax it first.
+    //    `.grove/` is on host disk (bind-mounted in sandbox), so this host op
+    //    cleans both the host and in-container views.
     let agents_dir = project_root_path.join(".grove").join("agents");
     if let Ok(rd) = std::fs::read_dir(&agents_dir) {
         for entry in rd.flatten() {
@@ -537,6 +548,17 @@ pub fn abort() {
             let name_str = name.to_string_lossy();
             if name_str.starts_with("integrate-") {
                 let p = entry.path();
+                // Best-effort: relax the RO context tree so remove_dir_all can
+                // unlink it. Suppress stderr — in devcontainer mode the agent
+                // may run as a different uid and leave files this host user
+                // can't chmod, but remove_dir_all still works (the agent dir
+                // itself is host-owned). A noisy "Operation not permitted" here
+                // would be misleading.
+                let _ = std::process::Command::new("chmod")
+                    .args(["-R", "u+w"])
+                    .arg(&p)
+                    .stderr(std::process::Stdio::null())
+                    .status();
                 match std::fs::remove_dir_all(&p) {
                     Ok(_) => {
                         println!("  {} purged {}", "✓".green(), p.display())
@@ -550,10 +572,14 @@ pub fn abort() {
     println!("{} integrate abort complete", "✓".green());
 }
 
-/// Build a ContainerInfo from .grove/config.toml. None if config missing.
-/// Caller already confirmed `container::is_up`. Mirrors the helper in
-/// commands::agents.
+/// Build a ContainerInfo for the project's backend. Sandbox addresses its
+/// container by the (identical) project-root path; devcontainer reads
+/// workspace_target from config. None if config missing. Caller already
+/// confirmed `container::is_up`. Mirrors `agents::resolve_container_for_query`.
 fn resolve_container_info(project_root: &Path) -> Option<ContainerInfo> {
+    if crate::session::backend::project_is_sandbox(project_root) {
+        return Some(crate::session::backend::sandbox_info(project_root));
+    }
     let cfg_path = project_root.join(".grove").join("config.toml");
     let raw = std::fs::read_to_string(&cfg_path).ok()?;
     let cfg: GroveConfig = toml::from_str(&raw).ok()?;
@@ -573,19 +599,18 @@ fn resolve_container_info(project_root: &Path) -> Option<ContainerInfo> {
     ))
 }
 
-fn list_integration_branches(project: &Path) -> Vec<String> {
-    let out = Command::new("git")
-        .current_dir(project)
-        .args([
+fn list_integration_branches(ctx: &RepoContext) -> Vec<String> {
+    let raw = match git_in(
+        ctx,
+        &[
             "branch",
             "--list",
             "--format=%(refname:short)",
             "integration/*",
-        ])
-        .output();
-    let raw = match out {
-        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).to_string(),
-        _ => return Vec::new(),
+        ],
+    ) {
+        Ok(s) => s,
+        Err(_) => return Vec::new(),
     };
     raw.lines()
         .map(|s| s.trim().to_string())
@@ -593,16 +618,11 @@ fn list_integration_branches(project: &Path) -> Vec<String> {
         .collect()
 }
 
-fn list_agent_branches(project: &Path) -> Result<Vec<String>, String> {
-    let out = Command::new("git")
-        .current_dir(project)
-        .args(["branch", "--list", "--format=%(refname:short)", "agent/*"])
-        .output()
-        .map_err(|e| format!("git branch: {}", e))?;
-    if !out.status.success() {
-        return Err(String::from_utf8_lossy(&out.stderr).to_string());
-    }
-    let raw = String::from_utf8_lossy(&out.stdout);
+fn list_agent_branches(ctx: &RepoContext) -> Result<Vec<String>, String> {
+    let raw = git_in(
+        ctx,
+        &["branch", "--list", "--format=%(refname:short)", "agent/*"],
+    )?;
     let mut branches: Vec<String> = raw
         .lines()
         .map(|s| s.trim().to_string())
@@ -633,11 +653,12 @@ fn read_config(project: &Path) -> GroveConfig {
     toml::from_str(&raw).unwrap_or_default()
 }
 
-fn git_in(dir: &Path, args: &[&str]) -> Result<String, String> {
-    let out = Command::new("git")
-        .current_dir(dir)
-        .args(args)
-        .output()
+/// Run `git -C <repo_path> <args>` for the integration repo via the backend
+/// dispatcher (host or sandbox container, selected by the project root).
+/// `repo_path` is the bare clone in bare layout (project_root is NOT itself a
+/// git dir there), the working-tree root in-place.
+fn git_in(ctx: &RepoContext, args: &[&str]) -> Result<String, String> {
+    let out = crate::git::git_exec::run(project_root(ctx), repo_path(ctx), args)
         .map_err(|e| format!("git {}: {}", args.join(" "), e))?;
     if !out.status.success() {
         return Err(String::from_utf8_lossy(&out.stderr).trim().to_string());
@@ -648,7 +669,19 @@ fn git_in(dir: &Path, args: &[&str]) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::git::worktree_manager::make_context;
+    use crate::models::ProjectLayout;
     use std::fs;
+    use std::process::Command;
+
+    // Wrap an in-place temp repo as a RepoContext (repo_path == project_root).
+    fn ctx_for(repo: &Path) -> RepoContext {
+        make_context(
+            repo.to_path_buf(),
+            repo.to_path_buf(),
+            ProjectLayout::InPlace,
+        )
+    }
 
     fn tmp_repo(label: &str) -> std::path::PathBuf {
         let pid = std::process::id();
@@ -710,7 +743,7 @@ mod tests {
         let repo = tmp_repo("literal");
         create_branch(&repo, "feature/foo");
         assert_eq!(
-            resolve_branch_input(&repo, "feature/foo"),
+            resolve_branch_input(&ctx_for(&repo), "feature/foo"),
             Some("feature/foo".to_string())
         );
         let _ = fs::remove_dir_all(&repo);
@@ -721,7 +754,7 @@ mod tests {
         let repo = tmp_repo("fallback");
         create_branch(&repo, "agent/feat-a");
         assert_eq!(
-            resolve_branch_input(&repo, "feat-a"),
+            resolve_branch_input(&ctx_for(&repo), "feat-a"),
             Some("agent/feat-a".to_string())
         );
         let _ = fs::remove_dir_all(&repo);
@@ -734,7 +767,7 @@ mod tests {
         create_branch(&repo, "agent/feat-a");
         // `feat-a` exists literally → must resolve to that, not agent/feat-a
         assert_eq!(
-            resolve_branch_input(&repo, "feat-a"),
+            resolve_branch_input(&ctx_for(&repo), "feat-a"),
             Some("feat-a".to_string())
         );
         let _ = fs::remove_dir_all(&repo);
@@ -743,15 +776,18 @@ mod tests {
     #[test]
     fn resolve_unknown_returns_none() {
         let repo = tmp_repo("unknown");
-        assert_eq!(resolve_branch_input(&repo, "nonexistent-branch-xyz"), None);
+        assert_eq!(
+            resolve_branch_input(&ctx_for(&repo), "nonexistent-branch-xyz"),
+            None
+        );
         let _ = fs::remove_dir_all(&repo);
     }
 
     #[test]
     fn resolve_empty_input_returns_none() {
         let repo = tmp_repo("empty");
-        assert_eq!(resolve_branch_input(&repo, ""), None);
-        assert_eq!(resolve_branch_input(&repo, "   "), None);
+        assert_eq!(resolve_branch_input(&ctx_for(&repo), ""), None);
+        assert_eq!(resolve_branch_input(&ctx_for(&repo), "   "), None);
         let _ = fs::remove_dir_all(&repo);
     }
 }
