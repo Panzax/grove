@@ -461,8 +461,27 @@ pub struct MountsSection {
     pub claude_inherit: Option<String>, // "full" | "scoped" | "none"
     #[serde(default)]
     pub gh_auth: Option<String>, // "pat" | "ro-mount" | "rw-mount" | "none"
+    #[serde(default)]
+    pub gh_token_env: Option<String>, // host env-var NAME holding the GH PAT; default GH_TOKEN_RO
     #[serde(default, rename = "extra")]
     pub extra: Vec<ExtraMount>,
+}
+
+impl MountsSection {
+    /// Name of the host environment variable that holds the GitHub PAT.
+    ///
+    /// Fine-grained PATs are repo-scoped, so each project needs its own token.
+    /// `gh_token_env` lets a project point at its own host var (e.g.
+    /// `GH_PAT_FREQTRADE`); grove stores only the NAME, never the value. Unset
+    /// falls back to the legacy global `GH_TOKEN_RO` so existing projects are
+    /// unaffected.
+    pub fn gh_token_env_name(&self) -> &str {
+        self.gh_token_env
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or("GH_TOKEN_RO")
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -541,4 +560,40 @@ pub struct MetaSection {
     pub initialized_at: Option<DateTime<Utc>>,
     #[serde(default)]
     pub schema_version: u32,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn gh_token_env_defaults_to_legacy_global() {
+        let m = MountsSection::default();
+        assert_eq!(m.gh_token_env_name(), "GH_TOKEN_RO");
+    }
+
+    #[test]
+    fn gh_token_env_uses_configured_name() {
+        let m = MountsSection {
+            gh_token_env: Some("GH_PAT_FREQTRADE".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(m.gh_token_env_name(), "GH_PAT_FREQTRADE");
+    }
+
+    #[test]
+    fn gh_token_env_blank_falls_back_to_default() {
+        let m = MountsSection {
+            gh_token_env: Some("   ".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(m.gh_token_env_name(), "GH_TOKEN_RO");
+    }
+
+    #[test]
+    fn gh_token_env_round_trips_through_toml() {
+        let cfg: GroveConfig =
+            toml::from_str("[mounts]\ngh_token_env = \"GH_PAT_FREQTRADE\"\n").unwrap();
+        assert_eq!(cfg.mounts.gh_token_env_name(), "GH_PAT_FREQTRADE");
+    }
 }

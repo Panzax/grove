@@ -155,13 +155,14 @@ pub fn build_devcontainer_skeleton(project: &ProjectContext) -> Value {
         "updateRemoteUserUID": true,
         "workspaceFolder": workspace_folder,
         "postCreateCommand": grove_container_prereqs_command(),
-        // GH_TOKEN piped from the host's GH_TOKEN_RO (operator's existing
-        // token name; despite the misnomer the token has RW perms). gh CLI
-        // reads GH_TOKEN natively so no `gh auth login` is needed inside
-        // the container. Required by the `grove integrate` agent's
-        // `gh pr create` step. Skipped silently if GH_TOKEN_RO is unset
-        // on the host — the integrate agent will roadblock with a clear
-        // message instead of looping.
+        // GH_TOKEN piped from a host env var. This is the pre-wizard default
+        // (legacy global `GH_TOKEN_RO`); the setup wizard's GitHub-auth prompt
+        // (`prompt_gh_token_env`) rewrites it to the project's configured var
+        // (`[mounts] gh_token_env`, e.g. `${localEnv:GH_PAT_FREQTRADE}`) so each
+        // repo can use its own fine-grained PAT. gh CLI reads GH_TOKEN natively
+        // (no `gh auth login` inside the container); required by the integrate
+        // agent's `gh pr create`. Skipped silently if the var is unset — the
+        // integrate agent roadblocks with a clear message instead of looping.
         "containerEnv": {
             "GH_TOKEN": "${localEnv:GH_TOKEN_RO}"
         },

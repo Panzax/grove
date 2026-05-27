@@ -122,7 +122,7 @@ pub fn run_setup_wizard(
     prompt_claude_scope(&mut config, &mut devcontainer, &user)?;
 
     // ----- Prompt 3: GitHub auth -----
-    prompt_github_auth(&mut config, &mut devcontainer, &user)?;
+    prompt_github_auth(&mut config, &mut devcontainer, &user, &project.repo_name)?;
 
     // ----- Prompt 4: agent-inferred extra mounts -----
     prompt_inferred_mounts(ctx, project, &mut config, &mut devcontainer, &user)?;
@@ -190,7 +190,7 @@ fn run_sandbox_wizard(
     prompt_claude_scope_sandbox(&mut config)?;
 
     // GitHub auth — the sandbox injects GH_TOKEN from the host's GH_TOKEN_RO.
-    prompt_github_auth_sandbox(&mut config)?;
+    prompt_github_auth_sandbox(&mut config, &project.repo_name)?;
 
     write_config(project_root_path, &config)?;
     println!();
@@ -235,13 +235,52 @@ fn prompt_claude_scope_sandbox(config: &mut GroveConfig) -> Result<(), String> {
     Ok(())
 }
 
-/// GitHub auth for sandbox mode. The sandbox forwards the host's `GH_TOKEN_RO`
-/// as `GH_TOKEN`; this records whether to do so and prints the setup tip.
-fn prompt_github_auth_sandbox(config: &mut GroveConfig) -> Result<(), String> {
+/// Prompt for the host env-var NAME that holds this project's GitHub PAT, store
+/// it in `[mounts] gh_token_env`, and return it. Fine-grained PATs are
+/// repo-scoped, so each project points at its own var (e.g. `GH_PAT_FREQTRADE`);
+/// grove never stores the token value. Defaults to the current value or the
+/// legacy global `GH_TOKEN_RO`.
+fn prompt_gh_token_env(config: &mut GroveConfig, repo_name: &str) -> Result<String, String> {
+    let theme = ColorfulTheme::default();
+    let suggested: String = repo_name
+        .to_ascii_uppercase()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+        .collect();
+    let default = config
+        .mounts
+        .gh_token_env
+        .clone()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| "GH_TOKEN_RO".to_string());
+    println!(
+        "  {} Fine-grained PATs are per-repo. Name a host var per project, e.g. GH_PAT_{}.",
+        "Tip:".cyan(),
+        suggested
+    );
+    let name: String = Input::with_theme(&theme)
+        .with_prompt("Host env var holding the GitHub PAT")
+        .default(default)
+        .interact_text()
+        .map_err(|e| format!("prompt: {}", e))?;
+    let name = name.trim().to_string();
+    config.mounts.gh_token_env = Some(name.clone());
+    println!(
+        "  {} Export {} on your host with a fine-grained PAT scoped to this repo \
+         (Contents: Read/Write to push + Pull requests: Read/Write for `gh pr create`).",
+        "Tip:".cyan(),
+        name.bold()
+    );
+    Ok(name)
+}
+
+/// GitHub auth for sandbox mode. The sandbox forwards the host PAT (named by
+/// `[mounts] gh_token_env`) as `GH_TOKEN`; this records whether to do so.
+fn prompt_github_auth_sandbox(config: &mut GroveConfig, repo_name: &str) -> Result<(), String> {
     let theme = ColorfulTheme::default();
     println!();
     let options = vec![
-        "PAT via GH_TOKEN_RO (recommended) — forwarded into the sandbox as GH_TOKEN",
+        "PAT via a host env var (recommended) — forwarded into the sandbox as GH_TOKEN",
         "Skip (no GitHub access from inside the sandbox)",
     ];
     let default_idx = match config.mounts.gh_auth.as_deref() {
@@ -256,10 +295,7 @@ fn prompt_github_auth_sandbox(config: &mut GroveConfig) -> Result<(), String> {
         .map_err(|e| format!("prompt: {}", e))?;
     if idx == 0 {
         config.mounts.gh_auth = Some("pat".to_string());
-        println!(
-            "  {} Set GH_TOKEN_RO on your host shell with a fine-grained PAT (Contents: Read-only).",
-            "Tip:".cyan()
-        );
+        prompt_gh_token_env(config, repo_name)?;
     } else {
         config.mounts.gh_auth = Some("none".to_string());
     }
@@ -619,11 +655,12 @@ fn prompt_github_auth(
     config: &mut GroveConfig,
     devcontainer: &mut Value,
     user: &str,
+    repo_name: &str,
 ) -> Result<(), String> {
     let theme = ColorfulTheme::default();
     println!();
     let options = vec![
-        "PAT via env var GH_TOKEN (RO fine-grained PAT) — recommended",
+        "PAT via a host env var (per-project fine-grained PAT) — recommended",
         "Mount ~/.config/gh read-only (any scope, still leaks token)",
         "Mount ~/.config/gh read-write (matches the freqtrade default, NOT recommended)",
         "Skip (no GitHub access from inside the container)",
@@ -649,11 +686,8 @@ fn prompt_github_auth(
     config.mounts.gh_auth = Some(key.to_string());
     match key {
         "pat" => {
-            set_container_env(devcontainer, "GH_TOKEN", "${localEnv:GH_TOKEN_RO}");
-            println!(
-                "  {} Set GH_TOKEN_RO on your host shell with a fine-grained PAT (Contents: Read-only).",
-                "Tip:".cyan()
-            );
+            let var = prompt_gh_token_env(config, repo_name)?;
+            set_container_env(devcontainer, "GH_TOKEN", &format!("${{localEnv:{}}}", var));
         }
         "ro-mount" => {
             let gh_target = format!("/home/{}/.config/gh", user);

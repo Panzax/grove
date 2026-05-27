@@ -256,6 +256,17 @@ fn sandbox_image(project_root: &Path) -> String {
         .unwrap_or_else(|| DEFAULT_SANDBOX_IMAGE.to_string())
 }
 
+/// GitHub PAT forwarded into the sandbox as `GH_TOKEN`. Reads the host env var
+/// NAMED by `[mounts] gh_token_env` (per-project; defaults to `GH_TOKEN_RO`).
+/// `None` when that var is unset/empty — the integrate agent then roadblocks
+/// with a clear message instead of pushing with no/wrong credentials.
+fn sandbox_gh_token(project_root: &Path) -> Option<String> {
+    let var = read_config(project_root)
+        .map(|c| c.mounts.gh_token_env_name().to_string())
+        .unwrap_or_else(|| "GH_TOKEN_RO".to_string());
+    std::env::var(var).ok().filter(|s| !s.trim().is_empty())
+}
+
 /// Display user recorded for the sandbox (informational; the process runs as
 /// the host uid). From `[sandbox] user`, defaulting to `agent`.
 fn sandbox_user(project_root: &Path) -> String {
@@ -467,7 +478,7 @@ fn create_and_seed(root: &Path, name: &str) -> Result<(), String> {
         root,
         &sandbox_image(root),
         SANDBOX_HOME,
-        std::env::var("GH_TOKEN_RO").ok().as_deref(),
+        sandbox_gh_token(root).as_deref(),
         &extra_mounts,
     );
     let refs: Vec<&str> = create_args.iter().map(|s| s.as_str()).collect();
