@@ -155,14 +155,23 @@ pub fn build_devcontainer_skeleton(project: &ProjectContext) -> Value {
         "updateRemoteUserUID": true,
         "workspaceFolder": workspace_folder,
         "postCreateCommand": grove_container_prereqs_command(),
-        // GH_TOKEN piped from the host's GH_TOKEN_RO (operator's existing
-        // token name; despite the misnomer the token has RW perms). gh CLI
-        // reads GH_TOKEN natively so no `gh auth login` is needed inside
-        // the container. Required by the `grove integrate` agent's
-        // `gh pr create` step. Skipped silently if GH_TOKEN_RO is unset
-        // on the host — the integrate agent will roadblock with a clear
-        // message instead of looping.
-        "containerEnv": {
+        // Re-run the (idempotent, `command -v`-guarded) prereqs on every start,
+        // not just create. A long-lived container that loses a tool — or one
+        // created before a prereq was added — self-heals on the next start with
+        // NO rebuild; the guards make it a near-no-op when tools are present.
+        "postStartCommand": grove_container_prereqs_command(),
+        // GH_TOKEN piped from a host env var via `remoteEnv` (NOT containerEnv):
+        // remoteEnv is applied by the devcontainer CLI on every `devcontainer
+        // exec`/attach, so rotating the PAT — or changing what `${localEnv:...}`
+        // resolves to — takes effect on the next `grove spawn` with NO rebuild.
+        // This is the pre-wizard default (legacy global `GH_TOKEN_RO`); the
+        // setup wizard's GitHub-auth prompt (`prompt_gh_token_env`) rewrites it
+        // to the project's configured var (`[mounts] gh_token_env`, e.g.
+        // `${localEnv:GH_PAT_FREQTRADE}`) so each repo can use its own
+        // fine-grained PAT. gh CLI reads GH_TOKEN natively (no `gh auth login`
+        // inside the container); required by the integrate agent's
+        // `gh pr create`. Skipped silently if the var is unset.
+        "remoteEnv": {
             "GH_TOKEN": "${localEnv:GH_TOKEN_RO}"
         },
         // Preset features install the agentic toolchain: the git feature
@@ -418,6 +427,10 @@ mod tests {
         // postCreate — it comes from the preset's devcontainer features.
         assert!(!post.contains("@anthropic-ai/claude-code"));
         assert!(!post.contains("cli.github.com/packages"));
+        // Same prereqs re-ensured on every start → no-rebuild self-heal.
+        let post_start = skel["postStartCommand"].as_str().unwrap();
+        assert!(post_start.contains("command -v tmux"));
+        assert!(post_start.contains("command -v jq"));
     }
 
     #[test]
@@ -439,7 +452,7 @@ mod tests {
     }
 
     #[test]
-    fn skeleton_maps_gh_token_via_container_env() {
+    fn skeleton_maps_gh_token_via_remote_env_for_no_rebuild() {
         let project = ProjectContext {
             stack: Some(ProjectStack::Rust),
             default_image: preset::for_stack(ProjectStack::Rust).image.to_string(),
@@ -447,8 +460,9 @@ mod tests {
             ..Default::default()
         };
         let skel = build_devcontainer_skeleton(&project);
-        let env = &skel["containerEnv"];
-        assert_eq!(env["GH_TOKEN"], "${localEnv:GH_TOKEN_RO}");
+        // remoteEnv (not containerEnv): token changes need no container rebuild.
+        assert_eq!(skel["remoteEnv"]["GH_TOKEN"], "${localEnv:GH_TOKEN_RO}");
+        assert!(skel.get("containerEnv").is_none());
     }
 
     #[test]

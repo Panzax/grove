@@ -98,6 +98,9 @@ pub fn run_setup_wizard(
             "customizations": { "vscode": { "extensions": [] } }
         })
     });
+    // Snapshot the on-disk config before the wizard mutates it, so we can tell
+    // the user afterward whether their changes need a container rebuild.
+    let devcontainer_before = devcontainer.clone();
 
     // ----- Prompt 0.5: environment preset (image + agentic toolchain) -----
     // Picking a preset sets the image, the container user, the devcontainer
@@ -122,7 +125,7 @@ pub fn run_setup_wizard(
     prompt_claude_scope(&mut config, &mut devcontainer, &user)?;
 
     // ----- Prompt 3: GitHub auth -----
-    prompt_github_auth(&mut config, &mut devcontainer, &user)?;
+    prompt_github_auth(&mut config, &mut devcontainer, &user, &project.repo_name)?;
 
     // ----- Prompt 4: agent-inferred extra mounts -----
     prompt_inferred_mounts(ctx, project, &mut config, &mut devcontainer, &user)?;
@@ -142,7 +145,62 @@ pub fn run_setup_wizard(
         "{} wrote .grove/config.toml + .devcontainer/devcontainer.json",
         "✓".green()
     );
+    report_rebuild_requirement(is_reconfigure, &devcontainer_before, &devcontainer);
     Ok(())
+}
+
+/// devcontainer.json keys baked at container-create. Changing any requires
+/// `devcontainer up --remove-existing-container` to take effect; everything
+/// else (`remoteEnv`, `customizations`, `postStartCommand`) applies on the next
+/// `devcontainer exec`/attach with no rebuild.
+const REBUILD_BAKED_KEYS: &[&str] = &[
+    "image",
+    "build",
+    "dockerComposeFile",
+    "features",
+    "mounts",
+    "workspaceMount",
+    "workspaceFolder",
+    "containerEnv",
+    "containerUser",
+    "remoteUser",
+    "updateRemoteUserUID",
+    "runArgs",
+    "onCreateCommand",
+    "updateContentCommand",
+    "postCreateCommand",
+];
+
+/// Create-baked keys whose value differs between `before` and `after`.
+fn rebuild_baked_changes(before: &Value, after: &Value) -> Vec<&'static str> {
+    REBUILD_BAKED_KEYS
+        .iter()
+        .copied()
+        .filter(|k| before.get(*k) != after.get(*k))
+        .collect()
+}
+
+/// After a `--reconfigure`, tell the user whether their edits take effect on the
+/// next `grove spawn` (live: remoteEnv/extensions/postStart) or need a rebuild
+/// (create-baked: image/features/mounts/containerEnv/...). On a fresh `init`
+/// there is no container yet, so nothing to report.
+fn report_rebuild_requirement(is_reconfigure: bool, before: &Value, after: &Value) {
+    if !is_reconfigure {
+        return;
+    }
+    let changed = rebuild_baked_changes(before, after);
+    if changed.is_empty() {
+        println!(
+            "{} no rebuild needed — changes apply on the next `grove spawn` (remoteEnv + extensions are live).",
+            "·".dimmed()
+        );
+    } else {
+        println!(
+            "{} create-baked keys changed ({}) — run `grove devcontainer rebuild` for them to take effect.",
+            "!".yellow(),
+            changed.join(", ")
+        );
+    }
 }
 
 // ---------- sandbox flow ----------
@@ -190,7 +248,7 @@ fn run_sandbox_wizard(
     prompt_claude_scope_sandbox(&mut config)?;
 
     // GitHub auth — the sandbox injects GH_TOKEN from the host's GH_TOKEN_RO.
-    prompt_github_auth_sandbox(&mut config)?;
+    prompt_github_auth_sandbox(&mut config, &project.repo_name)?;
 
     write_config(project_root_path, &config)?;
     println!();
@@ -235,13 +293,52 @@ fn prompt_claude_scope_sandbox(config: &mut GroveConfig) -> Result<(), String> {
     Ok(())
 }
 
-/// GitHub auth for sandbox mode. The sandbox forwards the host's `GH_TOKEN_RO`
-/// as `GH_TOKEN`; this records whether to do so and prints the setup tip.
-fn prompt_github_auth_sandbox(config: &mut GroveConfig) -> Result<(), String> {
+/// Prompt for the host env-var NAME that holds this project's GitHub PAT, store
+/// it in `[mounts] gh_token_env`, and return it. Fine-grained PATs are
+/// repo-scoped, so each project points at its own var (e.g. `GH_PAT_FREQTRADE`);
+/// grove never stores the token value. Defaults to the current value or the
+/// legacy global `GH_TOKEN_RO`.
+fn prompt_gh_token_env(config: &mut GroveConfig, repo_name: &str) -> Result<String, String> {
+    let theme = ColorfulTheme::default();
+    let suggested: String = repo_name
+        .to_ascii_uppercase()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+        .collect();
+    let default = config
+        .mounts
+        .gh_token_env
+        .clone()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| "GH_TOKEN_RO".to_string());
+    println!(
+        "  {} Fine-grained PATs are per-repo. Name a host var per project, e.g. GH_PAT_{}.",
+        "Tip:".cyan(),
+        suggested
+    );
+    let name: String = Input::with_theme(&theme)
+        .with_prompt("Host env var holding the GitHub PAT")
+        .default(default)
+        .interact_text()
+        .map_err(|e| format!("prompt: {}", e))?;
+    let name = name.trim().to_string();
+    config.mounts.gh_token_env = Some(name.clone());
+    println!(
+        "  {} Export {} on your host with a fine-grained PAT scoped to this repo \
+         (Contents: Read/Write to push + Pull requests: Read/Write for `gh pr create`).",
+        "Tip:".cyan(),
+        name.bold()
+    );
+    Ok(name)
+}
+
+/// GitHub auth for sandbox mode. The sandbox forwards the host PAT (named by
+/// `[mounts] gh_token_env`) as `GH_TOKEN`; this records whether to do so.
+fn prompt_github_auth_sandbox(config: &mut GroveConfig, repo_name: &str) -> Result<(), String> {
     let theme = ColorfulTheme::default();
     println!();
     let options = vec![
-        "PAT via GH_TOKEN_RO (recommended) — forwarded into the sandbox as GH_TOKEN",
+        "PAT via a host env var (recommended) — forwarded into the sandbox as GH_TOKEN",
         "Skip (no GitHub access from inside the sandbox)",
     ];
     let default_idx = match config.mounts.gh_auth.as_deref() {
@@ -256,10 +353,7 @@ fn prompt_github_auth_sandbox(config: &mut GroveConfig) -> Result<(), String> {
         .map_err(|e| format!("prompt: {}", e))?;
     if idx == 0 {
         config.mounts.gh_auth = Some("pat".to_string());
-        println!(
-            "  {} Set GH_TOKEN_RO on your host shell with a fine-grained PAT (Contents: Read-only).",
-            "Tip:".cyan()
-        );
+        prompt_gh_token_env(config, repo_name)?;
     } else {
         config.mounts.gh_auth = Some("none".to_string());
     }
@@ -503,7 +597,7 @@ fn prompt_secrets_mount(
 
     let target = format!("/home/{}/.config/{}", user, project.repo_name);
     add_mount(devcontainer, &path, &target, mode);
-    set_container_env(devcontainer, &env_name, &target);
+    set_remote_env(devcontainer, &env_name, &target);
 
     config.mounts.secrets_path = Some(path);
     config.mounts.secrets_mode = Some(mode.to_string());
@@ -536,11 +630,11 @@ fn prompt_claude_scope(
     println!();
     println!(
         "{}",
-        "grove init already added the recommended `scoped` mounts (~/.claude/{plugins, .credentials.json, settings.json} RO). Adjust if needed:".dimmed()
+        "grove init already added the recommended `scoped` mount (~/.claude RO directory; host token refreshes propagate, no rebuild). Adjust if needed:".dimmed()
     );
     let options = vec![
-        "Keep scoped (recommended) — the three RO mounts grove init added",
-        "Switch to full (RW)       — exposes session history + container can write settings; advanced only",
+        "Keep scoped (recommended) — RO ~/.claude directory mount grove init added",
+        "Switch to full (RW)       — container can write settings + self-refresh creds; advanced only",
         "Remove all .claude mounts — bring your own auth + hooks inside the container",
     ];
     let default_idx = match config.mounts.claude_inherit.as_deref() {
@@ -563,9 +657,28 @@ fn prompt_claude_scope(
 
     match key {
         "scoped" => {
-            // Baseline mounts are already in place from Phase 1. No-op.
+            // Reconstruct the scoped baseline: one RO ~/.claude DIRECTORY mount
+            // (refreshes propagate; no single-file inode-pin staleness) + the
+            // ~/.claude.json onboarding-state file RO. Remove any prior .claude*
+            // mounts first so reconfigure migrates legacy single-file mounts —
+            // or a prior `full` RW mount — cleanly.
+            remove_claude_mounts(devcontainer);
+            let claude_target = format!("/home/{}/.claude", user);
+            add_mount(
+                devcontainer,
+                "${localEnv:HOME}/.claude",
+                &claude_target,
+                "ro",
+            );
+            let claude_json_target = format!("/home/{}/.claude.json", user);
+            add_mount(
+                devcontainer,
+                "${localEnv:HOME}/.claude.json",
+                &claude_json_target,
+                "ro",
+            );
             println!(
-                "  {} keeping Phase 1 baseline mounts (scoped).",
+                "  {} scoped: RO ~/.claude directory mount (host token refreshes propagate; no rebuild on rotation).",
                 "·".dimmed()
             );
         }
@@ -619,11 +732,12 @@ fn prompt_github_auth(
     config: &mut GroveConfig,
     devcontainer: &mut Value,
     user: &str,
+    repo_name: &str,
 ) -> Result<(), String> {
     let theme = ColorfulTheme::default();
     println!();
     let options = vec![
-        "PAT via env var GH_TOKEN (RO fine-grained PAT) — recommended",
+        "PAT via a host env var (per-project fine-grained PAT) — recommended",
         "Mount ~/.config/gh read-only (any scope, still leaks token)",
         "Mount ~/.config/gh read-write (matches the freqtrade default, NOT recommended)",
         "Skip (no GitHub access from inside the container)",
@@ -649,11 +763,8 @@ fn prompt_github_auth(
     config.mounts.gh_auth = Some(key.to_string());
     match key {
         "pat" => {
-            set_container_env(devcontainer, "GH_TOKEN", "${localEnv:GH_TOKEN_RO}");
-            println!(
-                "  {} Set GH_TOKEN_RO on your host shell with a fine-grained PAT (Contents: Read-only).",
-                "Tip:".cyan()
-            );
+            let var = prompt_gh_token_env(config, repo_name)?;
+            set_remote_env(devcontainer, "GH_TOKEN", &format!("${{localEnv:{}}}", var));
         }
         "ro-mount" => {
             let gh_target = format!("/home/{}/.config/gh", user);
@@ -804,9 +915,24 @@ fn add_mount(devcontainer: &mut Value, source: &str, target: &str, mode: &str) {
     }
 }
 
-fn set_container_env(devcontainer: &mut Value, key: &str, value: &str) {
+/// Set an env var in devcontainer.json's `remoteEnv` (NOT `containerEnv`).
+/// `remoteEnv` is applied by the devcontainer CLI on every `devcontainer exec`
+/// / attach, so changing a value (e.g. rotating a PAT, or editing the host var
+/// `${localEnv:...}` resolves) takes effect on the next `grove spawn` with NO
+/// container rebuild. `containerEnv` is baked at container-create and would
+/// require `--remove-existing-container`. Prefer non-rebuild methods.
+fn set_remote_env(devcontainer: &mut Value, key: &str, value: &str) {
+    // Migrate away any stale `containerEnv` copy (older grove wrote there) so the
+    // baked-at-create value can't shadow/duplicate the live remoteEnv one.
+    if let Some(ce) = devcontainer
+        .as_object_mut()
+        .and_then(|o| o.get_mut("containerEnv"))
+        .and_then(|c| c.as_object_mut())
+    {
+        ce.remove(key);
+    }
     let env = devcontainer.as_object_mut().and_then(|o| {
-        o.entry("containerEnv")
+        o.entry("remoteEnv")
             .or_insert_with(|| json!({}))
             .as_object_mut()
     });
@@ -997,10 +1123,49 @@ mod tests {
     }
 
     #[test]
-    fn set_container_env_inserts_key() {
-        let mut v = json!({ "containerEnv": {} });
-        set_container_env(&mut v, "FOO", "bar");
-        assert_eq!(v["containerEnv"]["FOO"], "bar");
+    fn set_remote_env_inserts_key() {
+        let mut v = json!({ "remoteEnv": {} });
+        set_remote_env(&mut v, "FOO", "bar");
+        assert_eq!(v["remoteEnv"]["FOO"], "bar");
+    }
+
+    #[test]
+    fn set_remote_env_creates_map_when_absent() {
+        let mut v = json!({});
+        set_remote_env(&mut v, "GH_TOKEN", "${localEnv:GH_PAT_FREQTRADE}");
+        assert_eq!(v["remoteEnv"]["GH_TOKEN"], "${localEnv:GH_PAT_FREQTRADE}");
+    }
+
+    #[test]
+    fn rebuild_changes_empty_when_only_remote_env_or_extensions_differ() {
+        let before = json!({
+            "image": "x", "remoteEnv": { "GH_TOKEN": "${localEnv:A}" },
+            "customizations": { "vscode": { "extensions": ["a"] } }
+        });
+        let after = json!({
+            "image": "x", "remoteEnv": { "GH_TOKEN": "${localEnv:GH_PAT_FREQTRADE}" },
+            "customizations": { "vscode": { "extensions": ["a", "b"] } }
+        });
+        assert!(rebuild_baked_changes(&before, &after).is_empty());
+    }
+
+    #[test]
+    fn rebuild_changes_flags_baked_keys() {
+        let before = json!({ "image": "old", "mounts": [] });
+        let after = json!({ "image": "new", "mounts": ["m"] });
+        let changed = rebuild_baked_changes(&before, &after);
+        assert!(changed.contains(&"image"));
+        assert!(changed.contains(&"mounts"));
+    }
+
+    #[test]
+    fn set_remote_env_migrates_stale_container_env_key() {
+        let mut v =
+            json!({ "containerEnv": { "GH_TOKEN": "${localEnv:GH_TOKEN_RO}", "KEEP": "1" } });
+        set_remote_env(&mut v, "GH_TOKEN", "${localEnv:GH_PAT_FREQTRADE}");
+        assert_eq!(v["remoteEnv"]["GH_TOKEN"], "${localEnv:GH_PAT_FREQTRADE}");
+        assert!(v["containerEnv"].get("GH_TOKEN").is_none());
+        assert_eq!(v["containerEnv"]["KEEP"], "1");
     }
 
     #[test]

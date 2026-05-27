@@ -256,6 +256,17 @@ fn sandbox_image(project_root: &Path) -> String {
         .unwrap_or_else(|| DEFAULT_SANDBOX_IMAGE.to_string())
 }
 
+/// GitHub PAT forwarded into the sandbox as `GH_TOKEN`. Reads the host env var
+/// NAMED by `[mounts] gh_token_env` (per-project; defaults to `GH_TOKEN_RO`).
+/// `None` when that var is unset/empty — the integrate agent then roadblocks
+/// with a clear message instead of pushing with no/wrong credentials.
+fn sandbox_gh_token(project_root: &Path) -> Option<String> {
+    let var = read_config(project_root)
+        .map(|c| c.mounts.gh_token_env_name().to_string())
+        .unwrap_or_else(|| "GH_TOKEN_RO".to_string());
+    std::env::var(var).ok().filter(|s| !s.trim().is_empty())
+}
+
 /// Display user recorded for the sandbox (informational; the process runs as
 /// the host uid). From `[sandbox] user`, defaulting to `agent`.
 fn sandbox_user(project_root: &Path) -> String {
@@ -467,7 +478,7 @@ fn create_and_seed(root: &Path, name: &str) -> Result<(), String> {
         root,
         &sandbox_image(root),
         SANDBOX_HOME,
-        std::env::var("GH_TOKEN_RO").ok().as_deref(),
+        sandbox_gh_token(root).as_deref(),
         &extra_mounts,
     );
     let refs: Vec<&str> = create_args.iter().map(|s| s.as_str()).collect();
@@ -592,14 +603,18 @@ fn sandbox_extra_mounts(project_root: &Path) -> Vec<(String, String, bool)> {
                 out.push((src, claude_home, false));
             }
         }
-        // scoped (default): the same three RO resources the devcontainer
-        // baseline mounts, but only when present on the host.
+        // scoped (default): mount the whole ~/.claude DIRECTORY read-only (was
+        // three single-file RO mounts). A single-file bind pins the inode at
+        // create, so host OAuth-token refreshes (atomic rename = new inode)
+        // never reach the container → 401 after the token TTL on long-lived
+        // sandboxes. A directory mount reflects host refreshes live; RO keeps
+        // the container from writing the host profile (so it can't self-refresh
+        // — prefer `full` or an API key for fully unattended use). Trade-off:
+        // the agent can read all of ~/.claude (incl. session history).
         _ => {
-            for leaf in ["plugins", ".credentials.json", "settings.json"] {
-                let src = expand_home(&format!("~/.claude/{}", leaf));
-                if Path::new(&src).exists() {
-                    out.push((src, format!("{}/{}", claude_home, leaf), true));
-                }
+            let src = expand_home("~/.claude");
+            if Path::new(&src).exists() {
+                out.push((src, claude_home, true));
             }
         }
     }

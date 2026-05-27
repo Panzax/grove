@@ -376,7 +376,7 @@ fn run_phase1_and_phase2(
         );
     } else {
         println!(
-            "  {} added baseline .claude/{{settings.json, .credentials.json, plugins}} RO mounts (scoped default)",
+            "  {} added baseline ~/.claude RO directory mount + ~/.claude.json (scoped default; refreshes propagate, no rebuild)",
             "·".dimmed()
         );
     }
@@ -1133,9 +1133,18 @@ fn apply_baseline_claude_mounts(project_root: &Path) -> Result<(), String> {
         .ok_or_else(|| "devcontainer.json `mounts` is not an array".to_string())?;
 
     let baseline_subpaths = [
-        ".claude/plugins",
-        ".claude/.credentials.json",
-        ".claude/settings.json",
+        // Scoped default: mount the whole ~/.claude DIRECTORY read-only, not
+        // the three files individually. A single-file bind pins the inode at
+        // container-create, so when the host refreshes the short-lived OAuth
+        // token (atomic write-temp + rename = new inode) the container keeps
+        // seeing the stale file → HTTP 401 after the token TTL on long-lived
+        // containers. A directory mount reflects the host's current contents
+        // (incl. renamed-in files), so host-side refreshes propagate live with
+        // no rebuild. RO keeps the container from writing the host profile (it
+        // therefore can't self-refresh — for fully unattended use prefer `full`
+        // or an API key). The dir covers plugins, .credentials.json, and
+        // settings.json (Stop hook + enabledPlugins) at once.
+        ".claude",
         // Without ~/.claude.json the in-container claude sees a "fresh
         // install" → onboarding + danger-warning prompts block the
         // bootstrap turn. Mounting the host's onboarded state RO skips
@@ -1147,11 +1156,16 @@ fn apply_baseline_claude_mounts(project_root: &Path) -> Result<(), String> {
         let source = format!("${{localEnv:HOME}}/{}", sub);
         let target = format!("/home/{}/{}", user, sub);
         let entry = format!("source={},target={},type=bind,readonly", source, target);
-        // Skip if a mount with this exact target already exists (matches the
-        // idempotency we use elsewhere — protects user edits and reruns).
-        if mounts.iter().filter_map(|v| v.as_str()).any(|s| {
-            s.contains(&format!("target={}", target)) || s.contains(&format!("target={},", target))
-        }) {
+        // Skip if a mount with this exact target already exists (idempotent
+        // reruns; protects user edits). Match on the trailing `,` boundary so a
+        // prefix target (`.../.claude`) doesn't falsely match a longer one
+        // (`.../.claude.json`, `.../.claude/plugins`) — every grove mount string
+        // is `...,target=<T>,type=bind...`, so `target=<T>,` is exact.
+        if mounts
+            .iter()
+            .filter_map(|v| v.as_str())
+            .any(|s| s.contains(&format!("target={},", target)))
+        {
             continue;
         }
         mounts.push(serde_json::Value::String(entry));
@@ -1919,9 +1933,11 @@ mod tests {
         .unwrap();
         apply_baseline_claude_mounts(&root).unwrap();
         let body = fs::read_to_string(dc.join("devcontainer.json")).unwrap();
-        assert!(body.contains("target=/home/ftuser/.claude/plugins"));
-        assert!(body.contains("target=/home/ftuser/.claude/.credentials.json"));
-        assert!(body.contains("target=/home/ftuser/.claude/settings.json"));
+        // scoped = whole ~/.claude RO directory (not inode-pinned single files)
+        // + ~/.claude.json, routed to the detected user.
+        assert!(body.contains("target=/home/ftuser/.claude,type=bind,readonly"));
+        assert!(body.contains("target=/home/ftuser/.claude.json,type=bind,readonly"));
+        assert!(!body.contains(".credentials.json"));
         assert!(!body.contains("/home/vscode/"));
         let _ = fs::remove_dir_all(&root);
     }
@@ -1939,7 +1955,7 @@ mod tests {
         .unwrap();
         apply_baseline_claude_mounts(&root).unwrap();
         let body = fs::read_to_string(dc.join("devcontainer.json")).unwrap();
-        assert!(body.contains("target=/home/vscode/.claude/plugins"));
+        assert!(body.contains("target=/home/vscode/.claude,type=bind,readonly"));
         let _ = fs::remove_dir_all(&root);
     }
 }
