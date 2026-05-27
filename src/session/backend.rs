@@ -603,14 +603,18 @@ fn sandbox_extra_mounts(project_root: &Path) -> Vec<(String, String, bool)> {
                 out.push((src, claude_home, false));
             }
         }
-        // scoped (default): the same three RO resources the devcontainer
-        // baseline mounts, but only when present on the host.
+        // scoped (default): mount the whole ~/.claude DIRECTORY read-only (was
+        // three single-file RO mounts). A single-file bind pins the inode at
+        // create, so host OAuth-token refreshes (atomic rename = new inode)
+        // never reach the container → 401 after the token TTL on long-lived
+        // sandboxes. A directory mount reflects host refreshes live; RO keeps
+        // the container from writing the host profile (so it can't self-refresh
+        // — prefer `full` or an API key for fully unattended use). Trade-off:
+        // the agent can read all of ~/.claude (incl. session history).
         _ => {
-            for leaf in ["plugins", ".credentials.json", "settings.json"] {
-                let src = expand_home(&format!("~/.claude/{}", leaf));
-                if Path::new(&src).exists() {
-                    out.push((src, format!("{}/{}", claude_home, leaf), true));
-                }
+            let src = expand_home("~/.claude");
+            if Path::new(&src).exists() {
+                out.push((src, claude_home, true));
             }
         }
     }

@@ -630,11 +630,11 @@ fn prompt_claude_scope(
     println!();
     println!(
         "{}",
-        "grove init already added the recommended `scoped` mounts (~/.claude/{plugins, .credentials.json, settings.json} RO). Adjust if needed:".dimmed()
+        "grove init already added the recommended `scoped` mount (~/.claude RO directory; host token refreshes propagate, no rebuild). Adjust if needed:".dimmed()
     );
     let options = vec![
-        "Keep scoped (recommended) — the three RO mounts grove init added",
-        "Switch to full (RW)       — exposes session history + container can write settings; advanced only",
+        "Keep scoped (recommended) — RO ~/.claude directory mount grove init added",
+        "Switch to full (RW)       — container can write settings + self-refresh creds; advanced only",
         "Remove all .claude mounts — bring your own auth + hooks inside the container",
     ];
     let default_idx = match config.mounts.claude_inherit.as_deref() {
@@ -657,9 +657,28 @@ fn prompt_claude_scope(
 
     match key {
         "scoped" => {
-            // Baseline mounts are already in place from Phase 1. No-op.
+            // Reconstruct the scoped baseline: one RO ~/.claude DIRECTORY mount
+            // (refreshes propagate; no single-file inode-pin staleness) + the
+            // ~/.claude.json onboarding-state file RO. Remove any prior .claude*
+            // mounts first so reconfigure migrates legacy single-file mounts —
+            // or a prior `full` RW mount — cleanly.
+            remove_claude_mounts(devcontainer);
+            let claude_target = format!("/home/{}/.claude", user);
+            add_mount(
+                devcontainer,
+                "${localEnv:HOME}/.claude",
+                &claude_target,
+                "ro",
+            );
+            let claude_json_target = format!("/home/{}/.claude.json", user);
+            add_mount(
+                devcontainer,
+                "${localEnv:HOME}/.claude.json",
+                &claude_json_target,
+                "ro",
+            );
             println!(
-                "  {} keeping Phase 1 baseline mounts (scoped).",
+                "  {} scoped: RO ~/.claude directory mount (host token refreshes propagate; no rebuild on rotation).",
                 "·".dimmed()
             );
         }
