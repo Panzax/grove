@@ -155,15 +155,18 @@ pub fn build_devcontainer_skeleton(project: &ProjectContext) -> Value {
         "updateRemoteUserUID": true,
         "workspaceFolder": workspace_folder,
         "postCreateCommand": grove_container_prereqs_command(),
-        // GH_TOKEN piped from a host env var. This is the pre-wizard default
-        // (legacy global `GH_TOKEN_RO`); the setup wizard's GitHub-auth prompt
-        // (`prompt_gh_token_env`) rewrites it to the project's configured var
-        // (`[mounts] gh_token_env`, e.g. `${localEnv:GH_PAT_FREQTRADE}`) so each
-        // repo can use its own fine-grained PAT. gh CLI reads GH_TOKEN natively
-        // (no `gh auth login` inside the container); required by the integrate
-        // agent's `gh pr create`. Skipped silently if the var is unset — the
-        // integrate agent roadblocks with a clear message instead of looping.
-        "containerEnv": {
+        // GH_TOKEN piped from a host env var via `remoteEnv` (NOT containerEnv):
+        // remoteEnv is applied by the devcontainer CLI on every `devcontainer
+        // exec`/attach, so rotating the PAT — or changing what `${localEnv:...}`
+        // resolves to — takes effect on the next `grove spawn` with NO rebuild.
+        // This is the pre-wizard default (legacy global `GH_TOKEN_RO`); the
+        // setup wizard's GitHub-auth prompt (`prompt_gh_token_env`) rewrites it
+        // to the project's configured var (`[mounts] gh_token_env`, e.g.
+        // `${localEnv:GH_PAT_FREQTRADE}`) so each repo can use its own
+        // fine-grained PAT. gh CLI reads GH_TOKEN natively (no `gh auth login`
+        // inside the container); required by the integrate agent's
+        // `gh pr create`. Skipped silently if the var is unset.
+        "remoteEnv": {
             "GH_TOKEN": "${localEnv:GH_TOKEN_RO}"
         },
         // Preset features install the agentic toolchain: the git feature
@@ -440,7 +443,7 @@ mod tests {
     }
 
     #[test]
-    fn skeleton_maps_gh_token_via_container_env() {
+    fn skeleton_maps_gh_token_via_remote_env_for_no_rebuild() {
         let project = ProjectContext {
             stack: Some(ProjectStack::Rust),
             default_image: preset::for_stack(ProjectStack::Rust).image.to_string(),
@@ -448,8 +451,9 @@ mod tests {
             ..Default::default()
         };
         let skel = build_devcontainer_skeleton(&project);
-        let env = &skel["containerEnv"];
-        assert_eq!(env["GH_TOKEN"], "${localEnv:GH_TOKEN_RO}");
+        // remoteEnv (not containerEnv): token changes need no container rebuild.
+        assert_eq!(skel["remoteEnv"]["GH_TOKEN"], "${localEnv:GH_TOKEN_RO}");
+        assert!(skel.get("containerEnv").is_none());
     }
 
     #[test]

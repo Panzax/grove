@@ -539,7 +539,7 @@ fn prompt_secrets_mount(
 
     let target = format!("/home/{}/.config/{}", user, project.repo_name);
     add_mount(devcontainer, &path, &target, mode);
-    set_container_env(devcontainer, &env_name, &target);
+    set_remote_env(devcontainer, &env_name, &target);
 
     config.mounts.secrets_path = Some(path);
     config.mounts.secrets_mode = Some(mode.to_string());
@@ -687,7 +687,7 @@ fn prompt_github_auth(
     match key {
         "pat" => {
             let var = prompt_gh_token_env(config, repo_name)?;
-            set_container_env(devcontainer, "GH_TOKEN", &format!("${{localEnv:{}}}", var));
+            set_remote_env(devcontainer, "GH_TOKEN", &format!("${{localEnv:{}}}", var));
         }
         "ro-mount" => {
             let gh_target = format!("/home/{}/.config/gh", user);
@@ -838,9 +838,24 @@ fn add_mount(devcontainer: &mut Value, source: &str, target: &str, mode: &str) {
     }
 }
 
-fn set_container_env(devcontainer: &mut Value, key: &str, value: &str) {
+/// Set an env var in devcontainer.json's `remoteEnv` (NOT `containerEnv`).
+/// `remoteEnv` is applied by the devcontainer CLI on every `devcontainer exec`
+/// / attach, so changing a value (e.g. rotating a PAT, or editing the host var
+/// `${localEnv:...}` resolves) takes effect on the next `grove spawn` with NO
+/// container rebuild. `containerEnv` is baked at container-create and would
+/// require `--remove-existing-container`. Prefer non-rebuild methods.
+fn set_remote_env(devcontainer: &mut Value, key: &str, value: &str) {
+    // Migrate away any stale `containerEnv` copy (older grove wrote there) so the
+    // baked-at-create value can't shadow/duplicate the live remoteEnv one.
+    if let Some(ce) = devcontainer
+        .as_object_mut()
+        .and_then(|o| o.get_mut("containerEnv"))
+        .and_then(|c| c.as_object_mut())
+    {
+        ce.remove(key);
+    }
     let env = devcontainer.as_object_mut().and_then(|o| {
-        o.entry("containerEnv")
+        o.entry("remoteEnv")
             .or_insert_with(|| json!({}))
             .as_object_mut()
     });
@@ -1031,10 +1046,27 @@ mod tests {
     }
 
     #[test]
-    fn set_container_env_inserts_key() {
-        let mut v = json!({ "containerEnv": {} });
-        set_container_env(&mut v, "FOO", "bar");
-        assert_eq!(v["containerEnv"]["FOO"], "bar");
+    fn set_remote_env_inserts_key() {
+        let mut v = json!({ "remoteEnv": {} });
+        set_remote_env(&mut v, "FOO", "bar");
+        assert_eq!(v["remoteEnv"]["FOO"], "bar");
+    }
+
+    #[test]
+    fn set_remote_env_creates_map_when_absent() {
+        let mut v = json!({});
+        set_remote_env(&mut v, "GH_TOKEN", "${localEnv:GH_PAT_FREQTRADE}");
+        assert_eq!(v["remoteEnv"]["GH_TOKEN"], "${localEnv:GH_PAT_FREQTRADE}");
+    }
+
+    #[test]
+    fn set_remote_env_migrates_stale_container_env_key() {
+        let mut v =
+            json!({ "containerEnv": { "GH_TOKEN": "${localEnv:GH_TOKEN_RO}", "KEEP": "1" } });
+        set_remote_env(&mut v, "GH_TOKEN", "${localEnv:GH_PAT_FREQTRADE}");
+        assert_eq!(v["remoteEnv"]["GH_TOKEN"], "${localEnv:GH_PAT_FREQTRADE}");
+        assert!(v["containerEnv"].get("GH_TOKEN").is_none());
+        assert_eq!(v["containerEnv"]["KEEP"], "1");
     }
 
     #[test]
