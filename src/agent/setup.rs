@@ -98,6 +98,9 @@ pub fn run_setup_wizard(
             "customizations": { "vscode": { "extensions": [] } }
         })
     });
+    // Snapshot the on-disk config before the wizard mutates it, so we can tell
+    // the user afterward whether their changes need a container rebuild.
+    let devcontainer_before = devcontainer.clone();
 
     // ----- Prompt 0.5: environment preset (image + agentic toolchain) -----
     // Picking a preset sets the image, the container user, the devcontainer
@@ -142,7 +145,62 @@ pub fn run_setup_wizard(
         "{} wrote .grove/config.toml + .devcontainer/devcontainer.json",
         "✓".green()
     );
+    report_rebuild_requirement(is_reconfigure, &devcontainer_before, &devcontainer);
     Ok(())
+}
+
+/// devcontainer.json keys baked at container-create. Changing any requires
+/// `devcontainer up --remove-existing-container` to take effect; everything
+/// else (`remoteEnv`, `customizations`, `postStartCommand`) applies on the next
+/// `devcontainer exec`/attach with no rebuild.
+const REBUILD_BAKED_KEYS: &[&str] = &[
+    "image",
+    "build",
+    "dockerComposeFile",
+    "features",
+    "mounts",
+    "workspaceMount",
+    "workspaceFolder",
+    "containerEnv",
+    "containerUser",
+    "remoteUser",
+    "updateRemoteUserUID",
+    "runArgs",
+    "onCreateCommand",
+    "updateContentCommand",
+    "postCreateCommand",
+];
+
+/// Create-baked keys whose value differs between `before` and `after`.
+fn rebuild_baked_changes(before: &Value, after: &Value) -> Vec<&'static str> {
+    REBUILD_BAKED_KEYS
+        .iter()
+        .copied()
+        .filter(|k| before.get(*k) != after.get(*k))
+        .collect()
+}
+
+/// After a `--reconfigure`, tell the user whether their edits take effect on the
+/// next `grove spawn` (live: remoteEnv/extensions/postStart) or need a rebuild
+/// (create-baked: image/features/mounts/containerEnv/...). On a fresh `init`
+/// there is no container yet, so nothing to report.
+fn report_rebuild_requirement(is_reconfigure: bool, before: &Value, after: &Value) {
+    if !is_reconfigure {
+        return;
+    }
+    let changed = rebuild_baked_changes(before, after);
+    if changed.is_empty() {
+        println!(
+            "{} no rebuild needed — changes apply on the next `grove spawn` (remoteEnv + extensions are live).",
+            "·".dimmed()
+        );
+    } else {
+        println!(
+            "{} create-baked keys changed ({}) — run `grove devcontainer rebuild` for them to take effect.",
+            "!".yellow(),
+            changed.join(", ")
+        );
+    }
 }
 
 // ---------- sandbox flow ----------
@@ -1057,6 +1115,28 @@ mod tests {
         let mut v = json!({});
         set_remote_env(&mut v, "GH_TOKEN", "${localEnv:GH_PAT_FREQTRADE}");
         assert_eq!(v["remoteEnv"]["GH_TOKEN"], "${localEnv:GH_PAT_FREQTRADE}");
+    }
+
+    #[test]
+    fn rebuild_changes_empty_when_only_remote_env_or_extensions_differ() {
+        let before = json!({
+            "image": "x", "remoteEnv": { "GH_TOKEN": "${localEnv:A}" },
+            "customizations": { "vscode": { "extensions": ["a"] } }
+        });
+        let after = json!({
+            "image": "x", "remoteEnv": { "GH_TOKEN": "${localEnv:GH_PAT_FREQTRADE}" },
+            "customizations": { "vscode": { "extensions": ["a", "b"] } }
+        });
+        assert!(rebuild_baked_changes(&before, &after).is_empty());
+    }
+
+    #[test]
+    fn rebuild_changes_flags_baked_keys() {
+        let before = json!({ "image": "old", "mounts": [] });
+        let after = json!({ "image": "new", "mounts": ["m"] });
+        let changed = rebuild_baked_changes(&before, &after);
+        assert!(changed.contains(&"image"));
+        assert!(changed.contains(&"mounts"));
     }
 
     #[test]

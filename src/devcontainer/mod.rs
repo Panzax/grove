@@ -155,6 +155,11 @@ pub fn build_devcontainer_skeleton(project: &ProjectContext) -> Value {
         "updateRemoteUserUID": true,
         "workspaceFolder": workspace_folder,
         "postCreateCommand": grove_container_prereqs_command(),
+        // Re-run the (idempotent, `command -v`-guarded) prereqs on every start,
+        // not just create. A long-lived container that loses a tool — or one
+        // created before a prereq was added — self-heals on the next start with
+        // NO rebuild; the guards make it a near-no-op when tools are present.
+        "postStartCommand": grove_container_prereqs_command(),
         // GH_TOKEN piped from a host env var via `remoteEnv` (NOT containerEnv):
         // remoteEnv is applied by the devcontainer CLI on every `devcontainer
         // exec`/attach, so rotating the PAT — or changing what `${localEnv:...}`
@@ -422,6 +427,10 @@ mod tests {
         // postCreate — it comes from the preset's devcontainer features.
         assert!(!post.contains("@anthropic-ai/claude-code"));
         assert!(!post.contains("cli.github.com/packages"));
+        // Same prereqs re-ensured on every start → no-rebuild self-heal.
+        let post_start = skel["postStartCommand"].as_str().unwrap();
+        assert!(post_start.contains("command -v tmux"));
+        assert!(post_start.contains("command -v jq"));
     }
 
     #[test]
